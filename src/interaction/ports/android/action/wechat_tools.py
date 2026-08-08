@@ -401,7 +401,8 @@ class WeChatTools:
         self.dev.input_text(text)
         self.dev.wait_random(400, 800)
 
-        if not self._send_btn_visible():
+        btn = self._find_send_btn()
+        if not btn:
             # 文本仍没上屏（罕见：语音模式切换未生效/输入连接未建立）：
             # 重进一次文本模式 + 补一次广播
             self.dev.tap_rect(layout.CHAT_VOICE)
@@ -410,10 +411,12 @@ class WeChatTools:
             self.dev.wait_random(400, 700)
             self.dev.input_text(text)
             self.dev.wait_random(500, 900)
-        if not self._send_btn_visible():
+            btn = self._find_send_btn()
+        if not btn:
             return self._result(self._snap(), success=False,
                                 error="发送按钮未出现（输入未上屏？）")
-        self.dev.tap_rect(layout.SEND_BTN)
+        # 动态定位点按（引用预览条/聚焦态会顶起按钮，固定坐标会按空）
+        self.dev.tap_rect(layout.Rect(btn[0] - 60, btn[1] - 40, 120, 80))
         self.dev.wait_random(600, 1200)
 
         # 验证：最后一条消息 is_mine 且内容匹配。气泡渲染/OCR 有延迟，
@@ -456,20 +459,17 @@ class WeChatTools:
         except Exception:
             return False
 
-    def _send_btn_visible(self):
-        """发送按钮校验：绿掩膜扫描区内有绿色块、且 SEND_BTN 本体区域内绿色
-        占比达标（输入有字时 "+" 圆钮变为绿色"发送"按钮）。内存截图不落盘。"""
-        import cv2
+    def _find_send_btn(self):
+        """动态定位绿色发送按钮中心 (cx, cy)；找不到返回 None。
+        认颜色/文字不认坐标：引用预览条、聚焦态、面板态都会顶起按钮。"""
+        from .quote_reply import _find_send_btn as _find
+        from ..perception.ocr_engine import run_ocr
         img = self.dev.capture_bytes()
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        green = (h >= 60) & (h <= 90) & (s > 90) & (v > 80)
-        z = layout.SEND_SCAN_ZONE
-        zone_ratio = float(green[z.y:z.y + z.h, z.x:z.x + z.w].mean())
-        b = layout.SEND_BTN
-        btn_ratio = float(green[b.y:b.y + b.h, b.x:b.x + b.w].mean())
-        log.info("send btn green ratio: zone=%.3f btn=%.3f", zone_ratio, btn_ratio)
-        return zone_ratio > 0.02 and btn_ratio > 0.15
+        return _find(img, run_ocr(img))
+
+    def _send_btn_visible(self):
+        """发送按钮存在性（动态定位版，保留旧接口名）。"""
+        return self._find_send_btn() is not None
 
     def _full_ocr(self):
         """内存截图 -> 全图 OCR，返回 ocr_items（不落盘）。"""
