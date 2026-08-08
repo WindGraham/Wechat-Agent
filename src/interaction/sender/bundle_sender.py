@@ -83,10 +83,12 @@ class BundleSender:
     - port_tools: 端口工具（WeChatTools，quote/image/file 流程取其 dev）
     """
 
-    def __init__(self, port_sender, port_navigator, port_tools):
+    def __init__(self, port_sender, port_navigator, port_tools,
+                 session_reader=None):
         self._sender = port_sender         # 底层拟人发送器
         self._nav = port_navigator         # 导航器
         self._tools = port_tools           # WeChatTools（quote/image/file 用其 dev）
+        self._session_reader = session_reader  # 日志定位引用目标方向（可选）
         self._mutex = False                # 屏幕互斥锁（发送中=True）
         self._rand = random.uniform
         self._clock = time.time
@@ -212,6 +214,41 @@ class BundleSender:
                                 escalation_hint=f"无法进入会话 {session}")
         return None
 
+    def _locate_direction(self, session: str, match_text: str):
+        """用消息日志判断引用目标在屏幕的哪个方向。
+
+        返回 "above"（向上翻找）/ None（应在当前屏底部区域）。
+        入会话后停在底部，目标不在当前屏时几乎必然在上方；
+        日志里找不到目标时也按 above 处理（先向上翻找）。"""
+        if not self._session_reader:
+            return "above"
+        from ..msglog.message_log import normalize
+        try:
+            rows = self._session_reader.get_context(session, n=300)
+        except Exception:  # noqa: BLE001
+            return "above"
+        needle = normalize(match_text)
+        if not needle:
+            return "above"
+        target_idx = None
+        for i, m in enumerate(rows):            # 取最后一次出现（最新）
+            c = normalize(getattr(m, "content", ""))
+            if c and (needle in c or c in needle):
+                target_idx = i
+        if target_idx is None:
+            return "above"
+        # 底部 6 条以内 = 应在当前屏（OCR 抖动可能没找到，值得重试）
+        if target_idx >= len(rows) - 6:
+            return None
+        return "above"
+
+    def _scroll_search(self, direction: str):
+        """按方向滚一屏（随机化，走端口工具）。"""
+        if direction == "above":
+            self._tools.scroll_up()              # 看更早
+        else:
+            self._tools.scroll_down()            # 看更新
+
     def _do_send_texts(self, session: str, texts) -> ActionResult:
         """逐条发送文本：多个 <text> = 多条小消息依次发，条间随机延迟 1~3s。
         单条长文不拆——整条交给端口 sender（其内部标点分段是拟人节奏，不是拆句）。"""
@@ -238,25 +275,62 @@ class BundleSender:
         err = self._enter_session(session)
         if err is not None:
             return err
-        try:
-            r = quote_reply(self._tools.dev, match_text=match_text,
-                            reply_text=reply_text, sleep_fn=self._sleep)
-        except Exception as e:
-            log.exception("[%s] quote reply exception", session)
-            return ActionResult(ok=False, error=f"引用回复异常: {e}",
-                                retryable=True,
-                                escalation_hint=f"引用回复 {session} 异常")
-        if not r.get("ok"):
-            # find_target 类错误重试无意义（目标不在当前屏），其余 UI 抖动可重试
+
+        def _try():
+            return quote_reply(self._tools.dev, match_text=match_text,
+                               reply_text=reply_text, sleep_fn=self._sleep)
+
+        def _pack(r):
+            if r.get("ok"):
+                if not r.get("verified"):
+                    log.warning("[%s] quote reply 发出但轻验证未确认（假定已发出）",
+                                session)
+                return ActionResult(ok=True)
             retryable = r.get("step") not in ("args", "find_target")
             return ActionResult(
                 ok=False,
                 error=f"引用回复失败@{r.get('step')}: {r.get('error')}",
                 retryable=retryable,
                 escalation_hint=f"引用回复 {session} 失败: {r.get('error')}")
-        if not r.get("verified"):
-            log.warning("[%s] quote reply 发出但轻验证未确认（假定已发出）", session)
-        return ActionResult(ok=True)
+
+        try:
+            r = _try()
+        except Exception as e:
+            log.exception("[%s] quote reply exception", session)
+            return ActionResult(ok=False, error=f"引用回复异常: {e}",
+                                retryable=True,
+                                escalation_hint=f"引用回复 {session} 异常")
+        if r.get("ok") or r.get("step") != "find_target":
+            return _pack(r)
+
+        # 目标不在当前屏：按消息日志判方向，滚动查找（最多 4 屏）
+        direction = self._locate_direction(session, match_text)
+        if direction is None:
+            # 应在当前屏（底部区域）：OCR 抖动兜底重试一次，
+            # 再向下滚一屏（处理期间可能有新消息到底部）
+            log.info("[%s] quote target 应在当前屏，重试+向下补查", session)
+            r = _try()
+            if r.get("ok") or r.get("step") != "find_target":
+                return _pack(r)
+            self._scroll_search("below")
+            self._sleep(self._rand(0.6, 1.2))
+            r = _try()
+            return _pack(r)
+
+        log.info("[%s] quote target 在屏幕%s侧，滚动查找", session,
+                 "上" if direction == "above" else "下")
+        for i in range(4):
+            self._scroll_search(direction)
+            self._sleep(self._rand(0.6, 1.2))
+            try:
+                r = _try()
+            except Exception as e:
+                log.exception("[%s] quote reply exception", session)
+                return ActionResult(ok=False, error=f"引用回复异常: {e}",
+                                    retryable=True)
+            if r.get("ok") or r.get("step") != "find_target":
+                return _pack(r)
+        return _pack(r)
 
     def _do_send_media(self, session: str, kind: str, path: str) -> ActionResult:
         """发图片/文件：进会话 → action/image_sender.py 的相册/加号面板流程。"""

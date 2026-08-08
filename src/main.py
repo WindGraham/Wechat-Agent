@@ -197,7 +197,8 @@ def _assemble_interaction(comp, manifest, tools, dirs, runtime, queue, conn):
     session_reader = SessionReader(port_reader, conn,
                                    media_dir=dirs["media"],
                                    owner_nick=owner_nick)
-    bundle_sender = BundleSender(port_sender, navigator, tools)
+    bundle_sender = BundleSender(port_sender, navigator, tools,
+                                 session_reader=session_reader)
     comp["session_reader"] = session_reader
     comp["bundle_sender"] = bundle_sender
     manifest.append("interaction: SessionReader / BundleSender")

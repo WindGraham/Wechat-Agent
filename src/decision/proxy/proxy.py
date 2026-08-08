@@ -298,8 +298,12 @@ class Proxy:
                 continue                       # 只有工具调用：回灌续生成
 
             # 终止输出：路由执行
+            # @我 消息强制引用回复：reply 的 ref 指向 @我 消息但块内没有
+            # <quote> 时自动注入（LLM 偶尔忘记，2026-08-08 用户要求）
+            ref_map = {f"m{i + 1}": m for i, m in enumerate(new_msgs)}
             deliveries = []
             for b in reply_blocks[:MAX_REPLY_BLOCKS]:
+                self._inject_quote_for_at(b, ref_map)
                 xml = self._block_to_xml(b, session)
                 ok = self._submit_bundle(session, xml).ok
                 deliveries.append({"session": session, "ok": bool(ok)})
@@ -313,6 +317,24 @@ class Proxy:
         return replied
 
     # ---------------------------------------------------------------- 块处理
+    def _inject_quote_for_at(self, block, ref_map: dict):
+        """reply 的 ref 指向 @我 消息且块内无 <quote> 时，注入引用标记。
+        match 取目标消息内容前 12 字符（XML 转义）。"""
+        refs = parse_attrs(block.attrs).get("ref", "")
+        if not refs or "<quote" in block.raw_inner:
+            return
+        first_ref = refs.split("+")[0].strip()
+        target = ref_map.get(first_ref)
+        if target is None or not self._policy.is_at_me(target):
+            return
+        snippet = (getattr(target, "content", "") or "")[:12]
+        if not snippet:
+            return
+        esc = (snippet.replace("&", "&amp;").replace("<", "&lt;")
+               .replace(">", "&gt;").replace('"', "&quot;"))
+        block.raw_inner = f'<quote match="{esc}"/>' + block.raw_inner
+        log.info("为 @我 消息 %s 的回复自动注入引用", first_ref)
+
     @staticmethod
     def _norm_session_attr(attr_session: str, current: str) -> str:
         """归一化块上的 session 属性：LLM 会从 prompt 里抄上
