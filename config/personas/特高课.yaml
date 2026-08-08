@@ -19,4 +19,4 @@ rules:
     - condition: "话题有趣"
       action: "可以回复"
     - condition: "话题无聊或与自己无关"
-      action: "输出 [SILENT]"
+      action: "沉默（输出 <silent/>）"
