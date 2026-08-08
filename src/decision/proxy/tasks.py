@@ -32,6 +32,55 @@ class TaskLedger:
         self._seq = 0
         self._tasks = {}            # task_id -> dict
         os.makedirs(tasks_root, exist_ok=True)
+        self._rebuild()
+
+    def _rebuild(self):
+        """从目录重建台账（task.json 是事实源）。上次进程死掉时 running
+        状态的任务永远等不到回执——标 interrupted，防止被当成还在执行。"""
+        for day in os.listdir(self._root):
+            day_dir = os.path.join(self._root, day)
+            if not os.path.isdir(day_dir):
+                continue
+            for dirname in os.listdir(day_dir):
+                path = os.path.join(day_dir, dirname, "task.json")
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        task = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if task.get("status") == "running":
+                    task["status"] = "interrupted"
+                    try:
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump(task, f, ensure_ascii=False, indent=2)
+                    except OSError:
+                        pass
+                self._tasks[task["task_id"]] = task
+        if self._tasks:
+            log.info("ledger rebuilt: %d task(s) from disk", len(self._tasks))
+
+    def find_similar(self, session: str, desc: str, within_s: int = 600):
+        """同会话、描述相似（归一化后互为子串）、且仍在执行或 within_s
+        内才完成的任务——用于委派前去重（2026-08-08 海报重复委派实测）。"""
+        import re as _re
+        nd = _re.sub(r"\W+", "", desc or "")
+        if not nd:
+            return None
+        now = self._clock()
+        for t in self._tasks.values():
+            if t["session"] != session:
+                continue
+            if t["status"] == "running":
+                pass
+            elif t["status"] == "done" and t.get("finished_at") \
+                    and now - t["finished_at"] <= within_s:
+                pass
+            else:
+                continue
+            nt = _re.sub(r"\W+", "", t.get("desc") or "")
+            if nt and (nt in nd or nd in nt):
+                return t
+        return None
 
     def register(self, session: str, refs: list, ref_briefs: list,
                  desc: str, deliver: str) -> dict:

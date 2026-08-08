@@ -67,11 +67,30 @@ class KimiCodeCLI(CLIBackend):
 
         deadline = time.time() + timeout_s
         timed_out = False
+        # 读出行线程 + 队列：进程不吐行时 select 式等待也要能判超时
+        # （旧实现 for line in proc.stdout 在子进程静默挂起时永远阻塞，
+        # 超时形同虚设——2026-08-08 五个任务卡 running 的教训）
+        import queue as _queue
+        q = _queue.Queue()
+
+        def _pump():
+            for ln in proc.stdout:
+                q.put(ln)
+            q.put(None)
+
+        threading.Thread(target=_pump, daemon=True).start()
         try:
-            for line in proc.stdout:
-                if time.time() > deadline:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
                     proc.kill()
                     timed_out = True
+                    break
+                try:
+                    line = q.get(timeout=min(remaining, 5.0))
+                except _queue.Empty:
+                    continue
+                if line is None:               # EOF：进程输出关闭
                     break
                 trace_lines.append(line)
                 try:

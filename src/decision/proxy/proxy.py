@@ -414,6 +414,16 @@ class Proxy:
         attrs = parse_attrs(block.attrs)
         refs = [r for r in (attrs.get("ref") or "").split("+") if r]
         brief_text = block.inner.strip()
+        # 委派前去重：同会话相似任务在执行中/刚完成——发出去的图不进文字
+        # 历史，LLM 容易以为没办成而重复委派（2026-08-08 海报实测）
+        dup = self._ledger.find_similar(session, attrs.get("desc", ""))
+        if dup is not None:
+            log.info("[%s] 相似任务 %s(%s) 已存在，跳过重复委派: %s",
+                     session, dup["task_id"], dup["status"],
+                     (attrs.get("desc") or "")[:30])
+            _journal("task_dup_skipped", session=session,
+                     desc=attrs.get("desc", ""), dup_of=dup["task_id"])
+            return
         task = self._ledger.register(
             session=session, refs=refs,
             ref_briefs=[], desc=attrs.get("desc", ""),
