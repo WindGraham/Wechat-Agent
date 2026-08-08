@@ -114,6 +114,7 @@ QueueEntry:
 | `owner` / `owner_nick` | - | 主人会话名 / 主人@我时的昵称 |
 | `action_max_attempts` | 2 | 行动条目尝试上限 |
 | `task_retention_days` | 14 | tasks/ 目录保留天数 |
+| `tool_model` | `kimi-code/k3` | 工具层 subprocess 钉住的模型（kimi -m） |
 
 ## 六、@我 判定规则（Policy 用）
 

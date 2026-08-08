@@ -14,7 +14,7 @@ Wechat-Agent/
 ├── src/
 │   ├── shared/                  # 层间契约类型（dataclass 定义）——三层唯一共享物
 │   ├── interaction/             # 交互层
-│   │   ├── ports/               # 端口：android/ windows/ macos/（各自策略组）
+│   │   ├── ports/               # 端口：android/（perception/action/device）windows/ macos/
 │   │   ├── loop/                # 循环组：统一时间序队列、旅程、屏幕互斥
 │   │   ├── reader/              # 读取与同步：切段、增量、回填、打标
 │   │   ├── sender/              # bundle 解释执行（拆句/引用/发图/发文件）

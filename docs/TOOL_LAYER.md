@@ -21,6 +21,14 @@ kimi -p "<任务简报>" --output-format stream-json
 # 常驻/多任务场景：kimi web（REST + WebSocket，自带 /openapi.json）
 ```
 
+**模型选择**：子进程默认用本机 CLI 的 `default_model`（当前为
+`kimi-for-coding` K2.7）。薄封装统一加 `-m` 显式钉住模型
+（默认 `kimi-code/k3`，与决策层一致；可在 runtime.json 配置）：
+
+```bash
+kimi -m kimi-code/k3 -p "<任务简报>" --output-format stream-json
+```
+
 ### 返回（stdout 为 JSONL，一行一个对象）
 
 ```jsonl
