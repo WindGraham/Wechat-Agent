@@ -14,10 +14,13 @@ import re
 
 
 def _norm(s):
-    """名字匹配归一化：去空白和括号成员数。"""
+    """名字匹配归一化：NFKC（全角→半角，OCR 偶发把"？"读成"?"）+
+    去空白和括号成员数。"""
+    import unicodedata
     if not s:
         return ""
-    s = "".join(str(s).split())
+    s = unicodedata.normalize("NFKC", str(s))
+    s = "".join(s.split())
     for sep in ("(", "（"):
         if sep in s:
             s = s.split(sep)[0]
