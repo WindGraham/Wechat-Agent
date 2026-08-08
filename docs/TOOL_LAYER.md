@@ -22,8 +22,10 @@ kimi -p "<任务简报>" --output-format stream-json
 ```
 
 **模型选择**：子进程默认用本机 CLI 的 `default_model`（当前为
-`kimi-for-coding` K2.7）。薄封装统一加 `-m` 显式钉住模型
-（默认 `kimi-code/k3`，与决策层一致；可在 runtime.json 配置）：
+`kimi-for-coding` K2.7）。薄封装支持**逐任务选模型**（`kimi -m`），
+`CLIBackend.run(..., model=...)` 的 model 参数即任务级模型；
+不传时回落到 runtime.json 的 `tool_model`（默认 `kimi-code/k3`，
+**该默认值待定**，可按任务类型分级：重任务 k3 / 轻任务 K2.7）：
 
 ```bash
 kimi -m kimi-code/k3 -p "<任务简报>" --output-format stream-json
