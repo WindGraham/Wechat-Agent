@@ -134,3 +134,26 @@ class TestReinsert(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SnapshotTest(unittest.TestCase):
+    """队列快照落盘（网关展示用）。"""
+
+    def test_snapshot_written_on_mutation(self):
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "queue.json")
+            q = UnifiedQueue(snapshot_path=path)
+            q.push_notify("特高课", mention=True)
+            data = json.load(open(path, encoding="utf-8"))
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["session"], "特高课")
+            self.assertTrue(data[0]["mention"])
+            q.push_action("风图", "<reply><text>hi</text></reply>")
+            data = json.load(open(path, encoding="utf-8"))
+            self.assertEqual(len(data), 2)
+            self.assertEqual(data[0]["session"], "特高课")  # @我 排前
+            q.pop_next()
+            data = json.load(open(path, encoding="utf-8"))
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["kind"], "action")

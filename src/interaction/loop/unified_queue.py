@@ -24,11 +24,37 @@ class UnifiedQueue:
     线程安全：所有公共方法加锁。
     """
 
-    def __init__(self, max_attempts: int = 2):
+    def __init__(self, max_attempts: int = 2, snapshot_path: str = None):
         self._entries: dict[str, QueueEntry] = {}  # session → entry
         # RLock：requeue_action 的"全新入队"分支会在持锁状态下调用 push_action
         self._lock = threading.RLock()
         self._max_attempts = max_attempts
+        # 状态快照（网关只读展示用）：每次变更后写 workspace/runtime/queue.json
+        self._snapshot_path = snapshot_path
+
+    # ------------------------------------------------------------------ 快照
+    def _persist(self):
+        """把当前队列快照写入 snapshot_path（网关只读文件边界）。"""
+        if not self._snapshot_path:
+            return
+        import json
+        import os
+        try:
+            entries = self.snapshot()
+            data = [
+                {"order": i + 1, "kind": e.kind, "session": e.session,
+                 "mention": e.mention, "attempts": e.attempts,
+                 "sources": sorted(e.sources), "ts": e.ts,
+                 "payload_brief": (e.payload or "")[:80]}
+                for i, e in enumerate(entries)
+            ]
+            os.makedirs(os.path.dirname(self._snapshot_path), exist_ok=True)
+            tmp = self._snapshot_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._snapshot_path)
+        except OSError:
+            log.exception("queue snapshot 写入失败")
 
     # ------------------------------------------------------------------ 入队
     def push_notify(self, session: str, mention: bool = False,
@@ -48,6 +74,7 @@ class UnifiedQueue:
                 existing.sources.add(source)
                 if mention:
                     existing.mention = True
+                self._persist()
                 log.debug("queue: %s already queued (kind=%s), sources=%s",
                           session, existing.kind, sorted(existing.sources))
                 return existing
@@ -57,6 +84,7 @@ class UnifiedQueue:
                 mention=mention, sources={source},
             )
             self._entries[session] = entry
+            self._persist()
             log.info("queue push notify: %s mention=%s source=%s",
                      session, mention, source)
             return entry
@@ -80,6 +108,7 @@ class UnifiedQueue:
                 existing.attempts = 0  # 重置尝试次数
                 if mention:
                     existing.mention = True
+                self._persist()
                 return existing
 
             entry = QueueEntry(
@@ -87,6 +116,7 @@ class UnifiedQueue:
                 mention=mention, payload=blocks_xml,
             )
             self._entries[session] = entry
+            self._persist()
             log.info("queue push action: %s mention=%s", session, mention)
             return entry
 
@@ -107,12 +137,15 @@ class UnifiedQueue:
             )
             entry = entries[0]
             del self._entries[entry.session]
+            self._persist()
             return entry
 
     def pop_session(self, session: str) -> Optional[QueueEntry]:
         """取出指定会话的条目（旅程开始时调用），同时清除同会话的通知条目。"""
         with self._lock:
-            return self._entries.pop(session, None)
+            entry = self._entries.pop(session, None)
+            self._persist()
+            return entry
 
     # ------------------------------------------------------------------ 重试
     def requeue_entry(self, entry: QueueEntry) -> QueueEntry:
@@ -139,11 +172,13 @@ class UnifiedQueue:
                     sources=set(entry.sources),
                 )
                 self._entries[entry.session] = new_entry
+                self._persist()
                 log.warning("queue: %s max attempts reached, requeued at tail",
                             entry.session)
                 return new_entry
             # 未达上限：原条目按原 ts 放回，保持原位置语义
             self._entries[entry.session] = entry
+            self._persist()
             log.info("queue: %s retry %d/%d",
                      entry.session, entry.attempts, self._max_attempts)
             return entry
@@ -156,6 +191,7 @@ class UnifiedQueue:
         """
         with self._lock:
             self._entries[entry.session] = entry
+            self._persist()
             log.info("queue: %s reinserted (kind=%s)", entry.session, entry.kind)
 
     def requeue_action(self, session: str, blocks_xml: str) -> Optional[QueueEntry]:

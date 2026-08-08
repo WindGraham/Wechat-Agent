@@ -545,8 +545,24 @@ function loadStatus() {
     const block = (title, obj) => '<h3>' + title + '</h3>' +
       (obj == null ? '<p>暂无数据</p>'
                    : '<pre>' + JSON.stringify(obj, null, 2) + '</pre>');
-    let h = block('队列（runtime/queue.json）', j.queue) +
-            block('水位（runtime/watermarks.json）', j.watermarks);
+    // 统一时间序队列：表格化展示（出队顺序）
+    let h = '<h3>时序队列（出队顺序）</h3>';
+    if (!j.queue || !j.queue.length) h += '<p>队列为空</p>';
+    else {
+      h += '<table><tr><th>#</th><th>类型</th><th>会话</th><th>@我</th>' +
+           '<th>已试</th><th>来源</th><th>入队时间</th><th>内容摘要</th></tr>';
+      for (const e of j.queue) {
+        const ts = e.ts ? new Date(e.ts * 1000).toLocaleTimeString() : '-';
+        h += '<tr><td>' + e.order + '</td><td>' +
+             (e.kind === 'action' ? '行动' : '通知') + '</td><td>' +
+             e.session + '</td><td>' + (e.mention ? '⚠️' : '') + '</td><td>' +
+             e.attempts + '</td><td>' + (e.sources || []).join(',') +
+             '</td><td>' + ts + '</td><td>' +
+             (e.payload_brief || '').replace(/</g, '&lt;') + '</td></tr>';
+      }
+      h += '</table>';
+    }
+    h += block('水位（runtime/watermarks.json）', j.watermarks);
     h += '<h3>任务台账（tasks/）</h3>';
     if (!j.tasks.length) h += '<p>暂无数据</p>';
     else {

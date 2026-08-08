@@ -114,8 +114,10 @@ def assemble(workspace_root, config_path, with_device=True):
     comp["msglog_path"] = db_path
     manifest.append(f"msglog: {db_path}")
 
-    # 4. 统一时间序队列
-    queue = UnifiedQueue(max_attempts=runtime.get("action_max_attempts", 2))
+    # 4. 统一时间序队列（快照落盘：workspace/runtime/queue.json，网关只读展示）
+    queue = UnifiedQueue(
+        max_attempts=runtime.get("action_max_attempts", 2),
+        snapshot_path=os.path.join(dirs["runtime"], "queue.json"))
     comp["queue"] = queue
     manifest.append(f"queue: UnifiedQueue "
                     f"(max_attempts={runtime.get('action_max_attempts', 2)})")
