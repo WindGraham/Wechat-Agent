@@ -20,6 +20,35 @@ log = logging.getLogger("interaction.queue")
 # 系统/信息流"会话"黑名单：不是真实聊天，任何通道都不得入队
 # （公众号/服务通知是 feed 不是对话；"微信"是桌面登录等系统通知的标题噪声；
 #  "折叠的聊天"是折叠分组不是会话）
+def _dedup_stutter(label: str, known_fn=None) -> str:
+    """结巴标签截半：OCR/分段偶发把会话名拼成两遍。
+    两半都可能带 OCR 错（实测第一份结尾 I→L），所以候选两半分别与
+    已知会话名（日志库）模糊匹配，命中就用库里那个规范名。"""
+    import difflib
+    n = len(label or "")
+    if n < 4 or n % 2 != 0:
+        return label
+    a, b = label[:n // 2], label[n // 2:]
+    if a == b:
+        return a
+    if difflib.SequenceMatcher(None, a, b).ratio() < 0.8:
+        return label
+    if known_fn:
+        try:
+            known = known_fn() or []
+        except Exception:  # noqa: BLE001
+            known = []
+        best_name, best_ratio = None, 0.0
+        for cand in (a, b):
+            for name in known:
+                r = difflib.SequenceMatcher(None, cand, name).ratio()
+                if r > best_ratio:
+                    best_name, best_ratio = name, r
+        if best_name and best_ratio >= 0.75:
+            return best_name
+    return a
+
+
 BLOCKED_SESSIONS = frozenset({
     "微信", "微信团队", "微信支付", "服务通知", "公众号", "腾讯新闻",
     "微信运动", "QQ邮箱提醒", "腾讯充值", "微信游戏", "企业微信",
@@ -33,13 +62,15 @@ class UnifiedQueue:
     线程安全：所有公共方法加锁。
     """
 
-    def __init__(self, max_attempts: int = 2, snapshot_path: str = None):
+    def __init__(self, max_attempts: int = 2, snapshot_path: str = None,
+                 known_sessions_fn=None):
         self._entries: dict[str, QueueEntry] = {}  # session → entry
         # RLock：requeue_action 的"全新入队"分支会在持锁状态下调用 push_action
         self._lock = threading.RLock()
         self._max_attempts = max_attempts
         # 状态快照（网关只读展示用）：每次变更后写 workspace/runtime/queue.json
         self._snapshot_path = snapshot_path
+        self._known_sessions_fn = known_sessions_fn   # 结巴标签对齐用
 
     # ------------------------------------------------------------------ 快照
     def _persist(self):
@@ -54,6 +85,7 @@ class UnifiedQueue:
                 {"order": i + 1, "kind": e.kind, "session": e.session,
                  "mention": e.mention, "attempts": e.attempts,
                  "sources": sorted(e.sources), "ts": e.ts,
+                 "payload": e.payload or "",
                  "payload_brief": (e.payload or "")[:80]}
                 for i, e in enumerate(entries)
             ]
@@ -65,6 +97,35 @@ class UnifiedQueue:
         except OSError:
             log.exception("queue snapshot 写入失败")
 
+    def restore(self):
+        """启动时从快照恢复队列（崩溃/重启不丢待办行动）。"""
+        import json
+        import os
+        if not self._snapshot_path or not os.path.exists(self._snapshot_path):
+            return 0
+        try:
+            with open(self._snapshot_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return 0
+        n = 0
+        with self._lock:
+            for e in data:
+                session = e.get("session")
+                if not session or session in self._entries:
+                    continue
+                self._entries[session] = QueueEntry(
+                    kind=e.get("kind", "notify"), session=session,
+                    ts=e.get("ts", time.time()),
+                    mention=bool(e.get("mention")),
+                    payload=e.get("payload", ""),
+                    attempts=int(e.get("attempts", 0)),
+                    sources=set(e.get("sources", [])))
+                n += 1
+        if n:
+            log.info("queue 从快照恢复 %d 个条目", n)
+        return n
+
     # ------------------------------------------------------------------ 入队
     def push_notify(self, session: str, mention: bool = False,
                     source: str = "sweep") -> Optional[QueueEntry]:
@@ -72,6 +133,7 @@ class UnifiedQueue:
 
         规则：会话已在队列中 → 位置不变、内容不更新（只更新 sources）。
         """
+        session = _dedup_stutter(session, self._known_sessions_fn)
         if session in BLOCKED_SESSIONS:
             log.debug("queue: %s 被黑名单拦截（系统/feed 会话）", session)
             return None
@@ -108,6 +170,7 @@ class UnifiedQueue:
         规则：如果该会话已有通知条目 → 升级为行动条目（吞并通知）。
         如果已有行动条目 → 合并（追加 payload，但保持位置）。
         """
+        session = _dedup_stutter(session, self._known_sessions_fn)
         if session in BLOCKED_SESSIONS:
             log.debug("queue: %s 被黑名单拦截（系统/feed 会话）", session)
             return None

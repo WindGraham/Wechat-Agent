@@ -117,7 +117,12 @@ def assemble(workspace_root, config_path, with_device=True):
     # 4. 统一时间序队列（快照落盘：workspace/runtime/queue.json，网关只读展示）
     queue = UnifiedQueue(
         max_attempts=runtime.get("action_max_attempts", 2),
-        snapshot_path=os.path.join(dirs["runtime"], "queue.json"))
+        snapshot_path=os.path.join(dirs["runtime"], "queue.json"),
+        known_sessions_fn=lambda: [
+            r[0] for r in conn.execute("SELECT name FROM sessions")])
+    restored = queue.restore()          # 重启恢复未处理的行动/通知
+    if restored:
+        manifest.append(f"queue: 从快照恢复 {restored} 个条目")
     comp["queue"] = queue
     manifest.append(f"queue: UnifiedQueue "
                     f"(max_attempts={runtime.get('action_max_attempts', 2)})")
