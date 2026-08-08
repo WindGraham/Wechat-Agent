@@ -52,7 +52,7 @@ user 每次决策动态组装。
 | 块 | 内容 | 来源 |
 |---|---|---|
 | 人设 | 身份/性格/说话风格/禁区/核心记忆 | 人格卡（底座+会话卡合并） |
-| 输出协议 | 三态信号的死规定（[SILENT] / 纯文本=发文字 / 动作 JSON 行） | 决策层契约 |
+| 输出协议 | 单 JSON 对象契约的死规定（`{"actions":[...]}`，动作类型全集、终止/非终止规则） | 决策层契约 |
 | 可用工具 | `chat_history`（查更早记录）、`delegate_task`（交工具层），带用法与失败指引 | 决策层工具表 |
 
 **user：**
@@ -84,22 +84,50 @@ Leisure: @陈曦 那就这么定了
 历史与新消息严格分区不混排；决策层不驱动 UI，因此 prompt 不含屏幕状态
 （升级任务时屏幕现场经 TaskBrief 走，不进对话 prompt）。
 
-## 三、输出信号格式（OutputParser 只认这三种）
+## 三、输出信号格式（Proxy 强解析契约）
 
-```
-1. [SILENT]                     → 不回复
-2. 纯文本                        → 默认动作 send_text（当前会话）
-3. 动作行（首行 JSON，一轮最多 2 个）：
-   {"send": "text",  "session": "特高课", "text": "定了，周六见"}
-   {"send": "image", "session": "特高课", "url": "https://..."}
-   {"send": "file",  "session": "风图",   "path": "/tmp/x.pdf"}
+LLM 的每次输出**必须是且只是一个 JSON 对象**，无 markdown 围栏、
+无任何前后文字。唯一合法形态：
+
+```json
+{"actions": [ <动作>, ... ]}
 ```
 
-设计理由：
+动作类型（全集，此外一律非法）：
 
-- 纯文本默认 = 发文字：最高频动作零格式负担，模型服从率最高
-- `session` 显式携带：为"事件来自 A、回复发到 B"留口；省略默认当前会话
-- 检索工具调用不进输出信号，只在循环内部回灌；格式错误重试一次再丢弃
+```json
+{"send": "text",  "session": "特高课", "text": "定了，周六见"}
+{"send": "image", "session": "特高课", "url": "https://..."}     // 或 "path": "/tmp/x.jpg"
+{"send": "file",  "session": "风图",   "path": "/tmp/x.pdf"}
+{"send": "quote", "session": "特高课", "match_text": "被引用片段", "text": "回复内容"}
+
+{"tool": "chat_history", "session": "特高课", "keyword": "店", "n": 20}
+{"delegate": "task", "goal": "...", "context": "...", "deliver": "session:特高课"}
+```
+
+规则（Proxy 逐条强校验）：
+
+1. **沉默 = 空数组**：`{"actions": []}`（没有 [SILENT] 文本形态）
+2. `session` 可省略，默认当前会话
+3. 一轮输出 send 类动作最多 2 个（防刷屏）
+4. **含 `tool`/`delegate` 动作 = 非终止输出**：Proxy 执行后把结果回灌，
+   继续下一轮生成；**只含 `send` 或空数组 = 终止输出**，路由执行后结束
+5. 终止输出里禁止混 tool/delegate；出现即判格式错误
+6. **格式错误处理**：重试一次（system 追加"上次输出不是合法 JSON，只输出
+   规定对象"）；再错丢弃本轮，记日志
+7. Proxy 解析：`json.loads` 失败先剥一次 ``` 围栏再试；键白名单校验，
+   未知键/未知动作类型即格式错误
+
+路由表（Proxy 唯一分支逻辑）：
+
+| 动作 | 去向 |
+|---|---|
+| `send:*` | 交互层 `execute(ActionRequest)` |
+| `tool:chat_history` | 内部执行 → 结果回灌 LLM |
+| `delegate:task` | 工具层 `run_task(TaskBrief)` |
+
+远期升级：provider 支持原生 function calling 时，同一套动作 schema
+平移到 tool_calls，解析逻辑不变。
 
 ## 四、回复策略（Policy）
 
