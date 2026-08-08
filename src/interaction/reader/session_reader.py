@@ -128,7 +128,7 @@ class SessionReader:
 
     def _append_gap_aware(self, sid: int, session: str, entries: list) -> list:
         """增量写库；gap → 积压上翻收集；连续失败达上限 → 强制追加。"""
-        from ..msglog import append_incremental, merge_stack
+        from ..msglog import append_incremental
 
         r = append_incremental(self._conn, sid, entries,
                                captured_ts=time.time())
@@ -151,8 +151,15 @@ class SessionReader:
                  session, self._gap_fail[session], self.GAP_FORCE_CAP)
         try:
             backlog, _ = self._pr.read_backlog(session)
-            mr = merge_stack(self._conn, sid, backlog,
-                             captured_ts=time.time())
+            # backlog 从当前屏底部向上翻，覆盖区间比日志尾"更新"——正确接法是
+            # 用 append_incremental 把 backlog 顶部锚进日志尾、其余续写
+            # （merge_stack 是回填语义：锚栈底最旧 N 条，前向缺口永远锚不住，
+            # 2026-08-08 YOUSAOBI 69 条未读反复 MergeError 的根因）
+            r1 = append_incremental(self._conn, sid, backlog,
+                                    captured_ts=time.time())
+            if r1.get("gap"):
+                from ..msglog.message_log import MergeError
+                raise MergeError("backlog 上翻 %d 条仍未触及日志尾" % len(backlog))
             # 合并后再试增量
             r2 = append_incremental(self._conn, sid, entries,
                                     captured_ts=time.time())

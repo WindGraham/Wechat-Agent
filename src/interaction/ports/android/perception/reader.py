@@ -165,13 +165,14 @@ class Reader:
         return state
 
     # ---------------------------------------------------------- 积压上翻
-    def read_backlog(self, name, max_up_screens=12):
+    def read_backlog(self, name, max_up_screens=40):
         """未读积压读取：从当前屏向上翻（看更早）收集未读区间，再落底。
         停止条件：命中已记录日志 / 下拉小程序面板 / 连续 2 屏无变化 / 屏数上限。
+        （上限 40：活跃群几十条未读 ≈ 20+ 屏，12 屏够不着日志尾，
+        2026-08-08 YOUSAOBI 69 条未读实测）
         返回 (merged 早→晚, last_state)。"""
         sid = msg_log.get_or_create_session(self._conn, name, False)
-        known = [(r["sender"], r["content"]) for r in
-                 msg_log.session_tail(self._conn, sid, n=30)]
+        known = list(msg_log.session_tail(self._conn, sid, n=30))
 
         state = self.snap_settled(min_entries=1)
         backlog = [self._entries_of(state)]
@@ -276,10 +277,25 @@ class Reader:
 
     @staticmethod
     def _entries_known(entries, known):
+        """known 为 session_tail 行 dict（含 content_type/media_path）。
+        多媒体行内容已被标注改写，文本比不过——两侧皆多媒体且发送人一致
+        即视为已知（同 msglog._media_eq 的锚定语义）。"""
         for e in entries:
             if e.kind != "msg":
                 continue
-            for s, c in known:
+            for r in known:
+                if isinstance(r, dict):
+                    if r["content_type"] in msg_log.MEDIA_TYPES \
+                            or r["media_path"]:
+                        if (getattr(e, "content_type", "text")
+                                in msg_log.MEDIA_TYPES
+                                and msg_log.normalize(e.sender)
+                                == msg_log.normalize(r["sender"])):
+                            return True
+                        continue
+                    s, c = r["sender"], r["content"]
+                else:
+                    s, c = r
                 if msg_log.fuzzy_eq(e.sender, e.content, s, c):
                     return True
         return False
