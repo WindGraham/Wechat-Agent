@@ -34,21 +34,21 @@
                  这一整个框 = Proxy
 ```
 
-**Proxy ⇄ 交互层的衔接（动作队列 + 屏幕互斥锁）：**
+**Proxy ⇄ 交互层的衔接（XML 包直达，Proxy 只分流不解释）：**
 
-屏幕/设备被交互层循环组长期占用（sweep/心跳/读取都在用），Proxy 不能
-直接执行动作。因此动作走**队列**，不直接调用：
+Proxy 解析 LLM 输出流只做一件事——**分流**：`<task>` 块挑出来交工具层，
+`<reply>` 块保持 XML 原样、按会话打包，投进交互层的动作队列：
 
 ```python
-# Proxy 只投动作，不执行：
-interaction.submit_action(ActionRequest) -> action_id   # 入队即返回
-# 交互层循环组在循环间隙取动作执行（动作优先于发现工作），
-# 执行期间持有屏幕互斥锁（discovery 暂停），完成后：
-on_action_done(action_id, ActionResult)                 # 回调 Proxy
+# Proxy 只分流，不解释块内语义：
+interaction.submit_bundle(session, reply_blocks_xml) -> ok   # 入队即返回
+# 一个 bundle 里多个 <reply> 块如何处理——执行顺序、拆句间隔、
+# 引用怎么点、文件怎么发、与发现工作如何互斥——全是交互层的内部事务
 ```
 
-规则：同一时刻全系统只有一个动作序列持有屏幕锁；发现工作（sweep 等）
-遇到锁被占就顺延；动作失败带 escalation_hint 时 Proxy 决定是否升级任务。
+屏幕互斥（发现工作 vs 发送动作不能同时碰屏幕）由**交互层内部**实现，
+Proxy 无感知。交互层执行失败时回 `ActionResult(ok=False, escalation_hint)`，
+Proxy 决定是否升级为任务。
 
 **并发管理（Proxy 的头等职责）：**
 
@@ -56,10 +56,11 @@ on_action_done(action_id, ActionResult)                 # 回调 Proxy
 |---|---|
 | 决策信号量 `max_concurrent_decisions`（默认 1，用户可调） | 同时在跑的 LLM 决策数上限 |
 | 会话互斥锁 | 同一会话同时刻只允许一个决策，防重复回复 |
-| 屏幕互斥锁（交互层持有） | 动作执行与发现/读取互斥，防 UI 状态互相污染 |
 | 统一事件队列 | 三路输入全部归一化为事件，按优先级出队：主人 > @我 > 任务回执 > 普通新消息 |
 | 任务台账 | subprocess 全生命周期登记（发起/超时/取消/完成路由） |
 | 背压 | 队列超限对新事件合并丢弃（同会话只留最新态），保活优先 |
+
+（屏幕互斥锁不在此列——它是交互层的内部实现细节。）
 
 Proxy 职责清单：
 

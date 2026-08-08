@@ -27,10 +27,12 @@ MessageEvent(
 get_context(session, n=200) -> list[Message]   # 会话历史（默认 200 条灌注）
 get_screen_state() -> ScreenState              # 当前屏幕摘要
 
-# 下行动作：决策层信号落地
-execute(ActionRequest) -> ActionResult
-    ActionRequest(kind="text|image|quote|file", session=..., payload=...)
-    ActionResult(ok, error, retryable, escalation_hint)
+# 下行动作：决策层的 XML 动作包直接落地
+submit_bundle(session, reply_blocks_xml) -> ActionResult
+    # 输入是 <reply> 块序列（XML 原样）。一个包多个块如何执行——
+    # 顺序、拆句间隔、引用怎么点、文件怎么发、与发现工作的屏幕互斥——
+    # 全是本层内部事务，决策层无感知
+    # ActionResult(ok, error, retryable, escalation_hint)
 ```
 
 决策层看到的 Android 私聊和 macOS 群聊没有任何结构差异。
