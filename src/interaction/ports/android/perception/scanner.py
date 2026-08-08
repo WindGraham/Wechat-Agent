@@ -61,16 +61,20 @@ class Scanner:
         """
         r = self.tools.open_wechat()
         if not r.success or r.page != "wechat_home":
-            # 卡页自救：小程序面板/其他页面时先 back 一次再判定（实测面板
-            # 上滑/返回可回首页顶部；不自救会每轮 sweep 都 skip 死循环）
+            # 卡页自救：最多 back 3 次回首页（聊天页输入栏聚焦时第一次 back
+            # 只取消聚焦页面不退，需再按；小程序面板同理）。不自救会每轮 skip
             log.warning("sweep: open_wechat -> success=%s page=%s，尝试 back 自救",
                         r.success, r.page)
-            try:
-                self.tools.dev.back()
-                self.tools.dev.wait_random(600, 1000)
-                r = self.tools.open_wechat()
-            except Exception:  # noqa: BLE001
-                log.exception("sweep 自救 back 失败")
+            for _ in range(3):
+                if r.success and r.page == "wechat_home":
+                    break
+                try:
+                    self.tools.dev.back()
+                    self.tools.dev.wait_random(600, 1000)
+                    r = self.tools.open_wechat()
+                except Exception:  # noqa: BLE001
+                    log.exception("sweep 自救 back 失败")
+                    break
             if not r.success or r.page != "wechat_home":
                 log.warning("sweep: 自救失败 success=%s page=%s (skip)",
                             r.success, r.page)
