@@ -108,16 +108,29 @@ OutputParser（信号解析）都跑在 Proxy 的循环里；Policy（必回/@�
 
 ## 二、输入 prompt 格式（ContextBuilder 组装）
 
+**每个块单独维护一个文件**（`config/prompts/`，md 纯文本），Proxy 按
+`order.txt` 清单拼装，`{占位符}` 填充。改话术/协议只动文件，不碰代码，
+每次决策重读（或按 mtime 缓存）即热生效：
+
+```
+config/prompts/
+├── order.txt                  # 装配顺序清单（一行一个块文件）
+├── system/                    # 静态块（可缓存）
+│   ├── persona.md             # 人设槽位（人格卡渲染填入）
+│   ├── output_protocol.md     # XML 动作块契约（措辞最强硬，必须放 system）
+│   └── tools.md               # chat_history / delegate_task 用法
+└── user/                      # 动态块（占位符模板）
+    ├── session_info.md        # {session} {kind} {time} {trigger}
+    ├── history.md             # {n} {history}
+    ├── new_messages.md        # {new_messages}（编号 m1..mN）
+    └── task_receipt.md        # 任务完成回调时替换 new_messages 块
+```
+
 分 system / user 两个消息位：system 相对静态（可被 API 缓存），
-user 每次决策动态组装。
+user 每次决策动态组装。块内容摘要：
 
-**system：**
-
-| 块 | 内容 | 来源 |
-|---|---|---|
-| 人设 | 身份/性格/说话风格/禁区/核心记忆 | 人格卡（底座+会话卡合并） |
-| 输出协议 | XML 动作块契约的死规定（块类型全集、顺序语义、终止/非终止规则） | 决策层契约 |
-| 可用工具 | `chat_history`（查更早记录）、`delegate_task`（交工具层），带用法与失败指引 | 决策层工具表 |
+**system：** 人设（人格卡合并渲染） / 输出协议（XML 契约死规定） /
+可用工具（用法与失败指引）
 
 **user：**
 

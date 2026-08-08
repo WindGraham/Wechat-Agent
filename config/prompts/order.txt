@@ -1,0 +1,9 @@
+# prompt 块装配清单：Proxy 按本文件顺序拼接（# 开头为注释）
+# system: 静态块（人设由人格卡渲染，见 personas/）
+system/persona.md
+system/output_protocol.md
+system/tools.md
+# user: 动态块（{占位符} 由 Proxy 填充）
+user/session_info.md
+user/history.md
+user/new_messages.md
