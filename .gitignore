@@ -1,0 +1,4 @@
+# 运行时数据（不进 git）
+workspace/
+__pycache__/
+*.pyc
