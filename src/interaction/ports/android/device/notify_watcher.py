@@ -10,7 +10,7 @@
   com.tencent.mm 的 NotificationRecord（key/android.title/android.text/postTime）。
 - NotifyWatcher: 线程，3~6s 随机间隔轮询，key+preview 快照去重（微信会原地更新
   同一条通知，"见到就触发"会重复），新出现或内容变化才产出 NotifyEvent。
-  快照落盘 data/notify_seen.json，重启不重放存量通知。
+  快照落盘 workspace/runtime/notify_seen.json，重启不重放存量通知。
 - NotificationQueue: dict[session] -> QueueEntry，规则见 V2_AGENT_ARCH §3：
   同会话只出现一次 / 未处理则覆盖更新 / count 从"N条新消息"提取否则 +1 /
   mention 粘滞 / pop_on_process / mention 优先、其余按 first_ts FIFO。
@@ -39,10 +39,31 @@ from dataclasses import dataclass, field
 log = logging.getLogger("notify_watcher")
 
 WECHAT_PKG = "com.tencent.mm"
-MENTION_MARK = "@陈曦"          # 群通知正文含此串 → mention 预判（V2_AGENT_ARCH §2.1）
 
-SEEN_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "data", "notify_seen.json")
+PROJECT_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "..", ".."))
+SEEN_PATH = os.path.join(PROJECT_ROOT, "workspace", "runtime", "notify_seen.json")
+
+
+def default_owner_nick():
+    """主人昵称（@我 判定基准）：环境变量 WECHAT_OWNER_NICK 优先，
+    否则读 config/runtime.json 的 owner_nick（CONTRACTS §五）。读不到返回 ''。"""
+    nick = os.environ.get("WECHAT_OWNER_NICK", "").strip()
+    if nick:
+        return nick
+    try:
+        cfg = os.path.join(PROJECT_ROOT, "config", "runtime.json")
+        with open(cfg, encoding="utf-8") as f:
+            return (json.load(f).get("owner_nick") or "").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def mention_mark(owner_nick=None):
+    """群通知正文含此串 → mention 预判（V2_AGENT_ARCH §2.1）。
+    owner_nick 为 None 时按 default_owner_nick() 解析；解析不到返回 ''（不预判）。"""
+    nick = default_owner_nick() if owner_nick is None else owner_nick
+    return f"@{nick}" if nick else ""
 
 NEW_MSG_RE = re.compile(r"(\d+)\s*条新消息")
 
@@ -59,7 +80,7 @@ _TEXT_RE = re.compile(r"^\s*android\.text=\w+ \((.*)\)\s*$", re.M)
 class NotifyEvent:
     session: str        # android.title（群名/昵称）
     preview: str        # android.text（可能是 "N条新消息" 聚合，仅作参考）
-    mention: bool       # preview 含 @陈曦
+    mention: bool       # preview 含 @<owner_nick>
     post_time: int      # 通知 postTime（epoch ms）
     key: str            # NotificationRecord key，去重/清除检测用
     source: str = "notify"
@@ -78,8 +99,10 @@ def _extra(block, regex):
     return "" if v == "null" else v
 
 
-def parse_notifications(dump_text, pkg=WECHAT_PKG):
-    """从 dumpsys notification --noredact 全文中解析指定包的通知事件列表。"""
+def parse_notifications(dump_text, pkg=WECHAT_PKG, owner_nick=None):
+    """从 dumpsys notification --noredact 全文中解析指定包的通知事件列表。
+    owner_nick 注入 @我 判定基准（None 时按 default_owner_nick() 解析）。"""
+    mark = mention_mark(owner_nick)
     events = []
     # 按 NotificationRecord 切块（块头行缩进 4 空格）
     chunks = _RECORD_SPLIT_RE.split(dump_text)
@@ -100,15 +123,16 @@ def parse_notifications(dump_text, pkg=WECHAT_PKG):
             continue
         events.append(NotifyEvent(
             session=title, preview=text,
-            mention=MENTION_MARK in text,
+            mention=bool(mark) and mark in text,
             post_time=post_time, key=key))
     return events
 
 
-def dump_wechat_notifications(dev, pkg=WECHAT_PKG):
+def dump_wechat_notifications(dev, pkg=WECHAT_PKG, owner_nick=None):
     """真机抓取 + 解析。dev 为 DeviceCtl 实例（用其 _shell 统一封装）。"""
     out = dev._shell("dumpsys notification --noredact", timeout=25)
-    return parse_notifications(out.decode(errors="replace"), pkg=pkg)
+    return parse_notifications(out.decode(errors="replace"), pkg=pkg,
+                               owner_nick=owner_nick)
 
 
 # ------------------------------------------------------------------ 监听线程
@@ -120,12 +144,14 @@ class NotifyWatcher(threading.Thread):
     """
 
     def __init__(self, dump_fn, queue, seen_path=SEEN_PATH,
-                 interval=(3.0, 6.0), replay_existing=False):
+                 interval=(3.0, 6.0), replay_existing=False, owner_nick=None):
         super().__init__(daemon=True, name="notify-watcher")
         self._dump_fn = dump_fn
         self._queue = queue
         self._seen_path = seen_path
         self._interval = interval
+        # @我 预判基准：构造注入优先，缺省按环境/配置解析（解析不到 = 不预判）
+        self._mention_mark = mention_mark(owner_nick)
         self._stop_ev = threading.Event()
         self._seen = {}                     # key -> preview（上一次快照）
         if not replay_existing:
@@ -153,6 +179,11 @@ class NotifyWatcher(threading.Thread):
     def poll_once(self):
         """抓一轮：新出现或 text 变化的 key 产出事件；消失的 key 不产出（=已读）。"""
         events = self._dump_fn()
+        if self._mention_mark:
+            # dump_fn 可能没拿到 owner_nick（mention=False），此处按构造注入兜底
+            for e in events:
+                if not e.mention and self._mention_mark in e.preview:
+                    e.mention = True
         cur = {e.key: e for e in events}
         n_new = 0
         for k, e in cur.items():
@@ -190,7 +221,7 @@ BLOCKED_SESSIONS = frozenset({
 
 @dataclass
 class QueueEntry:
-    session: str                # 会话名（匹配监控列表用 wechat_tools._name_match）
+    session: str                # 会话名（匹配监控列表用 shared.name_match._name_match）
     count: int = 0              # 通知条数（"N条新消息"提取，提取不到则逐条 +1）
     latest_preview: str = ""    # 最近一次通知正文
     mention: bool = False       # 任一条含 @我 即 True，粘滞到出队

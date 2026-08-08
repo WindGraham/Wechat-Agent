@@ -7,14 +7,10 @@
   - 每段发送失败等 0.5~1.5s 重试 1 次，仍失败抛 RuntimeError
 底层 ADB 输入/触控随机化（高斯偏移、贝塞尔、jitter）都在 device_ctl 内，
 本层只负责节奏。随机延迟是风控对冲的硬需求，不可删除。
-
-特殊指令：[AGENTS_UPDATE] 开头 → 内容追加到 PROJECT_ROOT/AGENTS.md（带时间戳），
-实际只发"已更新工作指南"（agent 自我配置能力，2026-08-04）。
 """
 
 import logging
 import math
-import os
 import random
 import re
 import time
@@ -27,8 +23,6 @@ FIRST_DELAY_MAX = 30.0        # 首段前延迟上限（秒）
 SEG_DELAY_K = 1.2             # 段间 log(词数+1) 系数
 SEG_DELAY_MAX = 8.0           # 段间延迟上限（秒）
 MAX_SEGMENTS = 3              # 最多分段数，超出合并进最后一段
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))))
 _SEG_SPLIT_RE = re.compile(r"(?<=[。！？!?；;\n])")
 
 
@@ -47,11 +41,6 @@ class Sender:
     def send(self, session, reply_text) -> bool:
         """向会话发送回复，成功返回 True，重试后仍失败抛 RuntimeError。"""
         reply = reply_text or ""
-        # 主人要求更新工作指南：[AGENTS_UPDATE] 内容写入 AGENTS.md，不回发原文
-        if "[AGENTS_UPDATE]" in reply:
-            self._apply_agents_update(reply)
-            reply = "已更新工作指南"
-
         segments = self._split_segments(reply)
         delay = min(FIRST_DELAY_MAX,
                     self.rand_fn(2, 6) + len(reply) * self.rand_fn(0.1, 0.25))
@@ -108,20 +97,3 @@ class Sender:
         if len(parts) <= max_seg:
             return parts
         return parts[:max_seg - 1] + ["".join(parts[max_seg - 1:])]
-
-    @staticmethod
-    def _apply_agents_update(reply):
-        """[AGENTS_UPDATE] 后的内容追加进 AGENTS.md（带时间戳章节）。"""
-        try:
-            body = reply.split("[AGENTS_UPDATE]", 1)[1].strip()
-            if not body:
-                log.warning("AGENTS_UPDATE 内容为空，跳过")
-                return
-            path = os.path.join(PROJECT_ROOT, "AGENTS.md")
-            ts = time.strftime("%Y-%m-%d %H:%M")
-            block = f"\n## 自动更新 {ts}\n\n{body}\n"
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(block)
-            log.info("AGENTS.md 已追加更新: %s", os.path.abspath(path))
-        except Exception:
-            log.exception("apply AGENTS_UPDATE failed")

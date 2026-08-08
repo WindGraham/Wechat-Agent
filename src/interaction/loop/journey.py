@@ -8,18 +8,27 @@
 
 铁律：只要进入一个会话，就必须完成一次日志更新回传才能退出。
 LogUpdated 只在行动清空后发送。
+
+同步失败处理（铁律兜底）：重试 2 次（随机间隔 1~2s），仍失败允许退出，
+但该会话标记 dirty，下一轮循环优先补同步（不允许把 agent 卡死在单个会话里）。
+
+行动吸收不设单会话驻留上限（文档明确"暂不设计"）。ABSORB_FUSE_ROUNDS
+只是防死循环保险丝（对端不停发行动的极端场景），不是驻留限制：
+行动未清空前不许离场，只有连续吸收达到保险丝轮数才强制退出，
+剩余行动留在队列里下轮继续。
 """
 
 import logging
+import random
 import time
 from typing import Optional, Callable
 
-from .unified_queue import UnifiedQueue
+from .unified_queue import UnifiedQueue, QueueEntry
 
 log = logging.getLogger("interaction.journey")
 
-MAX_SESSION_DWELL = 120.0      # 单会话最长驻留秒数
-MAX_FOLLOWUP_ROUNDS = 2        # follow-up 最多追加轮数
+SYNC_MAX_RETRIES = 2             # 日志同步失败后的重试次数
+ABSORB_FUSE_ROUNDS = 20          # 行动吸收防死循环保险丝（非驻留上限，见模块 docstring）
 
 
 class JourneyManager:
@@ -42,14 +51,31 @@ class JourneyManager:
         self._nav = port_navigator
         self._on_log_updated = on_log_updated
 
+        self._dirty: set = set()   # 同步失败的会话：下轮循环优先补同步
+
+        # 可注入（测试用）
+        self._sleep = time.sleep
+        self._rand = random.uniform
+
+    # ------------------------------------------------------------------ 公开访问
+    @property
+    def navigator(self):
+        """端口导航器（供 run_loop 乱逛等场景使用）。"""
+        return self._nav
+
+    def take_dirty_sessions(self) -> list:
+        """取出并清空 dirty 会话集合（run_loop 每轮开头调用，优先补同步）。"""
+        dirty = sorted(self._dirty)
+        self._dirty.clear()
+        return dirty
+
     # ------------------------------------------------------------------ 旅程入口
-    def process_entry(self, entry) -> bool:
+    def process_entry(self, entry: QueueEntry) -> bool:
         """处理一个队列条目：完整的进入→同步→行动→退出旅程。
 
         返回 True 表示有发送动作。
         """
         session = entry.session
-        deadline = time.time() + MAX_SESSION_DWELL
         log.info("=== journey start: %s (kind=%s mention=%s) ===",
                  session, entry.kind, entry.mention)
 
@@ -62,12 +88,17 @@ class JourneyManager:
 
         is_group = self._detect_is_group(session)
 
-        # 2. 同步日志（进会话必做）
-        updated = self._reader.sync_session(session, is_group)
+        # 2. 同步日志（进会话必做，铁律）；失败重试，仍失败 → 标 dirty 退出
+        updated = self._sync_with_retry(session, is_group)
         if updated is None:
-            log.warning("[%s] sync failed, exiting", session)
-            self._nav.back_to_home()
+            log.warning("[%s] sync failed after retries, exit and mark dirty",
+                        session)
+            self._dirty.add(session)
+            # 行动永远不许丢：带进会话的行动条目原样退回队列重试
+            self._handle_action_failure(entry)
+            self._safe_back_home(session)
             return False
+        self._dirty.discard(session)
 
         sent = False
 
@@ -75,38 +106,61 @@ class JourneyManager:
         if entry.kind == "action" and entry.payload:
             sent = self._execute_actions(session, entry)
 
-        # 4. Follow-up：处理期间新来的行动（最多 2 轮）
-        for round_i in range(MAX_FOLLOWUP_ROUNDS):
-            if time.time() > deadline:
-                log.warning("[%s] dwell > %ds, force exit",
-                            session, MAX_SESSION_DWELL)
-                break
+        # 4. Follow-up：处理期间新来的行动一并吸收，直到行动清空。
+        #    不设驻留上限；ABSORB_FUSE_ROUNDS 仅为防死循环保险丝。
+        for round_i in range(ABSORB_FUSE_ROUNDS):
             followup = self._queue.pop_session(session)
             if followup is None or followup.kind != "action":
                 break
             log.info("[%s] follow-up round %d", session, round_i + 1)
 
-            # 再次同步（有新消息可能在处理期间到达）
-            updated2 = self._reader.sync_session(session, is_group)
+            # 再次同步（有新消息可能在处理期间到达）；失败不阻塞行动执行
+            if self._reader.sync_session(session, is_group) is None:
+                log.warning("[%s] follow-up sync failed (round %d)",
+                            session, round_i + 1)
             if followup.payload:
                 sent = self._execute_actions(session, followup) or sent
+        else:
+            # 保险丝熔断：行动未清空，但已连续吸收 ABSORB_FUSE_ROUNDS 轮。
+            # 剩余行动仍在队列中，下轮循环继续处理。
+            log.warning("[%s] absorb fuse blown (%d rounds), force exit",
+                        session, ABSORB_FUSE_ROUNDS)
 
-        # 5. 最后一次日志同步 + 发 LogUpdated
-        final_updated = self._reader.sync_session(session, is_group)
-        if final_updated and self._on_log_updated:
-            self._on_log_updated(final_updated)
+        # 5. 最后一次日志同步 + 发 LogUpdated（铁律：必须回传才能退出）
+        final_updated = self._sync_with_retry(session, is_group)
+        if final_updated is not None:
+            self._dirty.discard(session)
+            if self._on_log_updated:
+                self._on_log_updated(final_updated)
+        else:
+            # 同步彻底失败：允许退出但标 dirty，下轮优先补同步
+            log.warning("[%s] final sync failed, mark dirty", session)
+            self._dirty.add(session)
 
         # 6. 回首页
-        try:
-            self._nav.back_to_home()
-        except Exception:
-            log.exception("[%s] back_to_home failed", session)
+        self._safe_back_home(session)
 
         log.info("=== journey end: %s sent=%s ===", session, sent)
         return sent
 
     # ------------------------------------------------------------------ 内部
-    def _execute_actions(self, session: str, entry) -> bool:
+    def _sync_with_retry(self, session: str, is_group: bool):
+        """同步日志，失败重试 SYNC_MAX_RETRIES 次（随机间隔 1~2s）。
+
+        返回 LogUpdated；彻底失败返回 None。
+        """
+        for attempt in range(SYNC_MAX_RETRIES + 1):
+            updated = self._reader.sync_session(session, is_group)
+            if updated is not None:
+                return updated
+            if attempt < SYNC_MAX_RETRIES:
+                delay = self._rand(1.0, 2.0)
+                log.warning("[%s] sync failed, retry %d/%d in %.1fs",
+                            session, attempt + 1, SYNC_MAX_RETRIES, delay)
+                self._sleep(delay)
+        return None
+
+    def _execute_actions(self, session: str, entry: QueueEntry) -> bool:
         """执行会话的全部待办行动。返回是否发送成功。"""
         if not entry.payload:
             return False
@@ -115,28 +169,37 @@ class JourneyManager:
         if result.ok:
             return True
 
-        # 失败处理
+        # 失败处理：以条目为单位重入队（保留重试计数，B2 修复）
         log.warning("[%s] action failed: %s (retryable=%s)",
                     session, result.error, result.retryable)
         if result.retryable:
-            self._queue.requeue_action(session, entry.payload)
+            self._queue.requeue_entry(entry)
         return False
 
-    def _handle_action_failure(self, entry):
-        """行动执行失败（进会话失败等）。"""
+    def _handle_action_failure(self, entry: QueueEntry):
+        """行动执行失败（进会话失败、同步失败退出等）：行动不许丢。"""
         if entry.kind == "action" and entry.payload:
-            self._queue.requeue_action(entry.session, entry.payload)
+            self._queue.requeue_entry(entry)
+
+    def _safe_back_home(self, session: str):
+        try:
+            self._nav.back_to_home()
+        except Exception:
+            log.exception("[%s] back_to_home failed", session)
 
     def _detect_is_group(self, session: str) -> bool:
-        """检测会话是否为群聊（从端口状态读取）。"""
-        try:
-            # 从端口 reader 的最新 state 中获取
-            state = getattr(self._reader._pr, 'frame_bus', None)
-            if state:
-                latest = state.latest()
-                if latest:
-                    page = latest.get("page", {})
-                    return bool(page.get("is_group") or page.get("member_count"))
-        except Exception:
-            pass
+        """检测会话是否为群聊。
+
+        通过 reader 的公开接口 last_is_group(session) 获取
+        （由 SessionReader 实现，读取端口感知的最新页面状态）。
+        接口缺失或异常时保守默认 True（按群聊处理更安全）。
+        """
+        getter = getattr(self._reader, "last_is_group", None)
+        if callable(getter):
+            try:
+                is_group = getter(session)
+                if is_group is not None:
+                    return bool(is_group)
+            except Exception:
+                log.exception("[%s] last_is_group failed", session)
         return True  # 默认按群聊处理（更安全）

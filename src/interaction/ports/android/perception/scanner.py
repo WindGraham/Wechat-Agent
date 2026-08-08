@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass
 
 from ..device import layout
-from ..action.wechat_tools import _name_match
+from .....shared.name_match import _name_match
 
 log = logging.getLogger("perception.scanner")
 

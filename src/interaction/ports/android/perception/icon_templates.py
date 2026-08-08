@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """icon_templates.py - v2 图标模板库加载器
 
-维护 `samples/ui_inventory/templates/` 下的 PNG 模板，按语义名称聚合变体，
+维护 `assets/icon_templates/` 下的 PNG 模板，按语义名称聚合变体，
 供 `icon_detector.py` 做多尺度模板匹配。
+
+TODO: 模板从旧仓库 samples/ui_inventory/templates 迁移而来（2026-08-08），
+若换新机型/新微信版本需重新截取标定。模板目录缺失时加载返回空表，
+icon_detector 链路优雅降级为"检测不到图标"（state_builder 已按空列表兜底），
+不抛异常。
 """
 
+import logging
 import os
 import cv2
 import numpy as np
 from typing import Dict, List, Tuple
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_TEMPLATE_DIR = os.path.join(BASE_DIR, "samples", "ui_inventory", "templates")
+log = logging.getLogger(__name__)
+
+PROJECT_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "..", ".."))
+DEFAULT_TEMPLATE_DIR = os.path.join(PROJECT_ROOT, "assets", "icon_templates")
 
 
 def _name_and_variant(filename: str) -> Tuple[str, str]:
@@ -30,6 +39,9 @@ def load_template_variants(template_dir: str = DEFAULT_TEMPLATE_DIR) -> Dict[str
     """
     templates: Dict[str, List[Tuple[str, np.ndarray]]] = {}
     if not os.path.isdir(template_dir):
+        # 优雅降级：模板缺失不抛异常，icon 检测返回空（见模块 docstring TODO）
+        log.warning("icon template dir missing: %s (icon detection degraded)",
+                    template_dir)
         return templates
 
     for filename in sorted(os.listdir(template_dir)):

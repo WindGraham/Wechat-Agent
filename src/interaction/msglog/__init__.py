@@ -8,6 +8,8 @@
 from .message_log import (
     connect,
     get_or_create_session,
+    set_session_kind,
+    get_session_kind,
     get_sync_version,
     increment_sync_version,
     get_new_since,

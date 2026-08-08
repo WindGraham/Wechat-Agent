@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS messages (
     align_key    TEXT NOT NULL,
     msg_uid      TEXT NOT NULL UNIQUE,
     mentions     TEXT DEFAULT '',
+    media_path   TEXT DEFAULT '',         -- 多媒体裁图归档路径（CONTRACTS §一）
     frame_phash  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_session_seq ON messages(session_id, seq);
@@ -96,23 +97,65 @@ def connect(db_path):
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
+# 老库兼容：schema 后加列时，对已存在的 db 文件做 ALTER TABLE 补列
+_MIGRATIONS = (
+    ("messages", "media_path", "ALTER TABLE messages ADD COLUMN media_path TEXT DEFAULT ''"),
+)
+
+
+def _migrate(conn):
+    cols_cache = {}
+    for table, col, ddl in _MIGRATIONS:
+        if table not in cols_cache:
+            cols_cache[table] = {r["name"] for r in
+                                 conn.execute(f"PRAGMA table_info({table})")}
+        if col not in cols_cache[table]:
+            conn.execute(ddl)
+    conn.commit()
+
+
 def get_or_create_session(conn, name, is_group, name_full=None):
+    """按名字取会话，不存在才创建（is_group 只在新建时写入）。
+
+    已存在会话**绝不覆写 is_group**——读取路径（get_context/get_new_since）
+    拿不到真实 is_group，覆写会把群聊改成私聊（B4 数据破坏）。
+    旅程实测到真实值时用 set_session_kind 显式更新。"""
     row = conn.execute("SELECT session_id FROM sessions WHERE name=?",
                        (name,)).fetchone()
     if row:
-        # 更新 is_group（实测可能比配置更准确）
-        conn.execute("UPDATE sessions SET is_group=? WHERE session_id=?",
-                     (1 if is_group else 0, row["session_id"]))
-        conn.commit()
         return row["session_id"]
     cur = conn.execute(
         "INSERT INTO sessions(name, name_full, is_group, created_ts)"
         " VALUES(?,?,?,?)", (name, name_full, 1 if is_group else 0, time.time()))
     conn.commit()
     return cur.lastrowid
+
+
+def set_session_kind(conn, name, is_group):
+    """旅程实测到真实 is_group 后显式更新（get_or_create_session 不覆写）。
+    值无变化时不写库。返回是否发生了更新。"""
+    row = conn.execute("SELECT session_id, is_group FROM sessions WHERE name=?",
+                       (name,)).fetchone()
+    if not row:
+        return False
+    val = 1 if is_group else 0
+    if row["is_group"] == val:
+        return False
+    conn.execute("UPDATE sessions SET is_group=? WHERE session_id=?",
+                 (val, row["session_id"]))
+    conn.commit()
+    return True
+
+
+def get_session_kind(conn, name):
+    """查询会话 is_group（读路径补 Message.is_group 用）。未知会话返回 False。"""
+    row = conn.execute("SELECT is_group FROM sessions WHERE name=?",
+                       (name,)).fetchone()
+    return bool(row["is_group"]) if row else False
 
 
 # ---------------------------------------------------------------- 归一化与对齐键
@@ -162,8 +205,8 @@ def update_content(conn, session_id, sender, content, new_content):
             break
     if target is None:
         return 0
-    conn.execute("UPDATE messages SET content=? WHERE id=?",
-                 (new_content, target))
+    conn.execute("UPDATE messages SET content=?, content_norm=? WHERE id=?",
+                 (new_content, normalize(new_content), target))
     conn.commit()
     return 1
 
@@ -254,7 +297,7 @@ LOG_TAIL_N = 50           # 日志末尾参与锚定的条数
 def session_tail(conn, session_id, n=LOG_TAIL_N):
     """日志末尾 n 条，按 seq 升序（最新在尾）。mentions 一并取出（@我标注用）。"""
     rows = conn.execute(
-        "SELECT seq, sender, content, content_type, mentions FROM messages"
+        "SELECT seq, sender, content, content_type, mentions, media_path FROM messages"
         " WHERE session_id=? ORDER BY seq DESC LIMIT ?",
         (session_id, n)).fetchall()
     return [dict(r) for r in reversed(rows)]
@@ -376,16 +419,17 @@ def _insert_rows(conn, session_id, entries, first_seq, source, captured_ts,
         else:
             complete = 1
         mentions = ",".join(getattr(e, "mentions", None) or [])
+        media_path = getattr(e, "media_path", None) or ""
         cur = conn.execute(
             "INSERT OR IGNORE INTO messages"
             "(session_id, seq, ts_hint, ts_text, ts_captured, sender,"
             " is_mine, content_type, content, content_norm, complete,"
-            " ocr_conf, source, align_key, msg_uid, mentions)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " ocr_conf, source, align_key, msg_uid, mentions, media_path)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (session_id, seq, ts_hint, ts_text, captured_ts, sender,
              1 if getattr(e, "is_mine", False) else 0, ctype, content,
              content_norm, complete, getattr(e, "ocr_conf", None), source,
-             akey, _msg_uid(session_id, seq, akey), mentions))
+             akey, _msg_uid(session_id, seq, akey), mentions, media_path))
         inserted += cur.rowcount
         min_seq = seq if min_seq is None else min(min_seq, seq)
         max_seq = seq if max_seq is None else max(max_seq, seq)
@@ -608,11 +652,12 @@ def get_new_since(conn, session_id, last_seq):
     """水位差分：返回 seq > last_seq 的所有消息（严格大于），按 seq 升序。
 
     这是"哪些消息是新的"的唯一判定方式——不再需要通知正文猜测。
-    返回 list[dict]，每条含 seq/sender/content/content_type/is_mine/mentions/ts_hint。
+    返回 list[dict]，每条含 seq/sender/content/content_type/is_mine/mentions/
+    media_path/ts_hint。
     """
     rows = conn.execute(
         "SELECT seq, sender, content, content_type, is_mine, mentions,"
-        " ts_hint, ts_text, ts_captured"
+        " media_path, ts_hint, ts_text, ts_captured"
         " FROM messages WHERE session_id = ? AND seq > ?"
         " ORDER BY seq ASC",
         (session_id, last_seq)).fetchall()
@@ -624,7 +669,7 @@ def get_context(conn, session_id, n=200):
     用于拼 prompt 的历史灌注。"""
     rows = conn.execute(
         "SELECT seq, sender, content, content_type, is_mine, mentions,"
-        " ts_hint, ts_text"
+        " media_path, ts_hint, ts_text"
         " FROM messages WHERE session_id = ?"
         " ORDER BY seq DESC LIMIT ?",
         (session_id, n)).fetchall()

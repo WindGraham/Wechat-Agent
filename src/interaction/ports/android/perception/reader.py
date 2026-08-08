@@ -12,9 +12,9 @@ from ....msglog import message_log as msg_log
 
 log = logging.getLogger("perception.reader")
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))))
-DB_PATH = os.path.join(PROJECT_ROOT, "data", "chatlog.db")
+PROJECT_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "..", ".."))
+DB_PATH = os.path.join(PROJECT_ROOT, "workspace", "chatlogs", "chatlog.db")
 
 
 @dataclass
@@ -31,6 +31,8 @@ class SnapEntry:
     partial_top: bool = False
     partial_bottom: bool = False
     time_hint: str = None
+    media_id: str = ""                # 多媒体归档 id（media_archive 标注）
+    media_path: str = ""              # 多媒体裁图归档路径（写库进 messages.media_path）
 
 
 class Reader:

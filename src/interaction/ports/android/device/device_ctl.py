@@ -16,6 +16,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -26,7 +27,9 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from .random_touch import Rect, RandomTouch
 
-ADB_PATH = "/media/data_old/wechat-agent/tools/platform-tools/adb"
+PROJECT_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "..", ".."))
+ADB_PATH = os.path.join(PROJECT_ROOT, "tools", "platform-tools", "adb")
 SERIAL = "cf04642e"
 
 WECHAT_PKG = "com.tencent.mm"
@@ -34,8 +37,13 @@ WECHAT_MAIN_ACTIVITY = "com.tencent.mm/.ui.LauncherUI"
 
 ADBKB_PKG = "com.android.adbkeyboard"
 ADBKB_IME = "com.android.adbkeyboard/.AdbIME"
-ADBKB_APK = "/tmp/ADBKeyboard.apk"
+# apk 放项目内（/tmp 会丢）；缺失时从旧位置拷贝兜底，都没有则报错提示
+ADBKB_APK = os.path.join(PROJECT_ROOT, "tools", "ADBKeyboard.apk")
+ADBKB_APK_LEGACY = "/tmp/ADBKeyboard.apk"
 ADBKB_APK_URL = "https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKeyboard.apk"
+
+# 截图落盘目录（capture_bytes 内存截图是主路径；落盘版仅调试用，用完即删）
+CAPTURE_TMP_DIR = os.path.join(PROJECT_ROOT, "workspace", "runtime", "tmp")
 
 SCREEN_W, SCREEN_H = 1080, 2340
 
@@ -111,12 +119,15 @@ class DeviceCtl:
 
     # ----------------------------------------------------------------- 截图
     def capture(self):
-        """截图存 /tmp/wx_cap_<timestamp>.png，校验 PNG magic，坏图重试一次。"""
+        """落盘版截图（仅供调试；主路径是 capture_bytes 内存截图）。
+        落 workspace/runtime/tmp/wx_cap_<timestamp>.png，调用方用完必须自行删除。"""
+        os.makedirs(CAPTURE_TMP_DIR, exist_ok=True)
         for attempt in range(2):
             with self._cap_lock:
                 data = self._run(["exec-out", "screencap", "-p"], timeout=30, retries=0)
             if data.startswith(PNG_MAGIC) and len(data) > 1024:
-                path = f"/tmp/wx_cap_{int(time.time() * 1000)}.png"
+                path = os.path.join(
+                    CAPTURE_TMP_DIR, f"wx_cap_{int(time.time() * 1000)}.png")
                 with open(path, "wb") as f:
                     f.write(data)
                 log.debug("captured %s (%d bytes)", path, len(data))
@@ -225,8 +236,16 @@ class DeviceCtl:
             return
         log.info("ADBKeyBoard not installed, installing...")
         if not os.path.exists(ADBKB_APK):
-            subprocess.run(["curl", "-sL", "-o", ADBKB_APK, ADBKB_APK_URL],
-                           check=True, timeout=120)
+            # 项目内 apk 缺失：从旧位置（/tmp）拷贝兜底
+            if os.path.exists(ADBKB_APK_LEGACY):
+                os.makedirs(os.path.dirname(ADBKB_APK), exist_ok=True)
+                shutil.copy(ADBKB_APK_LEGACY, ADBKB_APK)
+                log.info("ADBKeyboard.apk copied from %s", ADBKB_APK_LEGACY)
+            else:
+                raise RuntimeError(
+                    f"ADBKeyboard.apk 缺失：{ADBKB_APK} 不存在，"
+                    f"旧位置 {ADBKB_APK_LEGACY} 也没有。"
+                    f"请手动下载放到项目内：{ADBKB_APK_URL}")
         self._run(["install", "-r", ADBKB_APK], timeout=120)
 
     def _split_chunks(self, text):

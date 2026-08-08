@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
-"""wechat_tools.py — Phase 3 工具层：把微信封装成 6 个语义化工具供 LLM agent 调用。
+"""wechat_tools.py — 端口工具层：把微信封装成语义化工具（发送/导航/滚动/读屏）。
 
 每个工具 = 动作 + 状态查询，返回 ToolResult（含页面文字描述 + 可用动作）。
 仅适配 OnePlus 6T (1080x2340, 深色模式) + 微信 8.0.76。
 
-依赖：src/device_ctl.py（DeviceCtl）、src/v2/state_builder.py（V2 感知层）。
+依赖：..device.device_ctl（DeviceCtl）、..perception.state_builder /
+..perception.ocr_engine（V2 感知层）。
 硬性约束：截图即读即删（capture_bytes 内存截图 + 内存解析，全程不落盘）。
 """
 
+# 本模块直接连接真实手机：以脚本方式直接运行没有任何安全的自测可做
+# （旧自测脚本会真实发消息，已移除）。闸门放在 import 之前——直接运行时
+# 包相对 import 必然失败，必须先拦住并给出说明。
+if __name__ == "__main__":
+    print("wechat_tools.py 不提供自测入口：直接运行会真实操作手机微信，已禁用。"
+          "请用离线单测（假 dev）验证逻辑。")
+    raise SystemExit(1)
+
 import logging
-import os
-import re
-import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ..device.device_ctl import DeviceCtl
 from ..perception.state_builder import build_state as _v2_build_state
@@ -51,48 +55,10 @@ class ToolResult:
         return head
 
 
-def _norm(s):
-    """名字匹配归一化：去空白和括号成员数。"""
-    if not s:
-        return ""
-    s = "".join(str(s).split())
-    for sep in ("(", "（"):
-        if sep in s:
-            s = s.split(sep)[0]
-    return s
-
-
-def _fold(s):
-    """OCR 易混字符折叠（实测："Doo" 被识别成 "Do0"）：0/O->o，小写化。"""
-    return s.lower().replace("0", "o")
-
-
-def _elide_match(elided, full):
-    """聊天页标题栏长名字会被微信省略成 '前段..后段'：分段按序匹配全文。
-    OCR 可能把省略号读成单个 '.'（2026-08-04 实测 '怨憎会爱别离要.风要雨得雨'），
-    因此单个点也按省略处理。"""
-    parts = [p for p in re.split(r"\.+|…", elided) if p]
-    if len(parts) < 2:
-        return False
-    pos = 0
-    for p in parts:
-        i = full.find(p, pos)
-        if i < 0:
-            return False
-        pos = i + len(p)
-    return True
-
-
-def _name_match(a, b):
-    a, b = _norm(a), _norm(b)
-    if not a or not b:
-        return False
-    if a == b or a in b or b in a:
-        return True
-    if "." in a or "." in b or "…" in a or "…" in b:
-        return _elide_match(a, b) or _elide_match(b, a)
-    fa, fb = _fold(a), _fold(b)          # OCR 混淆容错
-    return fa == fb or fa in fb or fb in fa
+# 名字匹配逻辑已下沉到 shared/name_match.py（scanner/sender 共用），
+# 此处 re-export 保持向后兼容
+from .....shared.name_match import (  # noqa: E402,F401
+    _norm, _fold, _elide_match, _name_match)
 
 
 # ------------------------------------------------------------------ 主类
@@ -509,76 +475,3 @@ class WeChatTools:
         """内存截图 -> 全图 OCR，返回 ocr_items（不落盘）。"""
         return _v2_run_ocr(self.dev.capture_bytes())
 
-
-# --------------------------------------------------------------------- 自测
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    tools = WeChatTools()
-
-    def show(tag, r, max_lines=14):
-        print(f"\n{'=' * 60}\n{tag}\n{r.summary()}")
-        lines = r.description.splitlines()
-        for ln in lines[:max_lines]:
-            print("  " + ln)
-        if len(lines) > max_lines:
-            print(f"  ... ({len(lines) - max_lines} more lines)")
-
-    # 1. open_wechat -> 首页 7 个会话
-    r1 = tools.open_wechat()
-    show("STEP 1: open_wechat", r1)
-    sessions = [ln for ln in r1.description.splitlines()
-                if ln and ln[0].isdigit() and ". " in ln]
-    print(f"  >> 会话数: {len(sessions)}")
-    assert r1.success and r1.page == "wechat_home", "step1 failed"
-
-    # 2. enter_session("风图")
-    r2 = tools.enter_session("风图")
-    show("STEP 2: enter_session(风图)", r2)
-    assert r2.success and r2.page == "wechat_chat", "step2 failed"
-
-    # 3. scroll_up -> 更早消息
-    r3 = tools.scroll_up()
-    show("STEP 3: scroll_up", r3)
-    changed = r3.description != r2.description
-    print(f"  >> 内容变化: {changed}")
-
-    # 4. scroll_down -> 回底部
-    r4 = tools.scroll_down()
-    show("STEP 4: scroll_down", r4)
-
-    # 5. send_text 测试消息（仅风图，仅此 1 条）
-    r5 = tools.send_text("自动回复功能测试，请忽略")
-    show("STEP 5: send_text", r5)
-    assert r5.success, "step5 failed: " + str(r5.error)
-
-    # 6. back -> 首页
-    r6 = tools.back()
-    show("STEP 6: back", r6)
-    assert r6.page == "wechat_home", f"step6: not home, got {r6.page}"
-
-    # 7. enter_session("特高课") 群聊 member_count=6
-    r7 = tools.enter_session("特高课")
-    show("STEP 7: enter_session(特高课)", r7)
-    assert r7.success, "step7 failed"
-
-    # 8. back -> 长群名会话（列表第 5 个）
-    r8 = tools.back()
-    show("STEP 8a: back", r8, max_lines=6)
-    r9 = tools.enter_session("怨憎会 爱别离 要风得风要雨得雨")
-    show("STEP 8b: enter_session(长群名)", r9)
-    assert r9.success, "step8 failed"
-
-    # 9. 搜索 fallback：enter_session("Leisure")（列表没有，可能搜不到）
-    r10 = tools.back()
-    r11 = tools.enter_session("Leisure")
-    show("STEP 9: enter_session(Leisure) 搜索fallback", r11)
-    print(f"  >> 搜索 fallback 结果: success={r11.success} error={r11.error}")
-    if r11.success:
-        tools.back()   # 真进去了就退出来，不发任何消息
-
-    # 清理残留截图
-    leftover = [f for f in os.listdir("/tmp") if f.startswith("wx_cap_")]
-    for f in leftover:
-        os.remove(os.path.join("/tmp", f))
-    print(f"\nALL DONE. leftover screenshots cleaned: {len(leftover)}")

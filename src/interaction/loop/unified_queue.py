@@ -11,27 +11,11 @@
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
 from typing import Optional
 
+from ...shared.types import QueueEntry
+
 log = logging.getLogger("interaction.queue")
-
-
-@dataclass
-class QueueEntry:
-    """统一时间序队列中的一条记录。"""
-    kind: str = ""             # "notify" | "action"
-    session: str = ""
-    ts: float = 0.0            # 入队时间
-    mention: bool = False      # @我/主人 → 插队队首
-    payload: str = ""          # action 时为 XML bundle 原文；notify 时为空
-    attempts: int = 0          # 已尝试次数
-    sources: set = field(default_factory=set)  # {"sweep", "notify", "heartbeat"}
-
-    @property
-    def is_priority(self) -> bool:
-        """是否为优先条目（@我/主人）。"""
-        return self.mention
 
 
 class UnifiedQueue:
@@ -42,7 +26,8 @@ class UnifiedQueue:
 
     def __init__(self, max_attempts: int = 2):
         self._entries: dict[str, QueueEntry] = {}  # session → entry
-        self._lock = threading.Lock()
+        # RLock：requeue_action 的"全新入队"分支会在持锁状态下调用 push_action
+        self._lock = threading.RLock()
         self._max_attempts = max_attempts
 
     # ------------------------------------------------------------------ 入队
@@ -56,7 +41,10 @@ class UnifiedQueue:
         with self._lock:
             existing = self._entries.get(session)
             if existing is not None:
-                # 已在队列中：不挪动，只登记来源和 @我 粘滞
+                # 已在队列中：不挪动，只登记来源和 @我 粘滞。
+                # 注意：mention 升级（@我 粘滞）是对"去重不挪动"的有意例外——
+                # 它只改优先级标记，不改 ts，FIFO 位置保持不变；
+                # 插队效果体现在 pop_next 的 priority 排序上，而非挪动条目。
                 existing.sources.add(source)
                 if mention:
                     existing.mention = True
@@ -127,8 +115,54 @@ class UnifiedQueue:
             return self._entries.pop(session, None)
 
     # ------------------------------------------------------------------ 重试
+    def requeue_entry(self, entry: QueueEntry) -> QueueEntry:
+        """行动失败后把已出队的条目重新入队（保留重试计数）。
+
+        供旅程管理器使用：pop_next/pop_session 出队即删，直接调
+        requeue_action 会因查不到条目而永远走"新建 attempts=0"分支，
+        重试计数失效。此方法以条目对象为输入：
+
+        - 未达上限：attempts+1，按原 ts 重新入队（保持原位置语义）
+        - 达到上限：作为新条目排到队尾（attempts 归零、ts 更新）。
+          行动永远不许丢——它承载着对用户的承诺。
+        """
+        with self._lock:
+            entry.attempts += 1
+            if entry.attempts >= self._max_attempts:
+                # 耗尽：作为新条目排到队尾（ts=now → FIFO 尾部）
+                new_entry = QueueEntry(
+                    kind="action", session=entry.session,
+                    ts=time.time(),
+                    mention=entry.mention,
+                    payload=entry.payload,
+                    attempts=0,
+                    sources=set(entry.sources),
+                )
+                self._entries[entry.session] = new_entry
+                log.warning("queue: %s max attempts reached, requeued at tail",
+                            entry.session)
+                return new_entry
+            # 未达上限：原条目按原 ts 放回，保持原位置语义
+            self._entries[entry.session] = entry
+            log.info("queue: %s retry %d/%d",
+                     entry.session, entry.attempts, self._max_attempts)
+            return entry
+
+    def reinsert(self, entry: QueueEntry) -> None:
+        """把已出队的条目原样放回队列（不碰 attempts/ts）。
+
+        用于暂停模式：行动条目永不许丢，暂停时 pop 出的行动必须
+        原样放回（保持原位置）。
+        """
+        with self._lock:
+            self._entries[entry.session] = entry
+            log.info("queue: %s reinserted (kind=%s)", entry.session, entry.kind)
+
     def requeue_action(self, session: str, blocks_xml: str) -> Optional[QueueEntry]:
-        """行动失败后重新入队。
+        """行动失败后重新入队（向后兼容接口）。
+
+        旅程管理器应优先使用 requeue_entry（pop 出队后条目已删，
+        按 session 查找会落空，重试计数失效）。本接口保留给外部调用方。
 
         - 未达上限：保持原位置重试
         - 达到上限：排到队尾（作为新条目）
