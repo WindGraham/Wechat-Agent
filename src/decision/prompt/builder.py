@@ -56,10 +56,29 @@ class ContextBuilder:
             lines.append(f"m{i} {sender}: {content}")
         return "\n".join(lines)
 
+    @staticmethod
+    def render_running_tasks(running_tasks) -> str:
+        """执行中任务台账 → 实时板块文本行。"""
+        if not running_tasks:
+            return "无"
+        lines = []
+        now = time.time()
+        for t in running_tasks:
+            elapsed = int(now - t.get("started_at", now))
+            mins, secs = divmod(elapsed, 60)
+            dur = f"{mins}分{secs}秒" if mins else f"{secs}秒"
+            lines.append(f"- {t.get('task_id', '?')}：{t.get('desc') or '（无描述）'}"
+                         f"（已进行 {dur}）")
+        return "\n".join(lines)
+
     # ---------------------------------------------------------------- 主构建
     def build(self, session: str, is_group: bool, trigger: str,
-              history, new_messages, tool_feedback: str = "") -> list:
-        """返回 [{"role": "system", ...}, {"role": "user", ...}]。"""
+              history, new_messages, tool_feedback: str = "",
+              running_tasks=None) -> list:
+        """返回 [{"role": "system", ...}, {"role": "user", ...}]。
+
+        running_tasks: 该会话执行中的后台任务台账记录列表（实时板块，
+        防重复委派 + 让 LLM 知道"已经派人去办了"）。"""
         persona_text = self._personas.render(session)
         system_parts = self._lib.system_blocks(persona=persona_text)
         system = "\n\n".join(p for p in system_parts if p)
@@ -82,6 +101,9 @@ class ContextBuilder:
             user_parts.append(self._lib.user_block(
                 "new_messages",
                 new_messages=self.render_new_messages(new_messages)))
+        user_parts.append(self._lib.user_block(
+            "running_tasks",
+            lines=self.render_running_tasks(running_tasks)))
         if tool_feedback:
             user_parts.append(f"【工具返回】\n{tool_feedback.strip()}")
 

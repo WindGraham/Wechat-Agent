@@ -298,6 +298,61 @@ def _find_send_btn(img, ocr_items):
     return None
 
 
+# ------------------------------------------------------------------ 预览条清理
+# 预览 pill 的 × 是小图标，OCR 读不出来（2026-08-08 真机实测）。
+# 改为检测 pill 文字：预览条无论聚焦/未聚焦都贴在 y 2030~2150 地带
+# （聚焦态在输入框下方、未聚焦态在输入框上方），正常聊天消息不会出现在
+# 这个高度；× 固定在 pill 右端内侧（OnePlus 6T 实测 x≈728）。
+_PREVIEW_PILL_BAND = (2020, 2150)
+_PREVIEW_CLOSE_X = 728
+_PREVIEW_IGNORE = ("ADB Keyboard", "按住说话", "发送")
+
+
+def find_quote_preview_close(ocr_items):
+    """引用预览条关闭按钮中心 (cx, cy, pill_text)；无预览返回 None。
+
+    引用发送失败会把预览条留在输入栏地带：不点掉的话下一条普通发送
+    会被当成引用发出（2026-08-08 用户实测）。pill_text 用于点完后复验
+    （同文消失才算点掉，防止对无关 OCR 噪声补点误触输入框）。"""
+    for it in ocr_items:
+        cx, cy = _item_cxy(it)
+        if not (_PREVIEW_PILL_BAND[0] <= cy <= _PREVIEW_PILL_BAND[1]):
+            continue
+        raw = (it.get("text") or "").strip()
+        if not raw or any(k in raw for k in _PREVIEW_IGNORE):
+            continue
+        return _PREVIEW_CLOSE_X, int(cy), raw
+    return None
+
+
+def dismiss_quote_preview(dev, ocr_fn=None):
+    """存在引用预览条则点 × 关掉（发送失败后的状态清理）。
+    复验认 pill 原文：原文消失才算成功；最多补点一次。返回是否清除。"""
+    ocr_fn = ocr_fn or _default_ocr
+    pill = None
+    for attempt in range(2):
+        try:
+            items = ocr_fn(dev.capture_bytes())
+        except Exception:
+            log.exception("dismiss_quote_preview ocr failed")
+            return False
+        found = find_quote_preview_close(items)
+        if found is None:
+            return pill is not None or attempt > 0
+        if pill is not None and normalize(found[2]) != normalize(pill):
+            return True                 # 原 pill 已消失，残留的是别的噪声
+        pill = found[2]
+        _dev_tap(dev, found[0] + attempt * 30, found[1])
+        _dev_wait(dev, time.sleep, 300, 700)
+        log.info("quote preview close tapped @(%d,%d) (attempt %d)",
+                 found[0], found[1], attempt)
+    # 最后确认一次
+    try:
+        return find_quote_preview_close(ocr_fn(dev.capture_bytes())) is None
+    except Exception:
+        return False
+
+
 def _sent_visible(ocr_items, reply_text):
     """轻验证：内容区出现回复文本（不判失败，仅标记——防重复发送，同
     wechat_tools._send_once 先例）。"""
@@ -380,6 +435,8 @@ def quote_reply(dev, match_text=None, match_sender=None, reply_text=None,
     img4 = dev.capture_bytes()
     btn = _find_send_btn(img4, ocr_fn(img4))
     if btn is None:
+        # 清理残留预览条：不点掉会盖住输入框点按区、下一条普通发送变引用
+        dismiss_quote_preview(dev, ocr_fn)
         return fail("send_button", "输入后发送按钮未出现（文本未上屏？）")
     _dev_tap(dev, *btn)
     _dev_wait(dev, sleep_fn, 600, 1200)

@@ -7,6 +7,7 @@ system/tools.md
 user/session_info.md
 user/history.md
 user/new_messages.md
+user/running_tasks.md
 # 注：user/task_receipt.md 不是常规装配块，不列进默认装配顺序。
 # 它由 Proxy 在任务回调（工具层 TaskResult 返回）时使用——
 # 临时替换 new_messages 块的位置，向 LLM 汇报任务结果。

@@ -74,6 +74,27 @@ MAX_TOOL_CALLS = 3            # chat_history 每轮最多 3 次
 MAX_REPLY_BLOCKS = 3          # 一轮最多 3 个 <reply>（防刷屏）
 MAX_TASK_BLOCKS = 1           # 一轮最多 1 个 <task>
 
+# 工具层简报 preamble：向 CLI 核心说明处境与输出格式（2026-08-08 用户要求：
+# kimicode 必须知道自己是在替一个微信人格 agent 动手，最终文本会被程序解析）
+TASK_BRIEF_PREAMBLE = """\
+你是微信人格 agent「陈曦」的后台执行核心。她在微信里陪用户聊天，
+自己没有操作电脑的能力；凡是需要动手的事（找图、下载、做文件、
+查资料、跑程序、处理数据），她都委派给你独立完成后回传结果。
+
+你运行在她的电脑上，可以用终端做几乎任何事：联网搜索/下载、
+运行脚本、处理图片与文件、读写代码、调用本机已有工具。
+
+工作约定：
+- 当前目录就是你的专属工作目录，交付物一律保存到 ./files/ 子目录
+- 图片/文件务必下载落盘，不要只给网络链接（她打不开链接）
+- 拿不准的结果宁可说不确定，不许编造
+
+最终回复格式（硬性要求，程序会解析你的最后一条消息）：
+1. 一句话总结：成了什么 / 没成什么
+2. 每个交付物单独一行：DELIVERABLE: <本机绝对路径>
+3. 需要她转达给用户的话（一两句口语，她会说微信里）
+做不到就直说做不到并说明卡在哪，不许假装成功。"""
+
 # 事件类型
 EV_LOG_UPDATED = "log_updated"
 EV_TASK_DONE = "task_done"
@@ -264,7 +285,8 @@ class Proxy:
         for _round in range(MAX_TOOL_CALLS + 2):
             messages = self._builder.build(
                 session, is_group, trigger, history, new_msgs,
-                tool_feedback=tool_feedback)
+                tool_feedback=tool_feedback,
+                running_tasks=self._ledger.running_for(session))
             _journal("prompt", session=session, round=_round,
                      system=_clip("\n\n".join(
                          m.get("content", "") for m in messages
@@ -403,9 +425,9 @@ class Proxy:
                           deliver=attrs.get("deliver", "reply"))
 
         def _work():
-            full_brief = (f"{brief.goal}\n\n相关背景：\n{brief.context}\n\n"
-                          "最后一律用一句话总结：成了什么、交付物在哪"
-                          "（本机绝对路径）、需要告诉用户什么。")
+            full_brief = (f"{TASK_BRIEF_PREAMBLE}\n\n"
+                          f"【本次任务】\n{brief.goal}\n\n"
+                          f"【相关背景】\n{brief.context}")
             result = self._cli.run(full_brief, task["workdir"])
             self._ledger.finish(task["task_id"], result.ok,
                                 result.cli_session_id)

@@ -10,9 +10,10 @@
   push 图片到相册目录 → 媒体扫描广播 → 加号面板 → 相册 →
   选第一张 → OCR 验证"发送(N)" → 发送（逐步 OCR 校验，不盲点）
 
-文件流程：push 到 /sdcard/Download → 加号面板（第二页）"文件" →
-  文件选择器里按文件名 OCR 查找（当前列表没有则进"手机存储"/Download 目录找）
-  → 选中后 OCR 验证"发送" → 发送。
+文件流程（2026-08-08 真机重测，旧"手机存储/Download"路径已废弃）：
+  push 到 /sdcard/Download + touch 刷新 mtime（保证 SAF 最近列表排第一）→
+  加号面板（第二页）"文件" → "选择文件"页点"手机文件"标签 → 点"选取" →
+  系统 SAF 选择器"最近"列表第一行就是我们的文件 → 点选 → "发送"。
 
 输入栏聚焦两态处理（2026-08-07 旧仓库修复实录）：聚焦时底部有
 "ADB Keyboard {ON}" 细条，整条输入栏顶起 ~125px，⊕ 中心 2185→2060；
@@ -160,22 +161,27 @@ def send_image(dev, path):
 
 
 # ------------------------------------------------------------------ 发文件
+# SAF"最近"列表第一行（浏览应用区之下、列表区首行，OnePlus 6T 实测）
+SAF_FIRST_ROW = Rect(150, 880, 700, 130)
+
+
 def send_file(dev, path):
-    """把本地文件发到当前聊天页（加号面板"文件"项 → 文件选择器）。
+    """把本地文件发到当前聊天页（加号面板"文件" → 手机文件 → SAF 最近列表）。
 
     返回 {"ok": bool, "step": ..., ...}。调用方须已在目标聊天页。
-    """
+    文件选择策略：push 后 touch 刷新 mtime，SAF"最近"列表第一行必是它，
+    直接点第一行（2026-08-08 与用户确认的交互路径）。"""
     # 1. 校验本地文件
     if not path or not os.path.isabs(path):
         return _fail("args", f"path 必须是本机绝对路径: {path!r}")
     if not os.path.isfile(path):
         return _fail("args", f"本地文件不存在: {path}")
-    basename = os.path.basename(path)
 
-    # 2. push + 媒体扫描
-    phone_path = f"{PHONE_FILE_DIR}/{basename}"
+    # 2. push + 媒体扫描 + touch（mtime 刷成现在，SAF 最近列表排第一）
+    phone_path = f"{PHONE_FILE_DIR}/agent_file{os.path.splitext(path)[1]}"
     try:
         _push_to_phone(dev, path, phone_path)
+        dev._shell(f"touch {shlex.quote(phone_path)}", timeout=5)
     except Exception as e:
         return _fail("push", f"push 文件到手机失败: {e}", dev, phone_path)
 
@@ -187,49 +193,41 @@ def send_file(dev, path):
     r = plus_panel.plus_panel_tap(dev, "文件")
     if not r["success"]:
         return _fail("file_tap", r["error"], dev, phone_path)
-    dev.wait_random(1000, 1500)
+    dev.wait_random(1200, 1800)
 
-    # 5. 文件选择器：当前列表按文件名 OCR 查找；没有则进"手机存储"→ Download 找
-    if not _tap_file_in_picker(dev, basename):
-        return _fail("file_pick", f"文件选择器中找不到: {basename}", dev, phone_path)
-    dev.wait_random(600, 1000)
+    # 5. "选择文件"页 → "手机文件"标签 → "选取"按钮 → SAF 选择器
+    if not _ocr_find(dev, "选择文件", ymax=300):
+        return _fail("picker_open", "文件选择页未打开", dev, phone_path)
+    tab = _ocr_find(dev, "手机文件", ymax=400)
+    if not tab:
+        return _fail("tab", "找不到'手机文件'标签", dev, phone_path)
+    dev.tap_rect(Rect(tab[0] - 70, tab[1] - 40, 140, 80))
+    dev.wait_random(800, 1200)
+    pick = _ocr_find(dev, "选取")
+    if not pick:
+        return _fail("pick_btn", "找不到'选取'按钮", dev, phone_path)
+    dev.tap_rect(Rect(pick[0] - 120, pick[1] - 50, 240, 100))
+    dev.wait_random(1500, 2200)
 
-    # 6. OCR 验证选中（出现"发送"按钮），才点发送
-    send_pos = _ocr_find(dev, "发送", ymin=1900)
+    # 6. SAF 选择器：点"最近"列表第一行（刚 push+touch 的文件）
+    if not (_ocr_find(dev, "最近", ymax=300)
+            or _ocr_find(dev, "近期的文件")):
+        return _fail("saf_open", "系统文件选择器未打开", dev, phone_path)
+    dev.tap_rect(SAF_FIRST_ROW)
+    dev.wait_random(1200, 1800)
+
+    # 7. 选中确认面板（"已选中N个文件"是底部弹板，"发送"按钮在屏幕
+    #    中上部 y~670 而不是底部，2026-08-08 真机实测）→ 点"发送"
+    if _ocr_find(dev, "已选中"):
+        send_pos = _ocr_find(dev, "发送")
+    else:
+        send_pos = _ocr_find(dev, "发送", ymin=1900)
     if not send_pos:
         return _fail("select", "未选中文件（发送按钮未出现）", dev, phone_path)
     dev.tap_rect(Rect(send_pos[0] - 40, send_pos[1] - 30, 80, 60))
     dev.wait_random(1200, 1800)
 
-    # 7. 清理
+    # 8. 清理
     _cleanup(dev, phone_path)
     log.info("file sent: %s", path)
     return {"ok": True, "step": "sent", "path": path}
-
-
-def _tap_file_in_picker(dev, basename):
-    """文件选择器里定位目标文件并点选。先查当前列表（最近文件），
-    没有再点"手机存储"标签 → "Download" 目录 → 文件名。每步 OCR 验证。"""
-    pos = _ocr_find(dev, basename)
-    if pos:
-        dev.tap_rect(Rect(pos[0] - 60, pos[1] - 40, 120, 80))
-        return True
-    # 进"手机存储"标签
-    tab = _ocr_find(dev, "手机存储")
-    if not tab:
-        log.warning("file picker: 当前列表无 %r 且找不到'手机存储'标签", basename)
-        return False
-    dev.tap_rect(Rect(tab[0] - 60, tab[1] - 30, 120, 60))
-    dev.wait_random(800, 1200)
-    # 进 Download 目录
-    d = _ocr_find(dev, "Download")
-    if not d:
-        log.warning("file picker: 手机存储里找不到 Download 目录")
-        return False
-    dev.tap_rect(Rect(d[0] - 60, d[1] - 40, 120, 80))
-    dev.wait_random(800, 1200)
-    pos = _ocr_find(dev, basename)
-    if not pos:
-        return False
-    dev.tap_rect(Rect(pos[0] - 60, pos[1] - 40, 120, 80))
-    return True

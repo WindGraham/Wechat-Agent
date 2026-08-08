@@ -70,6 +70,10 @@ class TaskLedger:
     def running(self) -> list:
         return [t for t in self._tasks.values() if t["status"] == "running"]
 
+    def running_for(self, session: str) -> list:
+        """某会话执行中的任务（prompt 实时板块用）。"""
+        return [t for t in self.running() if t["session"] == session]
+
     def _save(self, task: dict):
         try:
             path = os.path.join(task["workdir"], "task.json")

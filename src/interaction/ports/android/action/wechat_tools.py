@@ -373,7 +373,7 @@ class WeChatTools:
                 log.warning("send_text attempt %d failed: %s", attempt, r.error)
                 self.dev.wait_random(500, 900)
             # 清理输入框残留（可能仍处于聚焦态，输入栏在聚焦坐标）
-            self.dev.tap_rect(layout.CHAT_INPUT_BAR_FOCUSED)
+            self.dev.tap_rect(self._input_bar_rect())
             self.dev.wait_random(300, 600)
             self.dev.clear_text()
             self.dev.wait_random(400, 800)
@@ -393,7 +393,11 @@ class WeChatTools:
             log.info("输入栏处于语音模式，切回文本模式")
             self.dev.tap_rect(layout.CHAT_VOICE)
             self.dev.wait_random(800, 1200)
-        self.dev.tap_rect(layout.CHAT_INPUT_BAR)
+        # 上轮引用发送失败可能留下引用预览条：盖住输入框固定点按区（点不中
+        # 输入框），且不清掉本条普通发送会被当成引用发出（2026-08-08 实测）
+        from .quote_reply import dismiss_quote_preview
+        dismiss_quote_preview(self.dev)
+        self.dev.tap_rect(self._input_bar_rect())
         self.dev.wait_random(400, 800)
         self.dev.clear_text()
         self.dev.wait_random(200, 400)
@@ -407,7 +411,7 @@ class WeChatTools:
             # 重进一次文本模式 + 补一次广播
             self.dev.tap_rect(layout.CHAT_VOICE)
             self.dev.wait_random(600, 1000)
-            self.dev.tap_rect(layout.CHAT_INPUT_BAR)
+            self.dev.tap_rect(self._input_bar_rect())
             self.dev.wait_random(400, 700)
             self.dev.input_text(text)
             self.dev.wait_random(500, 900)
@@ -445,6 +449,21 @@ class WeChatTools:
             state = self._snap()
         log.warning("send 已点发送但验证未确认到气泡（假定已发出，不重发）")
         return state
+
+    def _input_bar_rect(self):
+        """智能定位输入框点按区（类似发送键的动态定位，不认固定坐标）：
+        OCR 底部 "ADB Keyboard {ON}" 细条（y>=2100）出现 = 聚焦态，
+        输入栏被顶起 ~115px，点聚焦坐标；否则点未聚焦坐标。
+        上轮发送失败把输入栏留在聚焦态时，死点未聚焦坐标会按空
+        （2026-08-08 用户实测"点不中输入框"）。OCR 异常兜底未聚焦坐标。"""
+        try:
+            for it in _v2_run_ocr(self.dev.capture_bytes()):
+                if "ADB Keyboard" in (it.get("text") or "") \
+                        and it.get("cy", 0) >= 2100:
+                    return layout.CHAT_INPUT_BAR_FOCUSED
+        except Exception:
+            log.exception("input bar locate failed, fallback 未聚焦坐标")
+        return layout.CHAT_INPUT_BAR
 
     def _in_voice_mode(self):
         """输入栏是否语音模式：语音态中间显示"按住说话"，无文本输入框，
