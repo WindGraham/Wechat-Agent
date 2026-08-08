@@ -6,25 +6,31 @@
 
 ## 一、核心职责
 
+交互层只做两件事：**获取信息**和**发送信息**。本层的循环组和规则判断
+（各种循环 + if/else）全部服务于这两件事——发现新消息、读懂消息、维护
+消息列表、把动作发出去。它不组装 prompt，不做回复决策。
+
 ### 1. 统一接口（本层存在的唯一理由）
 
 ```python
-# 上行：三端消息 → 同一个事件结构
+# 上行：轻量事件通知（不带完整上下文，决策层自己来取）
 MessageEvent(
-    session: str,            # 会话名
+    session: str,            # 哪个会话
     is_group: bool,
-    sender: str,             # 发送人昵称（群聊逐条识别）
-    content: str,            # 文本内容；多媒体为识别后的描述文本
-    content_type: str,       # text / image / sticker / quote / system ...
-    mention_me: bool,
+    mention_me: bool,        # 是否有 @我
+    brief: str,              # 新消息摘要（如 "Leisure: @陈曦 那就这么定了"）
+    new_count: int,          # 新消息条数
     source: str,             # notify / sweep / heartbeat / passive
 )
 
-# 下行：决策层动作 → 端上操作
-ActionRequest(kind="text|image|quote|file", session=..., payload=...) -> ActionResult
+# 下行读取：决策层按需自取（拼 prompt 的原料）
+get_context(session, n=200) -> list[Message]   # 会话历史（默认 200 条灌注）
+get_screen_state() -> ScreenState              # 当前屏幕摘要
 
-# 上下文：决策层随时可读
-SessionContext(session) -> list[Message]
+# 下行动作：决策层信号落地
+execute(ActionRequest) -> ActionResult
+    ActionRequest(kind="text|image|quote|file", session=..., payload=...)
+    ActionResult(ok, error, retryable, escalation_hint)
 ```
 
 决策层看到的 Android 私聊和 macOS 群聊没有任何结构差异。
@@ -90,6 +96,7 @@ SessionContext(session) -> list[Message]
 
 ## 二、明确不做
 
+- 不组装 prompt（只产出事件 + 提供历史/屏幕读取接口，拼 prompt 是决策层的事）
 - 不调用 LLM（多媒体标注的视觉 API 调用视为感知环节，例外）
 - 不决定回不回、回什么
 - 不包含人格文案
