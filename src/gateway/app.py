@@ -578,8 +578,8 @@ function loadGroups() {
            '<td><input id="ex-' + encodeURIComponent(g.session) +
            '" value="' + (g.extra_rule || '').replace(/"/g, '&quot;') +
            '" style="width:220px" placeholder="选填，如：少发表情包"/></td>' +
-           '<td><button onclick="setLevel(\'' + g.session.replace(/'/g, "\\'") +
-           '\')">保存</button></td></tr>';
+           '<td><button data-sess="' + encodeURIComponent(g.session) +
+           '" onclick="setLevel(decodeURIComponent(this.dataset.sess))">保存</button></td></tr>';
     }
     h += '</table></div>';
     document.getElementById('pane-groups').innerHTML = h;
