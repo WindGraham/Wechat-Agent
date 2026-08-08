@@ -1,77 +1,67 @@
 # 交互层（Interaction Layer）
 
-> 微信的一切进出 + "像人"的全部学问。对上（决策层）只暴露语义化接口，
-> 坐标、像素、平台细节全部封在本层。
+> 三端适配器：把 Android / Windows / macOS 三端微信的消息转换成一样的接口
+> 暴露给决策层，把决策层的动作翻译成端上操作。
+> 本层不调用 LLM，不做回复决策。
 
-## 一、职责清单
+## 一、核心职责
 
-### 1. 平台端口（ports/）——三端差异的唯一藏身地
-
-每个端口实现同一组抽象：
-
-```python
-class Port:
-    def observe(self) -> ScreenState: ...   # 当前屏幕 → 标准化状态（页面/元素/消息）
-    def act(self, action: UiAction) -> ActionResult: ...  # tap/long_press/swipe/type/back
-    def notify_events(self) -> list[Event]: ...           # 平台侧新消息信号（通知栏等）
-```
-
-- `android/`：截图 + 本地 OCR + 区域标定 + ADB/root shell 操控
-  （感知采用区域切段方案：首页分割线切段 + 聊天页头像顶切段，
-  操控全部带随机化扰动，布局常量两态标定）
-- `windows/`：桌面微信 UI 树（UIA）优先，截图兜底——桌面端无节点混淆，比安卓好做
-- `macos/`：Accessibility API 优先，截图兜底
-
-端口内部允许硬编码标定（一机一份），但输出必须是标准化 `ScreenState`。
-
-### 2. 消息发现（什么时候"有动静"）
-
-四通道互补，产物统一进通知队列（按会话粘滞合并）：
-
-| 通道 | 说明 |
-|---|---|
-| 通知监听 | 平台通知栏（Android dumpsys / 桌面端通知 API），近实时，@我 预判 |
-| 主动扫描 | 定时回首页解析未读：数字红圈、免打扰红点、红色 @ 前缀；含沉底补扫 |
-| 被动识别 | 任何一次首页帧都自动收编红点/未读入队 |
-| 心跳兜底 | 低频全量拍帧，防主通道失效 |
-
-### 3. 消息读取与标注
-
-- 聊天页切段读取：头像顶切段 → 发送人昵称（限高不限宽条带）/内容/归属/时间
-- 增量续写 + gap 回填（msg_log 幂等）
-- **多媒体即时标注**：图片/表情等消息在交付决策层之前裁图送多模态模型，
-  描述写回消息日志——决策层看到的永远是"图片内容：…"而非 [图片]
-- @我 消息标记（mentions 提取 + [@我] 标注）
-
-### 4. 人格与伪装
-
-- 人格卡加载与合并（底座 + 会话卡 + 群类型卡），说话风格约束
-- 行为随机化：点击落点、滑动轨迹、等待时长、回复延迟全部带扰动
-- 回复切片发送（长文本拟人分段）
-
-### 5. 消息日志（记忆底座）
-
-- 每会话独立持久化（SQLite + 文本导出），msg_uid 幂等
-- 供决策层读取上下文，供多媒体标注写回
-
-### 6. 动作出口
-
-接收决策层的 `ActionRequest`（发送文本/图片/引用/文件等），转成端口动作序列。
-**剧本优先**：已验证的确定性流程（如发图）直接执行；失败或场景未覆盖 → 生成
-`TaskBrief` 移交决策层任务模式，不硬撑。
-
-## 二、对上接口（本层唯一的出口）
+### 1. 统一接口（本层存在的唯一理由）
 
 ```python
-# 产出
-MessageEvent(session, sender, content, content_type, mentions, media_desc, source)
-SessionContext(session) -> list[Message]      # 含 [@我] / 多媒体标注
-# 接收
-ActionRequest(kind="text|image|quote|file", session, payload) -> ActionResult
+# 上行：三端消息 → 同一个事件结构
+MessageEvent(
+    session: str,            # 会话名
+    is_group: bool,
+    sender: str,             # 发送人昵称（群聊逐条识别）
+    content: str,            # 文本内容；多媒体为识别后的描述文本
+    content_type: str,       # text / image / sticker / quote / system ...
+    mention_me: bool,
+    source: str,             # notify / sweep / heartbeat / passive
+)
+
+# 下行：决策层动作 → 端上操作
+ActionRequest(kind="text|image|quote|file", session=..., payload=...) -> ActionResult
+
+# 上下文：决策层随时可读
+SessionContext(session) -> list[Message]
 ```
 
-## 三、明确不做
+决策层看到的 Android 私聊和 macOS 群聊没有任何结构差异。
 
-- 不调用 LLM（唯一的例外通道：多媒体标注用多模态 API，视为感知的一部分）
-- 不做回复决策（只提供事件和上下文）
-- 不包含任何平台无关业务逻辑（那是决策层的事）
+### 2. 端口实现（ports/，每端一份）
+
+| 端口 | 消息来源 | 操作方式 |
+|---|---|---|
+| `android/` | 截图 + 本地 OCR + 区域切段识别 | ADB/root shell（随机化点击/滑动/广播输入） |
+| `windows/` | 桌面微信 UI 树（UIA），截图兜底 | 原生输入事件 |
+| `macos/` | Accessibility 树，截图兜底 | 原生输入事件 |
+
+端口内部允许硬编码布局标定（一机一份）。输出必须归一化为 `MessageEvent` /
+`ScreenState`——坐标、像素、控件树不出本层。
+
+### 3. 消息发现与读取
+
+- 发现：平台通知监听（近实时）+ 首页未读主动扫描（数字红圈/免打扰红点/
+  红色@前缀）+ 首页帧被动识别 + 心跳兜底；统一入通知队列按会话合并
+- 读取：聊天页逐条切段（发送人昵称与内容分离），增量续写 + 断档回填
+- 多媒体：图片/表情消息在交付决策层前完成多模态标注，content 直接是
+  "图片内容：…"的文本
+- @我：mentions 提取 + 标记
+
+### 4. 行为伪装
+
+- 点击落点/滑动轨迹/等待时长/发送延迟全部随机化
+- 长文本拟人分段发送、模拟打字节奏
+- 目的：行为统计上像人，规避风控
+
+### 5. 消息日志
+
+每会话独立持久化（SQLite + 文本导出），幂等续写。这是全系统的记忆底座，
+交互层负责写，决策层通过 `SessionContext` 读。
+
+## 二、明确不做
+
+- 不调用 LLM（多媒体标注的视觉 API 调用视为感知环节，例外）
+- 不决定回不回、回什么
+- 不包含人格文案

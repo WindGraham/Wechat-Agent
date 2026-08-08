@@ -1,65 +1,47 @@
 # 工具层（Tool Layer）
 
-> 被决策层调用的能力集合。纯能力、无状态、无决策。
-> 每个工具 = 标准 schema 声明 + 执行体 + 结构化结果。
+> 不自研。直接接入一个现成的 CLI agent 框架，为决策层提供自由任务执行能力。
+> 首选：**Kimi Code CLI**（开源 MIT，`MoonshotAI/kimi-code`）。
 
-## 一、工具分组
+## 一、选型
 
-### 1. 计算机工具（宿主侧）
-`bash` / `read` / `write` / `glob` / `grep` —— 文件与 shell 能力。
-任务模式的重度用户（自由探索、下载、处理文件）。
+| 候选 | 结论 |
+|---|---|
+| **Kimi Code CLI**（首选） | MIT 开源可改内部；`kimi -p` 无头执行 + `--output-format stream-json` 结构化输出；`kimi web` 常驻 REST/WS 服务；子代理/Skills/Hooks/MCP 齐全；provider 可换（k3/DeepSeek/本地端点） |
+| OpenCode（备选） | 开源、模型无关、server 模式；想脱离 Kimi 生态时用 |
+| Claude Code | 闭源，排除 |
 
-### 2. 网络工具
-`web_search`（文本搜索）/ `web_fetch`（抓网页）/ `image_search`（图片直链搜索）。
-找图、查资料的第一入口。
+## 二、本层做什么
 
-### 3. 视觉工具
-`inspect_image`（多模态读图：本地图片/截图 → 文字描述）。
-经决策层 provider 的多模态能力实现（k3 vision），工具层不绑定具体模型。
+工具层 = CLI 框架 + 一层薄封装（adapter）。薄封装负责：
 
-### 4. 微信动作工具（经交互层 ActionRequest 落地）
-`send_image`（path/url/字图三通道）/ `quote_reply` / `plus_panel_tap` /
-`send_file`（待实现）等。
-这些是**剧本化工具**：内部是验证过的确定性流程，逐步 OCR/状态校验，不盲点。
-剧本失败时返回可移交的结构化失败原因（供升级通道使用）。
+1. **任务下发**：把决策层的 `TaskBrief` 翻译成 CLI 调用
+   - 一次性任务：`kimi -p "<简报>" --output-format stream-json`（无头模式权限自动放行）
+   - 长驻/多任务：`kimi web` REST API（OpenAPI 文档自动生成）
+2. **权限与安全**：用 CLI 的 permission 配置 + lifecycle hooks 实现
+   （哪些目录可写、哪些命令要拦），不改源码
+3. **结果回传**：解析 stream-json/REST 响应 → `TaskResult` 结构化返回决策层
+4. **能力扩展**：以 CLI 的 Skills/MCP 机制添加能力（如把微信 UI 原语封装成
+   MCP server 给它用），而不是自己造工具框架
 
-### 5. 聊天记忆工具
-`search_chat_log` / `recall_context` —— 跨时间检索消息日志。
-
-### 6. UI 原语（任务模式专用）
-`tap(label)` / `long_press(label)` / `swipe` / `back` / `type(text)` ——
-label→元素→随机化落点。这是核心在剧本外自由操控微信的"手"。
-原语只暴露语义目标，不暴露坐标。
-
-## 二、工具定义规范
+## 三、与决策层的接口
 
 ```python
-ToolDef(
-    name: str,
-    description: str,          # 写给 LLM 的：什么时候用、怎么用、失败语义
-    parameters: JSONSchema,
-    timeout_ms: int,
-    max_calls_per_turn: int,   # 每轮/每任务限流（计数随轮次重置）
-    requires: list[str],       # 依赖注入声明（context / port / llm …）
-    execute: fn(params, deps) -> ToolResult,
-)
-ToolResult(ok: bool, text: str, data: dict | None)
+run_task(brief: TaskBrief) -> task_id        # 异步
+get_result(task_id) -> TaskResult | Pending  # 轮询/回调
 ```
 
-- 描述必须包含**失败后的指引**（如"下载失败就换下一张"），让 LLM 能自主纠错
-- 结果文本面向 LLM 阅读，不是面向日志
+`TaskResult.say_to_user` 由决策层人格化后发出——工具层的原始输出不直接见人。
 
-## 三、横切规则
+## 四、横切规则
 
-- **限流**：单轮/单任务调用上限，计数必须在轮次开始处重置
-  （漏接重置会导致计数进程级累积、工具被永久封顶）
-- **幂等**：同一参数重复调用不产生重复副作用（发图去重、消息发送校验）
-- **可观测**：每次调用记录 tool_call 事件（参数、耗时、结果摘要）
-- **无静默失败**：失败必须带原因文本；禁止"假装成功"
-- 远期兼容 MCP：schema 与执行体分离，之后可整组导出为 MCP server
+- 每次任务留痕：简报、执行轨迹、结果可审计
+- 工作目录隔离：任务在指定 workspace 下执行，微信数据只读暴露
+- 超时与取消：任务有 wall-clock 上限，决策层可取消
+- 失败如实回传，由决策层决定重试、降级还是如实告诉用户
 
-## 四、明确不做
+## 五、明确不做
 
-- 不主动发起任何动作（只被调用）
-- 不读人格、不做回复决策
-- 不感知"当前在哪个会话"（会话上下文由调用方以参数/deps 传入）
+- 不自己实现 bash/文件/搜索等工具（CLI 自带）
+- 不感知微信协议和消息格式（需要操作微信时通过专用 MCP/skill 向交互层要能力）
+- 不接触人格与回复话术
