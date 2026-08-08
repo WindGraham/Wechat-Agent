@@ -174,5 +174,13 @@
     "source_page": "contacts",
     "width": 120,
     "height": 80
+  },
+  {
+    "file": "quote_close_x.png",
+    "name": "quote preview close x",
+    "variant": "dark",
+    "source_page": "chat",
+    "width": 48,
+    "height": 46
   }
 ]

@@ -300,10 +300,53 @@ def _find_send_btn(img, ocr_items):
 
 # ------------------------------------------------------------------ 预览条清理
 # 预览 pill 的 × 是小图标，OCR 读不出来（2026-08-08 真机实测）。
-# 改为检测 pill 文字：预览条无论聚焦/未聚焦都贴在 y 2030~2150 地带
-# （聚焦态在输入框下方、未聚焦态在输入框上方），正常聊天消息不会出现在
-# 这个高度；× 固定在 pill 右端内侧（OnePlus 6T 实测 x≈728）。
-_PREVIEW_PILL_BAND = (2020, 2150)
+# 多行引用时 pill 变高、× 垂直居中漂移，固定坐标/固定文字带都不稳
+# （用户实测多行引用卡输入框）——× 圆圈图标本身大小形态不变，
+# 用模板匹配定位（assets/icon_templates/quote_close_x.png，TM_CCOEFF_NORMED
+# 实测：有预览 1.00，无预览 <=0.51，阈值 0.75 宽裕）。
+_CLOSE_TPL = None
+_CLOSE_TPL_TRIED = False
+_CLOSE_TPL_THRESH = 0.75
+_CLOSE_ROI = (620, 1850, 860, 2300)      # x0, y0, x1, y1（× 只在这一带出没：
+                                         # 聚焦/未聚焦/语音模式 pill 位置不同，
+                                         # 多行引用还会再漂移，纵向放全）
+
+
+def _close_template():
+    global _CLOSE_TPL, _CLOSE_TPL_TRIED
+    if not _CLOSE_TPL_TRIED:
+        _CLOSE_TPL_TRIED = True
+        from ..perception.icon_templates import load_templates
+        all_tpls = load_templates()
+        # 文件名按最后一段拆 variant：quote_close_x.png 会归到 "quote_close"
+        tpls = all_tpls.get("quote_close_x") or all_tpls.get("quote_close") or []
+        if tpls:
+            _CLOSE_TPL = cv2.cvtColor(tpls[0], cv2.COLOR_BGR2GRAY) \
+                if tpls[0].ndim == 3 else tpls[0]
+    return _CLOSE_TPL
+
+
+def find_preview_close_by_tpl(img):
+    """模板匹配找引用预览条的 × 中心 (cx, cy)；找不到/模板缺失返回 None。"""
+    tpl = _close_template()
+    if tpl is None or img is None:
+        return None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    x0, y0, x1, y1 = _CLOSE_ROI
+    roi = gray[y0:y1, x0:x1]
+    if roi.shape[0] < tpl.shape[0] or roi.shape[1] < tpl.shape[1]:
+        return None
+    res = cv2.matchTemplate(roi, tpl, cv2.TM_CCOEFF_NORMED)
+    _, mx, _, ml = cv2.minMaxLoc(res)
+    if mx < _CLOSE_TPL_THRESH:
+        return None
+    return (ml[0] + x0 + tpl.shape[1] // 2,
+            ml[1] + y0 + tpl.shape[0] // 2)
+
+
+# pill 文字带（兜底路径用）：预览条无论聚焦/未聚焦都贴输入栏地带，
+# 正常聊天消息不会出现在这个高度
+_PREVIEW_PILL_BAND = (1950, 2160)
 _PREVIEW_CLOSE_X = 728
 _PREVIEW_IGNORE = ("ADB Keyboard", "按住说话", "发送")
 
@@ -311,8 +354,7 @@ _PREVIEW_IGNORE = ("ADB Keyboard", "按住说话", "发送")
 def find_quote_preview_close(ocr_items):
     """引用预览条关闭按钮中心 (cx, cy, pill_text)；无预览返回 None。
 
-    引用发送失败会把预览条留在输入栏地带：不点掉的话下一条普通发送
-    会被当成引用发出（2026-08-08 用户实测）。pill_text 用于点完后复验
+    兜底路径（模板缺失时用）：检测 pill 文字。pill_text 用于点完后复验
     （同文消失才算点掉，防止对无关 OCR 噪声补点误触输入框）。"""
     for it in ocr_items:
         cx, cy = _item_cxy(it)
@@ -327,12 +369,28 @@ def find_quote_preview_close(ocr_items):
 
 def dismiss_quote_preview(dev, ocr_fn=None):
     """存在引用预览条则点 × 关掉（发送失败后的状态清理）。
-    复验认 pill 原文：原文消失才算成功；最多补点一次。返回是否清除。"""
+    模板匹配主路径（多行 pill 也稳）；模板缺失退 pill 文字法。
+    点完复验，最多补点一次。返回是否清除。"""
     ocr_fn = ocr_fn or _default_ocr
+    use_tpl = _close_template() is not None
     pill = None
     for attempt in range(2):
         try:
-            items = ocr_fn(dev.capture_bytes())
+            img = dev.capture_bytes()
+        except Exception:
+            log.exception("dismiss_quote_preview capture failed")
+            return False
+        if use_tpl:
+            pos = find_preview_close_by_tpl(img)
+            if pos is None:
+                return attempt > 0 or pill is None
+            _dev_tap(dev, pos[0], pos[1])
+            _dev_wait(dev, time.sleep, 300, 700)
+            log.info("quote preview × tapped (tpl) @%s attempt %d", pos, attempt)
+            continue
+        # 兜底：pill 文字法
+        try:
+            items = ocr_fn(img)
         except Exception:
             log.exception("dismiss_quote_preview ocr failed")
             return False
@@ -348,7 +406,10 @@ def dismiss_quote_preview(dev, ocr_fn=None):
                  found[0], found[1], attempt)
     # 最后确认一次
     try:
-        return find_quote_preview_close(ocr_fn(dev.capture_bytes())) is None
+        img = dev.capture_bytes()
+        if use_tpl:
+            return find_preview_close_by_tpl(img) is None
+        return find_quote_preview_close(ocr_fn(img)) is None
     except Exception:
         return False
 
