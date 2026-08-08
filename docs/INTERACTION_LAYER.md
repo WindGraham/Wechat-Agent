@@ -16,8 +16,9 @@ class Port:
     def notify_events(self) -> list[Event]: ...           # 平台侧新消息信号（通知栏等）
 ```
 
-- `android/`：截图 + 本地 OCR + 区域标定 + ADB/root shell 操控（继承 old 仓库 v2 感知层、
-  device_ctl、layout 常量、random_touch 随机化）
+- `android/`：截图 + 本地 OCR + 区域标定 + ADB/root shell 操控
+  （感知采用区域切段方案：首页分割线切段 + 聊天页头像顶切段，
+  操控全部带随机化扰动，布局常量两态标定）
 - `windows/`：桌面微信 UI 树（UIA）优先，截图兜底——桌面端无节点混淆，比安卓好做
 - `macos/`：Accessibility API 优先，截图兜底
 
