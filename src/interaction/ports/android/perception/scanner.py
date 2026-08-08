@@ -53,9 +53,20 @@ class Scanner:
         """
         r = self.tools.open_wechat()
         if not r.success or r.page != "wechat_home":
-            log.warning("sweep: open_wechat -> success=%s page=%s (skip)",
+            # 卡页自救：小程序面板/其他页面时先 back 一次再判定（实测面板
+            # 上滑/返回可回首页顶部；不自救会每轮 sweep 都 skip 死循环）
+            log.warning("sweep: open_wechat -> success=%s page=%s，尝试 back 自救",
                         r.success, r.page)
-            return []
+            try:
+                self.tools.dev.back()
+                self.tools.dev.wait_random(600, 1000)
+                r = self.tools.open_wechat()
+            except Exception:  # noqa: BLE001
+                log.exception("sweep 自救 back 失败")
+            if not r.success or r.page != "wechat_home":
+                log.warning("sweep: 自救失败 success=%s page=%s (skip)",
+                            r.success, r.page)
+                return []
         self.tools.dev.double_tap_rect(layout.TAB_WECHAT)
         self.tools.dev.wait_random(800, 1500)
         state = self.frame_bus.capture()

@@ -23,6 +23,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 
@@ -90,9 +91,23 @@ class MergeError(Exception):
     """栈与日志无重叠且未到顶端：拒绝合并（宁可失败不可错拼）"""
 
 
+# 跨线程共享连接：主线程（journey 写入）与 Proxy 线程（决策读取/写回）
+# 共用同一连接——check_same_thread=False + 全模块 RLock 串行化
+_DB_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    import functools
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with _DB_LOCK:
+            return fn(*a, **kw)
+    return wrapper
+
+
 def connect(db_path):
     """打开/创建日志库。项目盘是 exfat：journal_mode 必须用 DELETE。"""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -118,6 +133,7 @@ def _migrate(conn):
     conn.commit()
 
 
+@_locked
 def get_or_create_session(conn, name, is_group, name_full=None):
     """按名字取会话，不存在才创建（is_group 只在新建时写入）。
 
@@ -135,6 +151,7 @@ def get_or_create_session(conn, name, is_group, name_full=None):
     return cur.lastrowid
 
 
+@_locked
 def set_session_kind(conn, name, is_group):
     """旅程实测到真实 is_group 后显式更新（get_or_create_session 不覆写）。
     值无变化时不写库。返回是否发生了更新。"""
@@ -151,6 +168,7 @@ def set_session_kind(conn, name, is_group):
     return True
 
 
+@_locked
 def get_session_kind(conn, name):
     """查询会话 is_group（读路径补 Message.is_group 用）。未知会话返回 False。"""
     row = conn.execute("SELECT is_group FROM sessions WHERE name=?",
@@ -191,6 +209,7 @@ def align_key(sender, content):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+@_locked
 def update_content(conn, session_id, sender, content, new_content):
     """按 sender+content 模糊匹配更新最近一条日志的内容（多媒体标注写回用）。
     返回更新的行数（0/1）。只查最近 20 条，防止误改老消息。"""
@@ -294,6 +313,7 @@ STACK_ANCHOR_KEYS = 12    # 取栈底（最新端）12 条参与锚定
 LOG_TAIL_N = 50           # 日志末尾参与锚定的条数
 
 
+@_locked
 def session_tail(conn, session_id, n=LOG_TAIL_N):
     """日志末尾 n 条，按 seq 升序（最新在尾）。mentions 一并取出（@我标注用）。"""
     rows = conn.execute(
@@ -436,6 +456,7 @@ def _insert_rows(conn, session_id, entries, first_seq, source, captured_ts,
     return inserted, min_seq, max_seq
 
 
+@_locked
 def merge_stack(conn, session_id, entries, source="backfill",
                 top_reached=False, captured_ts=None):
     """临时栈 -> 正式日志，单事务（§3.3）。
@@ -533,6 +554,7 @@ def _entry_in_tail(entry, tail):
                for row in tail)
 
 
+@_locked
 def append_incremental(conn, session_id, entries, source="incremental",
                        captured_ts=None, gap_ok=False):
     """统一增量 append API（§4.2）：entries 屏内有序（早->晚）。
@@ -588,6 +610,7 @@ def append_incremental(conn, session_id, entries, source="incremental",
 
 
 # ---------------------------------------------------------------- 文本 log 导出
+@_locked
 def export_text_log(conn, session_id, out_dir):
     """库 -> 文本单向生成（§1.3）：全量重写 <out_dir>/<会话名>.log。
     时间分割线原样独立成行；非文本消息已是占位符（[图片]/[语音] 5秒…）；
@@ -627,6 +650,7 @@ def export_text_log(conn, session_id, out_dir):
 
 
 # ---------------------------------------------------------------- 版本号与水位差分（v4 新增）
+@_locked
 def increment_sync_version(conn, session_id):
     """每次成功同步（日志回传）后调用，sync_version +1。
     返回新的 version 值。"""
@@ -640,6 +664,7 @@ def increment_sync_version(conn, session_id):
     return row["sync_version"] if row else 0
 
 
+@_locked
 def get_sync_version(conn, session_id):
     """查询当前会话的同步版本号。"""
     row = conn.execute(
@@ -648,6 +673,7 @@ def get_sync_version(conn, session_id):
     return row["sync_version"] if row else 0
 
 
+@_locked
 def get_new_since(conn, session_id, last_seq):
     """水位差分：返回 seq > last_seq 的所有消息（严格大于），按 seq 升序。
 
@@ -664,6 +690,7 @@ def get_new_since(conn, session_id, last_seq):
     return [dict(r) for r in rows]
 
 
+@_locked
 def get_context(conn, session_id, n=200):
     """按量拉取历史：返回尾部 n 条消息，seq 升序（最新在尾）。
     用于拼 prompt 的历史灌注。"""

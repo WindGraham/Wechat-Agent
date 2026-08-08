@@ -140,13 +140,19 @@ def assemble(workspace_root, config_path, with_device=True):
     else:
         try:
             from .decision import create_provider, Proxy
+            from .shared.types import ActionResult
+
+            def submit_bundle(session, xml):
+                """Proxy 动作出口：XML bundle 投统一时间序队列。
+                入队成功即 ActionResult.ok（执行结果由旅程异步完成）。"""
+                entry = queue.push_action(session, xml)
+                return ActionResult(ok=entry is not None)
 
             provider = create_provider()
             proxy = Proxy(
                 provider=provider,
                 reader=comp["session_reader"],
-                submit_bundle=lambda session, xml: queue.push_action(
-                    session, xml),
+                submit_bundle=submit_bundle,
                 runtime=runtime,
             )
             proxy_thread = threading.Thread(

@@ -11,6 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 log = logging.getLogger("decision.proxy.media")
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+MEDIA_ROOT = os.path.join(PROJECT_ROOT, "workspace", "media")
+
 MEDIA_TYPES = {"multimedia", "image", "sticker", "voice", "video",
                "unknown_nontext"}
 PROMPT = ("详细描述这张微信聊天中的图片或表情内容。如果是表情包，描述画面"
@@ -46,7 +50,11 @@ class MediaConverter:
 
         def _one(m):
             try:
-                desc = self._provider.vision_file(m.media_path, PROMPT)
+                # media_path 可能是相对 workspace/media 的路径（归档约定）
+                path = m.media_path
+                if not os.path.isabs(path):
+                    path = os.path.join(MEDIA_ROOT, path)
+                desc = self._provider.vision_file(path, PROMPT)
                 desc = (desc or "").strip()[:300]
                 if not desc:
                     return False

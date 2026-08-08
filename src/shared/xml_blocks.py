@@ -15,14 +15,18 @@ _OPEN_RE = re.compile(r"<(reply|task|tool|silent)(\s[^>]*)?(/?)>")
 
 class Block:
     """一个动作块。tag/attrs（原始属性串）/inner（内部文本，已反转义）/
-    self_closing/valid。"""
+    raw_inner（原始文本，未反转义——转发给交互层必须用它，否则
+    <text> 等结构标签会被转义成字面量）/self_closing/valid。"""
 
-    __slots__ = ("tag", "attrs", "inner", "self_closing", "valid", "error")
+    __slots__ = ("tag", "attrs", "inner", "raw_inner", "self_closing",
+                 "valid", "error")
 
-    def __init__(self, tag, attrs, inner, self_closing, valid=True, error=""):
+    def __init__(self, tag, attrs, inner, self_closing, valid=True, error="",
+                 raw_inner=None):
         self.tag = tag
         self.attrs = attrs or ""
         self.inner = inner
+        self.raw_inner = raw_inner if raw_inner is not None else inner
         self.self_closing = self_closing
         self.valid = valid
         self.error = error
@@ -77,7 +81,8 @@ def extract_blocks(text: str) -> list:
             pos = next_open.start()
             continue
 
-        inner = unescape(text[open_end:close_idx])
-        blocks.append(Block(tag, attrs, inner, False))
+        inner_raw = text[open_end:close_idx]
+        blocks.append(Block(tag, attrs, unescape(inner_raw), False,
+                            raw_inner=inner_raw))
         pos = close_idx + len(close_tag)
     return blocks

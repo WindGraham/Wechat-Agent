@@ -209,7 +209,13 @@ class Proxy:
             messages = self._builder.build(
                 session, is_group, trigger, history, new_msgs,
                 tool_feedback=tool_feedback)
-            out = self._provider.chat(messages)
+            try:
+                out = self._provider.chat(messages)
+            except Exception as e:  # noqa: BLE001
+                # LLM 调用失败（网络/限额/超时）：本轮放弃，不影响其他事件
+                log.warning("[%s] LLM 调用失败: %s: %s",
+                            session, type(e).__name__, e)
+                return replied
             blocks = [b for b in extract_blocks(out) if b.valid]
             if not blocks:
                 log.warning("[%s] 输出无合法块，重试一次", session)
@@ -245,14 +251,12 @@ class Proxy:
     # ---------------------------------------------------------------- 块处理
     @staticmethod
     def _block_to_xml(block) -> str:
-        """Block → 原始 XML 文本（交互层按原样解释）。"""
+        """Block → 原始 XML 文本（用 raw_inner 原样转发：inner 已反转义，
+        再转义会把 <text> 结构标签变成字面量发到微信里）。"""
         attrs = block.attrs.rstrip()
         if block.self_closing:
             return f"<{block.tag}{attrs}/>"
-        # inner 已在扫描时反转义，回给交互层时重新转义保持协议一致
-        inner = (block.inner.replace("&", "&amp;")
-                 .replace("<", "&lt;").replace(">", "&gt;"))
-        return f"<{block.tag}{attrs}>{inner}</{block.tag}>"
+        return f"<{block.tag}{attrs}>{block.raw_inner}</{block.tag}>"
 
     def _exec_tool(self, block) -> str:
         """执行 <tool> 块（当前只有 chat_history）。"""
