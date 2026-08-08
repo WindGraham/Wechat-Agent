@@ -201,11 +201,17 @@ class Proxy:
                 is_group = True               # 未知保守按群聊
 
             last_seq = self._watermarks.get(session, 0)
-            new_msgs = self._reader.get_new_since(session, last_seq)
-            if new_msgs:
+            all_new = self._reader.get_new_since(session, last_seq)
+            if all_new:
                 self._watermarks[session] = max(
-                    m.seq for m in new_msgs)
+                    m.seq for m in all_new)
                 self._save_watermarks()
+            # 过滤：自己的消息/时间线/系统消息不进决策（否则自己刚发的
+            # 回复会再次触发决策 → 空转/自答循环，2026-08-08 实测）
+            new_msgs = [m for m in all_new
+                        if not getattr(m, "is_mine", False)
+                        and getattr(m, "content_type", "text")
+                        not in ("time_divider", "system")]
 
             # @我 逐条必回（Policy）
             unreplied = self._policy.unreplied_mentions(session, new_msgs)

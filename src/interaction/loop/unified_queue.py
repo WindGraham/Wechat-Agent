@@ -21,32 +21,51 @@ log = logging.getLogger("interaction.queue")
 # （公众号/服务通知是 feed 不是对话；"微信"是桌面登录等系统通知的标题噪声；
 #  "折叠的聊天"是折叠分组不是会话）
 def _dedup_stutter(label: str, known_fn=None) -> str:
-    """结巴标签截半：OCR/分段偶发把会话名拼成两遍。
-    两半都可能带 OCR 错（实测第一份结尾 I→L），所以候选两半分别与
-    已知会话名（日志库）模糊匹配，命中就用库里那个规范名。"""
+    """会话名归一：OCR/分段会产生各种变体（结巴拼接 "YOUSAOBLYOUSAOBI"、
+    尾巴垃圾 "JY君C"、空格漂移 "怨憎会爱别离 …"）。按序尝试：
+    1. 原样命中已知会话 → 直接用
+    2. 去空白后命中 → 用库里的规范名
+    3. 互为包含（短名被垃圾尾巴包裹）→ 用短的已知名
+    4. 相似度 ≥0.75 → 用最像的已知名
+    5. 结巴截半（两半相似 ≥0.8）→ 截半后再过一遍 1-4
+    全都不中才原样返回。"""
     import difflib
-    n = len(label or "")
-    if n < 4 or n % 2 != 0:
+    if not label:
         return label
-    a, b = label[:n // 2], label[n // 2:]
-    if a == b:
-        return a
-    if difflib.SequenceMatcher(None, a, b).ratio() < 0.8:
-        return label
-    if known_fn:
-        try:
-            known = known_fn() or []
-        except Exception:  # noqa: BLE001
-            known = []
-        best_name, best_ratio = None, 0.0
-        for cand in (a, b):
-            for name in known:
-                r = difflib.SequenceMatcher(None, cand, name).ratio()
-                if r > best_ratio:
-                    best_name, best_ratio = name, r
-        if best_name and best_ratio >= 0.75:
-            return best_name
-    return a
+    try:
+        known = known_fn() or [] if known_fn else []
+    except Exception:  # noqa: BLE001
+        known = []
+
+    def _snap(name):
+        if name in known:
+            return name
+        best, best_r = None, 0.0
+        for k in known:
+            ka, kb = name.replace(" ", ""), k.replace(" ", "")
+            if ka == kb:
+                return k
+            if len(k) >= 2 and (ka in kb or kb in ka):
+                r = difflib.SequenceMatcher(None, ka, kb).ratio()
+                if r > best_r:
+                    best, best_r = k, max(r, 0.76)
+            r = difflib.SequenceMatcher(None, ka, kb).ratio()
+            if r > best_r:
+                best, best_r = k, r
+        return best if best_r >= 0.75 else None
+
+    hit = _snap(label)
+    if hit:
+        return hit
+    # 结巴截半
+    n = len(label)
+    if n >= 4 and n % 2 == 0:
+        a, b = label[:n // 2], label[n // 2:]
+        if a == b:
+            return _snap(a) or a
+        if difflib.SequenceMatcher(None, a, b).ratio() >= 0.8:
+            return _snap(a) or a
+    return label
 
 
 BLOCKED_SESSIONS = frozenset({
