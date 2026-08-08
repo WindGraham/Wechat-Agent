@@ -20,6 +20,9 @@ MEDIA_TYPES = {"multimedia", "image", "sticker", "voice", "video",
 PROMPT = ("详细描述这张微信聊天中的图片或表情内容。如果是表情包，描述画面"
           "和文字；如果是照片，描述场景。用 2-4 句话。")
 PER_ITEM_TIMEOUT = 45        # 单条视觉识别超时（秒），超时降级占位符
+# 标注写回格式：明确告诉 LLM 这是视觉识别结果而非用户原文
+ANNOTATED_MARK = "[多媒体消息，以下内容是视觉识别agent的描述]"
+_LEGACY_MARK = "内容:"        # 旧格式标记（判定是否已标注时兼容）
 
 
 class MediaConverter:
@@ -39,7 +42,8 @@ class MediaConverter:
             return False
         if not getattr(msg, "media_path", None):
             return False
-        return "内容:" not in (getattr(msg, "content", "") or "")
+        return (ANNOTATED_MARK not in (getattr(msg, "content", "") or "")
+                and _LEGACY_MARK not in (getattr(msg, "content", "") or ""))
 
     def convert_all(self, session: str, messages) -> int:
         """并发转换 messages 里所有待标注条目，写回日志并更新内存。
@@ -59,7 +63,7 @@ class MediaConverter:
                 if not desc:
                     return False
                 orig = (m.content or "").strip() or "[图片]"
-                new_content = f"{orig}\n内容: {desc}"
+                new_content = f"{orig}{ANNOTATED_MARK}{desc}"
                 self._writer(session, m.sender, m.content, new_content)
                 m.content = new_content
                 return True
