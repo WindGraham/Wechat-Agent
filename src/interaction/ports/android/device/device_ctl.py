@@ -25,6 +25,7 @@ import jieba
 import threading
 
 from .random_touch import Rect, RandomTouch
+from .....shared.ops_journal import log_op
 
 PROJECT_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "..", "..", "..", ".."))
@@ -160,6 +161,7 @@ class DeviceCtl:
     def tap_rect(self, rect, sigma_ratio=0.25):
         """Rect 区域内高斯偏中心随机点按（随机化框架 v2 主 API）。"""
         pt = self.touch.tap_rect(rect, sigma_ratio=sigma_ratio)
+        log_op("tap", x=int(pt[0]), y=int(pt[1]), rect=str(rect))
         self.wait_random(80, 200)
         return pt
 
@@ -167,12 +169,14 @@ class DeviceCtl:
         """Rect 区域内双击（两次独立随机落点 + 随机间隔），如首页"微信"Tab。"""
         pts = self.touch.double_tap_rect(rect, interval_ms=interval_ms,
                                          sigma_ratio=sigma_ratio)
+        log_op("double_tap", rect=str(rect))
         self.wait_random(80, 200)
         return pts
 
     def long_press_rect(self, rect, sigma_ratio=0.25):
         """Rect 区域内长按（随机落点 + 500~800ms 按压，触发系统长按菜单）。"""
         pt = self.touch.long_press_rect(rect, sigma_ratio=sigma_ratio)
+        log_op("long_press", rect=str(rect))
         self.wait_random(80, 200)
         return pt
 
@@ -187,6 +191,7 @@ class DeviceCtl:
                                     length_ratio=length_ratio,
                                     diag_ratio=diag_ratio,
                                     duration_ms=duration_ms)
+        log_op("swipe", direction=direction)
         self.wait_random(100, 250)
         return pts
 
@@ -214,6 +219,7 @@ class DeviceCtl:
         self.wait_random(60, 150)
 
     def back(self):
+        log_op("back")
         self.key_event("KEYCODE_BACK")
 
     def home_key(self):
@@ -226,6 +232,7 @@ class DeviceCtl:
     # ----------------------------------------------------------------- 输入
     def input_text(self, text):
         """输入文本（中英文统一走 ADBKeyBoard 广播方案，IME 已锁定无需切换）。"""
+        log_op("input_text", text=text)
         self._input_text_unicode(text)
         self.wait_random(150, 350)
 
@@ -295,6 +302,7 @@ class DeviceCtl:
             self._shell(f"ime set {ADBKB_IME}")
 
     def clear_text(self, times=40):
+        log_op("clear_text")
         """ADBKeyBoard 自带 ADB_CLEAR_TEXT 广播一次清空输入框（2026-08-04 真机验证）。
 
         根除 v1 连发 30 次 KEYCODE_DEL 丢事件残留旧文本的问题（AGENTS.md 第 9 条）。
@@ -306,6 +314,7 @@ class DeviceCtl:
     # ----------------------------------------------------------------- 应用
     def open_wechat(self, timeout_s=10):
         """monkey 拉起微信并等待 activity 验证。"""
+        log_op("open_wechat")
         self._shell(f"monkey -p {WECHAT_PKG} -c android.intent.category.LAUNCHER 1")
         deadline = time.time() + timeout_s
         while time.time() < deadline:

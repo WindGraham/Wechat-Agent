@@ -245,34 +245,28 @@ class UnifiedQueue:
             return entry
 
     # ------------------------------------------------------------------ 重试
-    def requeue_entry(self, entry: QueueEntry) -> QueueEntry:
+    def requeue_entry(self, entry: QueueEntry):
         """行动失败后把已出队的条目重新入队（保留重试计数）。
 
-        供旅程管理器使用：pop_next/pop_session 出队即删，直接调
-        requeue_action 会因查不到条目而永远走"新建 attempts=0"分支，
-        重试计数失效。此方法以条目对象为输入：
-
         - 未达上限：attempts+1，按原 ts 重新入队（保持原位置语义）
-        - 达到上限：作为新条目排到队尾（attempts 归零、ts 更新）。
-          行动永远不许丢——它承载着对用户的承诺。
+        - 达到上限（2 次）：排到队尾，**attempts 不归零**
+        - 达到硬上限（2×上限）：彻底丢弃——防止幻影会话/持久故障
+          无限排尾刷屏（实测 JY君C 每分钟刷一次）
         """
         with self._lock:
             entry.attempts += 1
+            if entry.attempts >= self._max_attempts * 2:
+                log.error("queue: %s 行动重试 %d 次仍失败，丢弃",
+                          entry.session, entry.attempts)
+                return None
             if entry.attempts >= self._max_attempts:
-                # 耗尽：作为新条目排到队尾（ts=now → FIFO 尾部）
-                new_entry = QueueEntry(
-                    kind="action", session=entry.session,
-                    ts=time.time(),
-                    mention=entry.mention,
-                    payload=entry.payload,
-                    attempts=0,
-                    sources=set(entry.sources),
-                )
-                self._entries[entry.session] = new_entry
+                # 耗尽：排到队尾（ts=now），attempts 保留继续计
+                entry.ts = time.time()
+                self._entries[entry.session] = entry
                 self._persist()
                 log.warning("queue: %s max attempts reached, requeued at tail",
                             entry.session)
-                return new_entry
+                return entry
             # 未达上限：原条目按原 ts 放回，保持原位置语义
             self._entries[entry.session] = entry
             self._persist()

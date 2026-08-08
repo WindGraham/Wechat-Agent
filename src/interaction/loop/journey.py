@@ -86,7 +86,9 @@ class JourneyManager:
         r = self._nav.enter_session(session)
         if not r.success:
             log.error("[%s] enter_session failed: %s", session, r.error)
-            self._handle_action_failure(entry)
+            # 进不去先重排（队列硬上限 2×max_attempts 后丢弃，
+            # 幻影会话不会无限循环，瞬时失败也有机会）
+            self._handle_action_failure(entry, retryable=True)
             return False
 
         is_group = self._detect_is_group(session)
@@ -98,7 +100,7 @@ class JourneyManager:
                         session)
             self._dirty.add(session)
             # 行动永远不许丢：带进会话的行动条目原样退回队列重试
-            self._handle_action_failure(entry)
+            self._handle_action_failure(entry, retryable=True)
             self._safe_back_home(session)
             return False
         self._dirty.discard(session)
@@ -106,12 +108,18 @@ class JourneyManager:
         sent = False
 
         # 3. 执行行动（如果有）
+        action_failed = False
         if entry.kind == "action" and entry.payload:
             sent = self._execute_actions(session, entry)
+            action_failed = not sent
 
         # 4. Follow-up：处理期间新来的行动一并吸收，直到行动清空。
         #    不设驻留上限；ABSORB_FUSE_ROUNDS 仅为防死循环保险丝。
+        #    行动失败已重排队列的，本旅程不再吸收（防止刚重排的失败行动
+        #    在同一旅程里被立刻弹出热重试，空转到硬上限被丢弃）。
         for round_i in range(ABSORB_FUSE_ROUNDS):
+            if action_failed:
+                break
             followup = self._queue.pop_session(session)
             if followup is None or followup.kind != "action":
                 break
@@ -122,7 +130,10 @@ class JourneyManager:
                 log.warning("[%s] follow-up sync failed (round %d)",
                             session, round_i + 1)
             if followup.payload:
-                sent = self._execute_actions(session, followup) or sent
+                ok = self._execute_actions(session, followup)
+                sent = ok or sent
+                if not ok:
+                    break
         else:
             # 保险丝熔断：行动未清空，但已连续吸收 ABSORB_FUSE_ROUNDS 轮。
             # 剩余行动仍在队列中，下轮循环继续处理。
@@ -179,10 +190,16 @@ class JourneyManager:
             self._queue.requeue_entry(entry)
         return False
 
-    def _handle_action_failure(self, entry: QueueEntry):
-        """行动执行失败（进会话失败、同步失败退出等）：行动不许丢。"""
+    def _handle_action_failure(self, entry: QueueEntry,
+                               retryable: bool = True):
+        """行动执行失败：retryable 才重排；不可重试（如会话不存在）丢弃，
+        防止幻影会话名无限排尾循环（实测 JY君C 每分钟刷一次屏）。"""
         if entry.kind == "action" and entry.payload:
-            self._queue.requeue_entry(entry)
+            if retryable:
+                self._queue.requeue_entry(entry)
+            else:
+                log.warning("[%s] 行动不可重试，丢弃: %s",
+                            entry.session, (entry.payload or "")[:60])
 
     def _safe_back_home(self, session: str):
         try:

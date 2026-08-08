@@ -198,6 +198,18 @@ def create_app(project_root=None):
                             "proxy_events.jsonl")
         return jsonify({"ok": True, "events": _read_jsonl_tail(path, n)})
 
+    @app.route("/api/ops")
+    def api_ops():
+        """interaction_ops.jsonl 原子操作流水尾部 n 条（倒序）。"""
+        try:
+            n = int(request.args.get("n", "50"))
+        except ValueError:
+            n = 50
+        n = max(1, min(n, 500))
+        path = os.path.join(root, "workspace", "runtime",
+                            "interaction_ops.jsonl")
+        return jsonify({"ok": True, "ops": _read_jsonl_tail(path, n)})
+
     @app.route("/api/home_scan")
     def api_home_scan():
         """首页红点扫描快照；未产生过时 scan 为 null。"""
@@ -517,6 +529,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="card"><h2>时序队列</h2><div id="live-queue"></div></div>
     <div class="card"><h2>首页红点</h2><div id="live-home"></div></div>
     <div class="card"><h2>Proxy 流水</h2><div id="live-events"></div></div>
+    <div class="card"><h2>原子操作</h2><div id="live-ops"></div></div>
   </div>
   <div class="pane" id="pane-groups"></div>
   <div class="pane" id="pane-runtime"></div>
@@ -786,7 +799,8 @@ function loadLive() {
     api('/api/home_scan').catch(() => null),
     eventsFrozen ? Promise.resolve(null)
                  : api('/api/events?n=80').catch(() => null),
-  ]).then(([st, hs, ev]) => {
+    api('/api/ops?n=40').catch(() => null),
+  ]).then(([st, hs, ev, ops]) => {
     document.getElementById('live-queue').innerHTML =
       queueTable(st && st.queue);
     document.getElementById('live-home').innerHTML =
@@ -794,6 +808,10 @@ function loadLive() {
     if (ev) {
       document.getElementById('live-events').innerHTML =
         renderEvents(ev.events || []);
+    }
+    if (ops) {
+      document.getElementById('live-ops').innerHTML =
+        renderOps(ops.ops || []);
     }
   });
 }
@@ -844,6 +862,21 @@ function eventSummary(e) {
     default:
       return JSON.stringify(e).slice(0, 120);
   }
+}
+
+function renderOps(ops) {
+  if (!ops.length) return '<p>暂无数据</p>';
+  let h = '';
+  for (const o of ops) {
+    const ts = new Date(o.ts * 1000).toLocaleTimeString();
+    const detail = Object.entries(o)
+      .filter(([k]) => !['ts', 'op'].includes(k))
+      .map(([k, v]) => k + '=' + v).join(' ');
+    h += '<div class="ev" style="padding:2px 6px;border-bottom:1px solid #21262d">' +
+         '<span style="color:var(--dim)">' + ts + '</span> <b>' + esc(o.op) +
+         '</b> <span style="color:var(--dim)">' + esc(detail) + '</span></div>';
+  }
+  return h;
 }
 
 function renderEvents(events) {

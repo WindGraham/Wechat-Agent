@@ -87,7 +87,7 @@ class TestRequeueEntry(unittest.TestCase):
         self.assertEqual(r.ts, e.ts)             # 保持原位置语义
 
     def test_max_attempts_requeue_at_tail(self):
-        """失败 2 次达上限 → 作为新条目排队尾（attempts 归零、ts 更新）。"""
+        """失败 2 次达上限 → 排队尾（attempts 不归零；硬上限 2×max 后丢弃）。"""
         q = UnifiedQueue(max_attempts=2)
         a = q.push_action("A", "<b/>")
         q.push_action("B", "<b/>")
@@ -99,13 +99,18 @@ class TestRequeueEntry(unittest.TestCase):
         p2 = q.pop_next()
         self.assertEqual(p2.session, "A")
         self.assertEqual(p2.attempts, 1)
-        # 第二次失败：达上限 → 排队尾
+        # 第二次失败：达上限 → 排队尾（attempts 保留为 2，ts 更新）
         t = q.requeue_entry(p2)
-        self.assertEqual(t.attempts, 0)
+        self.assertEqual(t.attempts, 2)
         self.assertGreaterEqual(t.ts, a.ts)
         # B 现在排在 A 前面
         self.assertEqual(q.pop_next().session, "B")
-        self.assertEqual(q.pop_next().session, "A")
+        p3 = q.pop_next()          # A（attempts=2）
+        self.assertEqual(p3.session, "A")
+        q.requeue_entry(p3)        # attempts=3 → 队尾
+        p4 = q.pop_session("A")
+        self.assertIsNone(q.requeue_entry(p4))   # attempts=4=2×max → 丢弃
+        self.assertNotIn("A", q)
 
     def test_requeue_action_backward_compat(self):
         """旧接口保留：条目不在队列时按新条目入队。"""
