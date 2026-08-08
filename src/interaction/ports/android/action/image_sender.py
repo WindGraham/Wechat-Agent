@@ -177,8 +177,10 @@ def send_file(dev, path):
     if not os.path.isfile(path):
         return _fail("args", f"本地文件不存在: {path}")
 
-    # 2. push + 媒体扫描 + touch（mtime 刷成现在，SAF 最近列表排第一）
-    phone_path = f"{PHONE_FILE_DIR}/agent_file{os.path.splitext(path)[1]}"
+    # 2. push + 媒体扫描 + touch（mtime 刷成现在，SAF 最近列表排第一）。
+    # 保留原文件名：文件卡片显示的就是手机上的文件名（2026-08-09 实测
+    # 固定名 agent_file.txt 发到群里 recipients 看不懂）
+    phone_path = f"{PHONE_FILE_DIR}/{os.path.basename(path)}"
     try:
         _push_to_phone(dev, path, phone_path)
         dev._shell(f"touch {shlex.quote(phone_path)}", timeout=5)
