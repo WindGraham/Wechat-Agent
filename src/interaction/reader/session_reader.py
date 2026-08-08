@@ -42,6 +42,13 @@ class SessionReader:
         self._on_log_updated = None     # 回调：决策层的 LogUpdated 处理器
 
     # ------------------------------------------------------------------ 决策层接口
+    def update_content(self, session: str, sender: str, content: str,
+                       new_content: str) -> int:
+        """消息内容写回（媒体标注等）。返回更新行数（0/1）。"""
+        from ..msglog import get_or_create_session, update_content as _upd
+        sid = get_or_create_session(self._conn, session, False)
+        return _upd(self._conn, sid, sender, content, new_content)
+
     def last_is_group(self, session: str):
         """该会话最近一次实测的群/私属性；未知返回 None（调用方自行兜底）。"""
         try:

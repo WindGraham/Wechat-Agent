@@ -58,6 +58,9 @@ class JourneyManager:
         self._rand = random.uniform
 
     # ------------------------------------------------------------------ 公开访问
+    def set_on_log_updated(self, cb):
+        """LogUpdated 回调热替换（决策层装配时接线用）。"""
+        self._on_log_updated = cb
     @property
     def navigator(self):
         """端口导航器（供 run_loop 乱逛等场景使用）。"""

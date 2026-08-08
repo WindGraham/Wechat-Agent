@@ -132,15 +132,33 @@ def assemble(workspace_root, config_path, with_device=True):
         manifest.append("interaction: [dry-run 跳过] SessionReader/"
                         "BundleSender/JourneyManager/InteractionLoop 不装配")
 
-    # 7. 决策层接线点（TODO）
-    # TODO(decision): src/decision/{proxy,prompt,policy,provider} 目前只有空
-    #   __init__。决策层落地后在此接线：
-    #   - Proxy(on_log_updated=comp['on_log_updated'])：
-    #     LogUpdated → 五队列分流 → ContextBuilder 装配 prompt → provider
-    #   - 决策产物 ActionBundle → comp['queue'].push_action(session, blocks_xml)
-    #   - task_receipt 回调 → prompt 块替换 new_messages（见 prompts/order.txt）
-    manifest.append("decision: TODO 未接线（proxy/prompt/policy/provider "
-                    "为空包；接线点见 main.py 注释）")
+    # 7. 决策层装配（Proxy：LLM 唯一对话对象，三层唯一交汇点）
+    if not with_device or "session_reader" not in comp:
+        manifest.append("decision: [dry-run 跳过] Proxy 不装配")
+    else:
+        try:
+            from .decision import create_provider, Proxy
+
+            provider = create_provider()
+            proxy = Proxy(
+                provider=provider,
+                reader=comp["session_reader"],
+                submit_bundle=lambda session, xml: queue.push_action(
+                    session, xml),
+                runtime=runtime,
+            )
+            proxy_thread = threading.Thread(
+                target=proxy.run_forever, daemon=True, name="decision-proxy")
+            proxy_thread.start()
+            comp["proxy"] = proxy
+            comp["proxy_thread"] = proxy_thread
+            # 交互层 LogUpdated 上行接到 Proxy
+            comp["journey"].set_on_log_updated(proxy.notify_log_updated)
+            manifest.append(
+                f"decision: Proxy 已接线 (provider={provider.model})")
+        except Exception as e:
+            log.exception("决策层装配失败")
+            manifest.append(f"decision: 装配失败（{type(e).__name__}: {e}）")
     return comp, manifest
 
 
@@ -172,6 +190,8 @@ def _assemble_interaction(comp, manifest, tools, dirs, runtime, queue, conn):
                                    media_dir=dirs["media"],
                                    owner_nick=owner_nick)
     bundle_sender = BundleSender(port_sender, navigator, tools)
+    comp["session_reader"] = session_reader
+    comp["bundle_sender"] = bundle_sender
     manifest.append("interaction: SessionReader / BundleSender")
 
     notify_queue = NotificationQueue()
