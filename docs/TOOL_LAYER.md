@@ -60,7 +60,9 @@ kimi -m kimi-code/k3 -p "<任务简报>" --output-format stream-json
 
 ## 三、本层做什么
 
-工具层 = CLI 框架 + 一层薄封装（adapter）。
+工具层 = CLI 框架本身。**本层没有代码目录**——调用逻辑以"CLI 后端适配器"
+的形式实现在决策层 Proxy 内（可插拔，见 DECISION_LAYER.md §六），
+`src/tools/` 只放使用说明。
 
 **集成方式（已定）：进程外调用，不封装进程序、不 fork 源码。**
 理由：语言栈不同（我方 Python / 它 TypeScript）；它是 CLI 应用不是库，
@@ -69,7 +71,7 @@ kimi -m kimi-code/k3 -p "<任务简报>" --output-format stream-json
 若将来需要在它的 agent 循环内部注入能力（共享状态的工具），
 走 MCP server 暴露，仍然不 fork。
 
-薄封装负责：
+适配器职责（实现在 Proxy 内）：
 
 1. **任务下发**：把决策层的 `TaskBrief` 翻译成 CLI 调用（无头模式 / `kimi web` REST）
 2. **权限与安全**：用 CLI 的 permission 配置 + lifecycle hooks 实现

@@ -24,8 +24,7 @@ Wechat-Agent/
 │   │   ├── prompt/              # ContextBuilder：块文件装配 + 占位填充
 │   │   ├── policy/              # 必回规则、@逐条、兜底话术
 │   │   └── provider/            # LLM provider 抽象（k3/DeepSeek/本地）
-│   └── tools/                   # 工具层
-│       └── cli_adapter/         # kimi -p / kimi web 薄封装
+│   └── tools/                   # 工具层（无代码，仅使用说明 README.md）
 ├── tests/                       # 分层单测（假层/回放，不连真机真模型）
 └── workspace/                   # 运行时数据（gitignore，首次启动自动建立）
 ```

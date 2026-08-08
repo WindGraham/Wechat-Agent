@@ -245,10 +245,25 @@ LLM 的每次输出是一串**有序 XML 动作块**（选 XML 不选 JSON 的�
 异步拿 `TaskResult` 后人格化回复。ActionResult 失败带 escalation_hint 时
 自动升级为任务。
 
-## 六、Provider 抽象
+## 六、Provider 与 CLI 后端抽象
 
-- LLM 调用统一接口，模型可热替换（k3 / DeepSeek / 本地端点）
-- 模型怪癖集中收口（如 k3 省略 temperature）
+- **LLM provider** 统一接口，模型可热替换（k3 / DeepSeek / 本地端点）；
+  模型怪癖集中收口（如 k3 省略 temperature）
+- **CLI 后端可插拔**：Proxy 通过统一的后端接口调用工具层 CLI，
+  新增框架只需注册一个新适配器：
+
+```python
+class CLIBackend:                 # 决策层持有的工具层句柄
+    name: str                     # "kimi-code"（首个适配）/ "opencode"（备选）
+    def run(self, brief: str, workspace: str,
+            model: str|None = None,
+            on_trace=None) -> TaskResult: ...
+    def resume(self, cli_session_id: str, prompt: str) -> TaskResult: ...
+```
+
+- 当前唯一适配器：KimiCodeCLI（`kimi -m <model> -p <brief>
+  --output-format stream-json`，解析 JSONL 取最后 assistant content +
+  退出码 + session_id）。模型默认钉 `kimi-code/k3`（runtime.json `tool_model`）
 
 ## 七、明确不做
 
