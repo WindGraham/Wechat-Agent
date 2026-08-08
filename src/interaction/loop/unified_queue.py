@@ -17,6 +17,15 @@ from ...shared.types import QueueEntry
 
 log = logging.getLogger("interaction.queue")
 
+# 系统/信息流"会话"黑名单：不是真实聊天，任何通道都不得入队
+# （公众号/服务通知是 feed 不是对话；"微信"是桌面登录等系统通知的标题噪声；
+#  "折叠的聊天"是折叠分组不是会话）
+BLOCKED_SESSIONS = frozenset({
+    "微信", "微信团队", "微信支付", "服务通知", "公众号", "腾讯新闻",
+    "微信运动", "QQ邮箱提醒", "腾讯充值", "微信游戏", "企业微信",
+    "折叠的聊天",
+})
+
 
 class UnifiedQueue:
     """统一时间序队列：通知与行动合二为一，按时间排序。
@@ -63,6 +72,9 @@ class UnifiedQueue:
 
         规则：会话已在队列中 → 位置不变、内容不更新（只更新 sources）。
         """
+        if session in BLOCKED_SESSIONS:
+            log.debug("queue: %s 被黑名单拦截（系统/feed 会话）", session)
+            return None
         ts = time.time()
         with self._lock:
             existing = self._entries.get(session)
@@ -96,6 +108,9 @@ class UnifiedQueue:
         规则：如果该会话已有通知条目 → 升级为行动条目（吞并通知）。
         如果已有行动条目 → 合并（追加 payload，但保持位置）。
         """
+        if session in BLOCKED_SESSIONS:
+            log.debug("queue: %s 被黑名单拦截（系统/feed 会话）", session)
+            return None
         ts = time.time()
         with self._lock:
             existing = self._entries.get(session)
