@@ -207,13 +207,22 @@ class JourneyManager:
         except Exception:
             log.exception("[%s] back_to_home failed", session)
 
-    def _detect_is_group(self, session: str) -> bool:
-        """检测会话是否为群聊。
+    def _detect_is_group(self, session: str, chat_title: str = "") -> bool:
+        """检测会话是否为群聊（进入会话后调用，此时停留在聊天页）。
 
-        通过 reader 的公开接口 last_is_group(session) 获取
-        （由 SessionReader 实现，读取端口感知的最新页面状态）。
-        接口缺失或异常时保守默认 True（按群聊处理更安全）。
+        优先用端口实测：群聊标题必带 "(人数)" 后缀，私聊没有
+        （2026-08-09 新加好友 Road 被默认成群聊导致私聊沉默；
+        state 的 page.title 被规整过会丢人数后缀，必须原始 OCR）。
+        实测失败回退 DB 里的历史实测值，再不行保守默认 True。
         """
+        probe = getattr(self._nav, "chat_is_group", None)
+        if callable(probe):
+            try:
+                got = probe()
+                if got is not None:
+                    return bool(got)
+            except Exception:
+                log.exception("[%s] chat_is_group failed", session)
         getter = getattr(self._reader, "last_is_group", None)
         if callable(getter):
             try:

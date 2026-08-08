@@ -31,6 +31,10 @@ class Navigator:
         """返回上一页。"""
         return self.tools.back()
 
+    def chat_is_group(self):
+        """当前聊天页是否群聊（标题栏"(人数)"后缀实测）。"""
+        return self.tools.chat_is_group()
+
     def scroll_up(self) -> "ToolResult":
         """聊天页看更早消息 / 列表看更靠上。"""
         return self.tools.scroll_up()

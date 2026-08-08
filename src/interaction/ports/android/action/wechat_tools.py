@@ -450,6 +450,25 @@ class WeChatTools:
         log.warning("send 已点发送但验证未确认到气泡（假定已发出，不重发）")
         return state
 
+    def chat_is_group(self):
+        """当前聊天页是否群聊：标题栏原始 OCR 里找 "(人数)" 后缀。
+        群聊标题必带、私聊没有；state 里的 page.title 被规整过会丢掉
+        人数后缀，所以这里自己裁标题带跑一次 OCR（不过滤字高）。
+        返回 True/False；读不到标题文字返回 None（调用方自行兜底）。"""
+        import re as _re
+        from ..perception import layout_consts as LC
+        try:
+            img = self.dev.capture_bytes()
+            crop = img[LC.TITLE_Y0 - 20:LC.TITLE_Y1 + 20, 150:950]
+            items = _v2_run_ocr(crop)
+        except Exception:
+            log.exception("chat_is_group ocr failed")
+            return None
+        text = "".join((it.get("text") or "") for it in items)
+        if not text.strip():
+            return None
+        return bool(_re.search(r"[（(]\s*\d+\s*[)）]", text))
+
     def _input_bar_rect(self):
         """智能定位输入框点按区（类似发送键的动态定位，不认固定坐标）：
         OCR 底部 "ADB Keyboard {ON}" 细条（y>=2100）出现 = 聚焦态，
