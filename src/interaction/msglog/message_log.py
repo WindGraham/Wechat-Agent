@@ -239,10 +239,15 @@ def fuzzy_eq(sender_a, content_a, sender_b, content_b, iou=None):
     - 内容归一化后相等 -> True
     - 短消息（norm 长度<=6）必须完全相等；调用方若提供几何 IoU 则要求 IoU>0.4
     - 长消息 SequenceMatcher ratio >= 0.85
+
+    多媒体标注容忍（2026-08-08）：标注写回会在 content 尾部追加
+    "[多媒体消息…]描述"（或旧格式"\\n内容：…"），屏幕再读到的原文没有
+    这段——比较前先剥掉标注后缀，否则已标注消息永远锚不上（反复 gap）。
     """
     if normalize(sender_a) != normalize(sender_b):
         return False
-    na, nb = normalize(content_a), normalize(content_b)
+    na, nb = normalize(_strip_annotation(content_a)), \
+        normalize(_strip_annotation(content_b))
     if not na or not nb:
         # 纯标点消息（"?" / "..."）normalize 后为空串：退化为原文精确比较，
         # 否则 "?" 永远无法匹配，增量补尾会把整段底部误判为新消息（218 实测）
@@ -254,6 +259,17 @@ def fuzzy_eq(sender_a, content_a, sender_b, content_b, iou=None):
     if min(len(na), len(nb)) <= 6:
         return False
     return _ratio(na, nb) >= 0.85
+
+
+def _strip_annotation(content):
+    """剥掉多媒体标注后缀（新旧两种格式）。"""
+    if not content:
+        return ""
+    for mark in ("[多媒体消息", "\n内容:"):
+        i = content.find(mark)
+        if i >= 0:
+            content = content[:i]
+    return content
 
 
 # ---------------------------------------------------------------- 时间分割线
