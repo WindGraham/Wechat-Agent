@@ -60,9 +60,12 @@ class TaskLedger:
             log.info("ledger rebuilt: %d task(s) from disk", len(self._tasks))
 
     def find_similar(self, session: str, desc: str, within_s: int = 600):
-        """同会话、描述相似（归一化后互为子串）、且仍在执行或 within_s
-        内才完成的任务——用于委派前去重（2026-08-08 海报重复委派实测）。"""
+        """同会话、描述高度相似、且仍在执行或 within_s 内才完成的任务——
+        用于委派前去重（2026-08-08 海报重复委派实测）。
+        判定用 SequenceMatcher ratio>=0.8：纯子串包含会误杀"旧任务+新需求"
+        的合并任务（"找海报+电子书" 被 "找海报" 误吞，电子书没人办）。"""
         import re as _re
+        from difflib import SequenceMatcher
         nd = _re.sub(r"\W+", "", desc or "")
         if not nd:
             return None
@@ -78,7 +81,7 @@ class TaskLedger:
             else:
                 continue
             nt = _re.sub(r"\W+", "", t.get("desc") or "")
-            if nt and (nt in nd or nd in nt):
+            if nt and SequenceMatcher(None, nd, nt).ratio() >= 0.8:
                 return t
         return None
 
