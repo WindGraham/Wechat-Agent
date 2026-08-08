@@ -1,2 +1,0 @@
-{"ts": "2026-08-08T19:45:33", "type": "llm_decision", "data": {"session": "交流一下？", "trigger": "截图扫描+新消息通知发现未读", "pending": [], "result": "silent", "boundary": "dispatcher→pipeline→llm"}}
-{"ts": "2026-08-08T19:45:33", "type": "decision", "data": {"session": "交流一下？", "result": "silent", "new_msgs": 0, "boundary": "dispatcher→pipeline"}}
