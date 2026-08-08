@@ -17,5 +17,9 @@
   "action_max_attempts": 2,
   "task_retention_days": 14,
   "tool_model": "kimi-code/k3",
-  "open_all_sessions": true
+  "open_all_sessions": true,
+  "screen_watch_interval": [
+    2.0,
+    4.0
+  ]
 }

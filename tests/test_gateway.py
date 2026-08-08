@@ -251,6 +251,76 @@ class StatusApiTest(GatewayTestBase):
         self.assertEqual(j["tasks"], [])
 
 
+class LiveApiTest(GatewayTestBase):
+    """实况页 API：/api/events 与 /api/home_scan。"""
+
+    def _write_events(self, lines):
+        self._w("workspace/runtime/proxy_events.jsonl", "\n".join(lines) + "\n")
+
+    def test_events_empty(self):
+        r = self.client.get("/api/events")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json(), {"ok": True, "events": []})
+
+    def test_events_data_reversed(self):
+        self._write_events([
+            json.dumps({"ts": 1, "type": "decision_start", "session": "A"}),
+            "这不是合法 JSON",
+            "",
+            json.dumps({"ts": 2, "type": "route", "session": "A",
+                        "blocks": ["reply"],
+                        "deliveries": [{"session": "A", "ok": True}]}),
+        ])
+        r = self.client.get("/api/events")
+        self.assertEqual(r.status_code, 200)
+        events = r.get_json()["events"]
+        # 倒序（最新在前），坏行/空行跳过
+        self.assertEqual([e["type"] for e in events],
+                         ["route", "decision_start"])
+        self.assertEqual(events[0]["deliveries"][0]["ok"], True)
+
+    def test_events_n_limit(self):
+        self._write_events([json.dumps({"ts": i, "type": "tick"})
+                            for i in range(5)])
+        r = self.client.get("/api/events?n=2")
+        events = r.get_json()["events"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["ts"], 4)          # 最新的在前
+        # 非法 n 回退默认 50（全部 5 条）
+        r = self.client.get("/api/events?n=abc")
+        self.assertEqual(len(r.get_json()["events"]), 5)
+        # 超大 n 截到上限 500（数据不足则全返回）
+        r = self.client.get("/api/events?n=99999")
+        self.assertEqual(len(r.get_json()["events"]), 5)
+
+    def test_home_scan_missing(self):
+        r = self.client.get("/api/home_scan")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json(), {"ok": True, "scan": None})
+
+    def test_home_scan_ok(self):
+        self._w("workspace/runtime/home_scan.json", json.dumps({
+            "ts": 1723100000,
+            "sessions": [{"label": "特高课", "unread_count": 3,
+                          "unread_kind": "number", "mention_me": True,
+                          "muted": False, "partial": False},
+                         {"label": "文件传输助手", "unread_count": 0,
+                          "unread_kind": None, "mention_me": False,
+                          "muted": True, "partial": False}],
+        }))
+        r = self.client.get("/api/home_scan")
+        self.assertEqual(r.status_code, 200)
+        scan = r.get_json()["scan"]
+        self.assertEqual(len(scan["sessions"]), 2)
+        self.assertEqual(scan["sessions"][0]["unread_kind"], "number")
+        self.assertTrue(scan["sessions"][1]["muted"])
+
+    def test_home_scan_corrupt(self):
+        self._w("workspace/runtime/home_scan.json", "{坏掉的")
+        r = self.client.get("/api/home_scan")
+        self.assertEqual(r.get_json(), {"ok": True, "scan": None})
+
+
 class TokenAuthTest(GatewayTestBase):
     token = "secret-token-123"
 

@@ -30,6 +30,45 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 WATERMARKS_PATH = os.path.join(PROJECT_ROOT, "workspace", "runtime",
                                "watermarks.json")
+EVENTS_PATH = os.path.join(PROJECT_ROOT, "workspace", "runtime",
+                           "proxy_events.jsonl")
+EVENTS_MAX_BYTES = 2 * 1024 * 1024     # jsonl 超过则截断保留后半
+PROMPT_JOURNAL_LIMIT = 30000           # prompt/llm_output 超过则截断标注
+
+
+def _clip(text: str, limit: int = PROMPT_JOURNAL_LIMIT) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[已截断，全文 {len(text)} 字符]"
+
+
+def _journal(event_type: str, **data):
+    """往 workspace/runtime/proxy_events.jsonl 追加一条事件（网关实况页读取）。
+    观测性通道：任何失败只记日志，绝不影响决策主流程。"""
+    try:
+        rec = {"ts": time.time(), "type": event_type}
+        rec.update(data)
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        os.makedirs(os.path.dirname(EVENTS_PATH), exist_ok=True)
+        if (os.path.isfile(EVENTS_PATH)
+                and os.path.getsize(EVENTS_PATH) > EVENTS_MAX_BYTES):
+            _truncate_events()
+        with open(EVENTS_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:  # noqa: BLE001
+        log.exception("journal 写入失败: %s", event_type)
+
+
+def _truncate_events():
+    """jsonl 超限：截断保留后半（按行对齐，丢掉被截断的半行）。"""
+    with open(EVENTS_PATH, "rb") as f:
+        data = f.read()
+    half = data[len(data) // 2:]
+    nl = half.find(b"\n")
+    half = half[nl + 1:] if nl != -1 else b""
+    with open(EVENTS_PATH, "wb") as f:
+        f.write(half)
 
 MAX_TOOL_CALLS = 3            # chat_history 每轮最多 3 次
 MAX_REPLY_BLOCKS = 3          # 一轮最多 3 个 <reply>（防刷屏）
@@ -175,11 +214,19 @@ class Proxy:
                 return
 
             # 媒体转换：新消息里的未标注多媒体先转文字（限并发）
-            self._media.convert_all(session, new_msgs)
+            n_targets = sum(1 for m in new_msgs
+                            if self._media.needs_convert(m))
+            n_converted = self._media.convert_all(session, new_msgs)
+            if n_targets:
+                _journal("media_convert", session=session,
+                         ok=n_converted, total=n_targets)
 
             history = self._reader.get_context(
                 session, n=self._rt("history_size", 200))
             trigger = "有人@我" if (mention_hint or unreplied) else "新消息"
+            t0 = time.monotonic()
+            _journal("decision_start", session=session, trigger=trigger,
+                     new_messages=len(new_msgs))
 
             reply_sent = self._llm_loop(
                 session, is_group, trigger, history, new_msgs)
@@ -198,6 +245,9 @@ class Proxy:
             if reply_sent:
                 for m in unreplied:
                     self._policy.mark_replied(session, m)
+            _journal("decision_end", session=session,
+                     replied=bool(reply_sent),
+                     elapsed_ms=int((time.monotonic() - t0) * 1000))
 
     def _llm_loop(self, session, is_group, trigger, history, new_msgs) -> bool:
         """LLM 调用循环：生成 → 解析 → 路由；tool 块回灌续生成。
@@ -209,6 +259,13 @@ class Proxy:
             messages = self._builder.build(
                 session, is_group, trigger, history, new_msgs,
                 tool_feedback=tool_feedback)
+            _journal("prompt", session=session, round=_round,
+                     system=_clip("\n\n".join(
+                         m.get("content", "") for m in messages
+                         if m.get("role") == "system")),
+                     user=_clip("\n\n".join(
+                         m.get("content", "") for m in messages
+                         if m.get("role") == "user")))
             try:
                 out = self._provider.chat(messages)
             except Exception as e:  # noqa: BLE001
@@ -216,6 +273,8 @@ class Proxy:
                 log.warning("[%s] LLM 调用失败: %s: %s",
                             session, type(e).__name__, e)
                 return replied
+            _journal("llm_output", session=session, round=_round,
+                     output=_clip(out))
             blocks = [b for b in extract_blocks(out) if b.valid]
             if not blocks:
                 log.warning("[%s] 输出无合法块，重试一次", session)
@@ -239,12 +298,17 @@ class Proxy:
                 continue                       # 只有工具调用：回灌续生成
 
             # 终止输出：路由执行
+            deliveries = []
             for b in reply_blocks[:MAX_REPLY_BLOCKS]:
                 xml = self._block_to_xml(b, session)
-                if self._submit_bundle(session, xml).ok:
+                ok = self._submit_bundle(session, xml).ok
+                deliveries.append({"session": session, "ok": bool(ok)})
+                if ok:
                     replied = True
             for b in task_blocks[:MAX_TASK_BLOCKS]:
                 self._start_task(session, b)
+            _journal("route", session=session,
+                     blocks=[b.tag for b in blocks], deliveries=deliveries)
             return replied or bool(task_blocks)
         return replied
 
@@ -304,6 +368,8 @@ class Proxy:
             session=session, refs=refs,
             ref_briefs=[], desc=attrs.get("desc", ""),
             deliver=attrs.get("deliver", "reply"))
+        _journal("task_start", task_id=task["task_id"], session=session,
+                 desc=task["desc"])
         brief = TaskBrief(goal=brief_text,
                           context=self._brief_context(session),
                           deliver=attrs.get("deliver", "reply"))
@@ -340,6 +406,8 @@ class Proxy:
         if not task:
             return
         session = task["session"]
+        _journal("task_done", task_id=task_id, session=session,
+                 desc=task.get("desc", ""), ok=task["status"] == "done")
         try:
             with open(os.path.join(task["workdir"], "result.txt"),
                       encoding="utf-8") as f:

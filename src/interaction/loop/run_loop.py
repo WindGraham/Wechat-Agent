@@ -77,6 +77,11 @@ class InteractionLoop:
             log.exception("wake_and_dim failed")
 
         self._watcher.start()
+        # 持续盯屏：首页红点即时入队（不等 sweep 周期）
+        from .screen_watch import ScreenWatcher
+        self._screen_watch = ScreenWatcher(self._tools, self._queue,
+                                           config=self._config)
+        self._screen_watch.start()
 
         try:
             if once:
@@ -84,6 +89,10 @@ class InteractionLoop:
             else:
                 self._main_loop()
         finally:
+            try:
+                self._screen_watch.stop()
+            except Exception:
+                log.exception("screen watch stop failed")
             try:
                 self._watcher.stop()
             except Exception:
@@ -109,10 +118,15 @@ class InteractionLoop:
 
             now = self._clock()
             if now >= next_sweep:
-                try:
-                    self._do_sweep()
-                except Exception:
-                    log.exception("sweep failed")
+                if len(self._queue) > 0:
+                    # 队列未清空不开轮询（用户规则 2026-08-08）：
+                    # 旅程优先，sweep 顺延到下一周期
+                    log.debug("队列未清空（%d），sweep 顺延", len(self._queue))
+                else:
+                    try:
+                        self._do_sweep()
+                    except Exception:
+                        log.exception("sweep failed")
                 next_sweep = self._clock() + self._rand(*self.sweep_interval)
 
             # 乱逛：队列空时模拟真人随机浏览

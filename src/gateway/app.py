@@ -9,6 +9,8 @@
 - 运行配置：config/runtime.json 表单化读写（字段按 CONTRACTS.md §五 白名单）
 - 密钥：workspace/.env 查看（脱敏：前4后2）与更新；只落本机文件
 - 状态页：workspace/runtime/ 的 queue.json / watermarks.json 与 tasks/ 台账摘要
+- 实况页（默认首页）：时序队列 + home_scan.json 首页红点快照 +
+  proxy_events.jsonl 决策事件流水（prompt/llm_output 可展开全文）
 
 安全：默认只绑 127.0.0.1；环境变量 WECHAT_AGENT_GATEWAY_TOKEN 设置时，
 所有请求必须带 ``Authorization: Bearer <token>``。
@@ -183,6 +185,27 @@ def create_app(project_root=None):
             "tasks": _list_tasks(os.path.join(root, "workspace", "tasks")),
         })
 
+    # ------------------------------------------------------------- 实况
+    @app.route("/api/events")
+    def api_events():
+        """proxy_events.jsonl 尾部 n 条（倒序：最新在前）。"""
+        try:
+            n = int(request.args.get("n", "50"))
+        except ValueError:
+            n = 50
+        n = max(1, min(n, 500))
+        path = os.path.join(root, "workspace", "runtime",
+                            "proxy_events.jsonl")
+        return jsonify({"ok": True, "events": _read_jsonl_tail(path, n)})
+
+    @app.route("/api/home_scan")
+    def api_home_scan():
+        """首页红点扫描快照；未产生过时 scan 为 null。"""
+        path = os.path.join(root, "workspace", "runtime", "home_scan.json")
+        data = _read_json(path)
+        return jsonify({"ok": True,
+                        "scan": data if isinstance(data, dict) else None})
+
     return app
 
 
@@ -194,6 +217,27 @@ def _read_json(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def _read_jsonl_tail(path, n):
+    """读 jsonl 尾部 n 条（倒序：最新在前）；不存在返回 []，坏行跳过。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    events = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+        if len(events) >= n:
+            break
+    return events
 
 
 def _list_prompts(root):
@@ -323,44 +367,83 @@ INDEX_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Wechat-Agent 网关</title>
 <style>
-  body { font-family: sans-serif; margin: 0; color: #222; }
-  header { background: #2b3a4a; color: #fff; padding: 8px 16px; }
+  :root { --bg:#14181d; --panel:#1c2128; --border:#30363d; --fg:#c9d1d9;
+          --dim:#8b949e; --accent:#1f6feb; --warn:#d29922; --bad:#f85149; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+         margin: 0; background: var(--bg); color: var(--fg); }
+  header { background: var(--panel); border-bottom: 1px solid var(--border);
+           padding: 8px 16px; }
   header h1 { font-size: 16px; margin: 0; display: inline-block; }
   nav { display: inline-block; margin-left: 24px; }
-  nav button { margin-right: 6px; padding: 4px 12px; }
+  nav button { margin-right: 6px; padding: 4px 14px; background: #21262d;
+               color: var(--fg); border: 1px solid var(--border);
+               border-radius: 6px; cursor: pointer; }
+  nav button:hover { border-color: var(--dim); }
+  nav button.active { background: var(--accent); border-color: var(--accent);
+                      color: #fff; }
   main { display: flex; height: calc(100vh - 40px); }
-  #sidebar { width: 280px; overflow: auto; border-right: 1px solid #ccc;
+  #sidebar { width: 280px; overflow: auto; border-right: 1px solid var(--border);
              padding: 8px; }
   #sidebar .f { padding: 3px 6px; cursor: pointer; border-radius: 4px;
                 font-size: 13px; }
-  #sidebar .f:hover { background: #eef; }
-  #sidebar .f.active { background: #dbe7ff; }
+  #sidebar .f:hover { background: #21262d; }
+  #sidebar .f.active { background: #1f3355; }
   #sidebar .tag { font-size: 11px; color: #fff; border-radius: 3px;
                   padding: 0 4px; margin-right: 4px; }
   .tag.system { background: #587; } .tag.user { background: #975; }
   .tag.persona { background: #759; } .tag.order { background: #555; }
   #editor { flex: 1; display: flex; flex-direction: column; padding: 8px; }
   #editor textarea { flex: 1; font-family: monospace; font-size: 13px;
-                     width: 100%; box-sizing: border-box; }
+                     width: 100%; background: #0d1117; color: var(--fg);
+                     border: 1px solid var(--border); border-radius: 6px;
+                     padding: 8px; }
   #bar { padding: 6px 0; }
-  #dirty { color: #c60; font-weight: bold; margin-left: 12px; }
+  #bar button, .pane button { background: #21262d; color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 14px;
+    cursor: pointer; }
+  #dirty { color: var(--warn); font-weight: bold; margin-left: 12px; }
   .pane { flex: 1; overflow: auto; padding: 12px; display: none; }
-  table { border-collapse: collapse; }
-  td, th { border: 1px solid #ccc; padding: 4px 8px; font-size: 13px; }
-  input[type=text], input[type=number] { width: 220px; }
-  pre { background: #f6f6f6; padding: 8px; font-size: 12px; }
-  #msg { margin-left: 12px; color: #282; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 8px; color: var(--dim);
+             font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { border-bottom: 1px solid var(--border); padding: 4px 8px;
+           font-size: 13px; text-align: left; }
+  th { color: var(--dim); font-weight: 600; }
+  tr.action td { background: rgba(210, 153, 34, .12); }
+  tr.unread td { color: var(--bad); }
+  tr.unread td:first-child { font-weight: 600; }
+  input[type=text], input[type=number] { width: 220px; background: #0d1117;
+    color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 6px; }
+  pre { background: #0d1117; border: 1px solid var(--border);
+        border-radius: 6px; padding: 8px; font-size: 12px; }
+  #msg { margin-left: 12px; color: #3fb950; }
+  .dim { color: var(--dim); }
+  .ev { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px; padding: 3px 0; border-bottom: 1px solid #21262d; }
+  .ev .ts { color: var(--dim); margin-right: 8px; }
+  .ev .etype { display: inline-block; min-width: 110px; color: #79c0ff; }
+  .ev details summary { cursor: pointer; list-style: none; }
+  .ev details summary::-webkit-details-marker { display: none; }
+  .ev details summary .etype::before { content: "▸ "; color: var(--dim); }
+  .ev details[open] summary .etype::before { content: "▾ "; }
+  .ev pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0;
+            max-height: 420px; overflow: auto; }
 </style>
 </head>
 <body>
 <header>
   <h1>Wechat-Agent 网关</h1>
   <nav>
-    <button onclick="showTab('prompts')">Prompt 编辑</button>
-    <button onclick="showTab('personas')">人格卡</button>
-    <button onclick="showTab('runtime')">运行配置</button>
-    <button onclick="showTab('env')">密钥</button>
-    <button onclick="showTab('status')">状态</button>
+    <button data-tab="live" onclick="showTab('live')">实况</button>
+    <button data-tab="prompts" onclick="showTab('prompts')">Prompt 编辑</button>
+    <button data-tab="personas" onclick="showTab('personas')">人格卡</button>
+    <button data-tab="runtime" onclick="showTab('runtime')">运行配置</button>
+    <button data-tab="env" onclick="showTab('env')">密钥</button>
+    <button data-tab="status" onclick="showTab('status')">状态</button>
   </nav>
 </header>
 <main>
@@ -375,18 +458,27 @@ INDEX_HTML = """<!DOCTYPE html>
     <textarea id="ta" oninput="markDirty()"
       placeholder="左侧选择文件开始编辑"></textarea>
   </div>
+  <div class="pane" id="pane-live">
+    <div class="card"><h2>时序队列</h2><div id="live-queue"></div></div>
+    <div class="card"><h2>首页红点</h2><div id="live-home"></div></div>
+    <div class="card"><h2>Proxy 流水</h2><div id="live-events"></div></div>
+  </div>
   <div class="pane" id="pane-runtime"></div>
   <div class="pane" id="pane-env"></div>
   <div class="pane" id="pane-status"></div>
 </main>
 <script>
-let curPath = null, savedContent = "", dirty = false;
+let curPath = null, savedContent = "", dirty = false, curTab = "live";
 
 function api(path, opts) {
   return fetch(path, opts).then(r => r.json().then(j => {
     if (!r.ok) throw new Error(j.error || r.status);
     return j;
   }));
+}
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;');
 }
 function markDirty() {
   dirty = (document.getElementById('ta').value !== savedContent);
@@ -395,12 +487,17 @@ function markDirty() {
 window.onbeforeunload = () => dirty ? '有未保存的修改' : null;
 
 function showTab(name) {
+  curTab = name;
   const editing = (name === 'prompts' || name === 'personas');
   document.getElementById('editor').style.display = editing ? 'flex' : 'none';
-  for (const p of ['runtime', 'env', 'status'])
+  document.getElementById('sidebar').style.display = editing ? '' : 'none';
+  for (const p of ['live', 'runtime', 'env', 'status'])
     document.getElementById('pane-' + p).style.display =
       (p === name) ? 'block' : 'none';
+  for (const b of document.querySelectorAll('nav button'))
+    b.classList.toggle('active', b.dataset.tab === name);
   if (editing) loadFiles(name);
+  if (name === 'live') loadLive();
   if (name === 'runtime') loadRuntime();
   if (name === 'env') loadEnv();
   if (name === 'status') loadStatus();
@@ -415,7 +512,7 @@ function loadFiles(which) {
       d.className = 'f' + (f.path === curPath ? ' active' : '');
       const ord = f.order ? ('#' + f.order + ' ') : '';
       d.innerHTML = '<span class="tag ' + f.group + '">' + f.group +
-                    '</span>' + ord + f.name;
+                    '</span>' + ord + esc(f.name);
       d.onclick = () => openFile(f.path);
       sb.appendChild(d);
     }
@@ -463,7 +560,7 @@ const RUNTIME_SCHEMA = [
 function loadRuntime() {
   api('/api/runtime').then(j => {
     const p = document.getElementById('pane-runtime');
-    let h = '<h3>运行配置（config/runtime.json）</h3><table>';
+    let h = '<div class="card"><h2>运行配置（config/runtime.json）</h2><table>';
     for (const [k, t] of RUNTIME_SCHEMA) {
       const v = j.config[k];
       h += '<tr><td>' + k + '</td><td>';
@@ -477,14 +574,14 @@ function loadRuntime() {
              'value="' + (v ? v[1] : '') + '">';
       else if (t === 'str')
         h += '<input type="text" id="rt_' + k + '" value="' +
-             (v ?? '') + '">';
+             esc(v ?? '') + '">';
       else
         h += '<input type="number" id="rt_' + k + '" value="' +
              (v ?? '') + '">';
       h += '</td></tr>';
     }
     h += '</table><br><button onclick="saveRuntime()">保存</button>' +
-         ' <span id="rt_msg"></span>';
+         ' <span id="rt_msg"></span></div>';
     p.innerHTML = h;
   }).catch(e => alert(e.message));
 }
@@ -512,16 +609,18 @@ function saveRuntime() {
 function loadEnv() {
   api('/api/env').then(j => {
     const p = document.getElementById('pane-env');
-    let h = '<h3>密钥（workspace/.env，脱敏显示）</h3><table>' +
-            '<tr><th>键</th><th>当前值</th><th>新值（留空=不变）</th></tr>';
+    let h = '<div class="card"><h2>密钥（workspace/.env，脱敏显示）</h2>' +
+            '<table><tr><th>键</th><th>当前值</th>' +
+            '<th>新值（留空=不变）</th></tr>';
     for (const item of j.keys)
-      h += '<tr><td>' + item.key + '</td><td>' + item.masked + '</td>' +
-           '<td><input type="text" data-envkey="' + item.key + '"></td></tr>';
+      h += '<tr><td>' + esc(item.key) + '</td><td>' + esc(item.masked) +
+           '</td><td><input type="text" data-envkey="' + esc(item.key) +
+           '"></td></tr>';
     h += '<tr><td><input type="text" id="env_newkey" ' +
          'placeholder="NEW_KEY"></td><td></td>' +
          '<td><input type="text" id="env_newval"></td></tr>';
     h += '</table><br><button onclick="saveEnv()">保存</button>' +
-         ' <span id="env_msg"></span>';
+         ' <span id="env_msg"></span></div>';
     p.innerHTML = h;
   }).catch(e => alert(e.message));
 }
@@ -542,43 +641,134 @@ function saveEnv() {
 function loadStatus() {
   api('/api/status').then(j => {
     const p = document.getElementById('pane-status');
-    const block = (title, obj) => '<h3>' + title + '</h3>' +
-      (obj == null ? '<p>暂无数据</p>'
-                   : '<pre>' + JSON.stringify(obj, null, 2) + '</pre>');
-    // 统一时间序队列：表格化展示（出队顺序）
-    let h = '<h3>时序队列（出队顺序）</h3>';
-    if (!j.queue || !j.queue.length) h += '<p>队列为空</p>';
-    else {
-      h += '<table><tr><th>#</th><th>类型</th><th>会话</th><th>@我</th>' +
-           '<th>已试</th><th>来源</th><th>入队时间</th><th>内容摘要</th></tr>';
-      for (const e of j.queue) {
-        const ts = e.ts ? new Date(e.ts * 1000).toLocaleTimeString() : '-';
-        h += '<tr><td>' + e.order + '</td><td>' +
-             (e.kind === 'action' ? '行动' : '通知') + '</td><td>' +
-             e.session + '</td><td>' + (e.mention ? '⚠️' : '') + '</td><td>' +
-             e.attempts + '</td><td>' + (e.sources || []).join(',') +
-             '</td><td>' + ts + '</td><td>' +
-             (e.payload_brief || '').replace(/</g, '&lt;') + '</td></tr>';
-      }
-      h += '</table>';
-    }
+    const block = (title, obj) => '<div class="card"><h2>' + title +
+      '</h2>' + (obj == null ? '<p class="dim">暂无数据</p>'
+                 : '<pre>' + esc(JSON.stringify(obj, null, 2)) + '</pre>') +
+      '</div>';
+    let h = '<div class="card"><h2>时序队列（出队顺序）</h2>' +
+            queueTable(j.queue) + '</div>';
     h += block('水位（runtime/watermarks.json）', j.watermarks);
-    h += '<h3>任务台账（tasks/）</h3>';
-    if (!j.tasks.length) h += '<p>暂无数据</p>';
+    h += '<div class="card"><h2>任务台账（tasks/）</h2>';
+    if (!j.tasks.length) h += '<p class="dim">暂无数据</p>';
     else {
       h += '<table><tr><th>日期</th><th>task_id</th><th>会话</th>' +
            '<th>描述</th><th>状态</th></tr>';
       for (const t of j.tasks)
-        h += '<tr><td>' + t.date + '</td><td>' + t.task_id + '</td><td>' +
-             t.session + '</td><td>' + t.desc + '</td><td>' + t.status +
-             '</td></tr>';
+        h += '<tr><td>' + esc(t.date) + '</td><td>' + esc(t.task_id) +
+             '</td><td>' + esc(t.session) + '</td><td>' + esc(t.desc) +
+             '</td><td>' + esc(t.status) + '</td></tr>';
       h += '</table>';
     }
+    h += '</div>';
     p.innerHTML = h;
   }).catch(e => alert(e.message));
 }
 
-showTab('prompts');
+function queueTable(queue) {
+  if (!queue || !queue.length) return '<p class="dim">队列为空</p>';
+  let h = '<table><tr><th>#</th><th>类型</th><th>会话</th><th>@我</th>' +
+          '<th>已试</th><th>来源</th><th>入队时间</th><th>内容摘要</th></tr>';
+  for (const e of queue) {
+    const ts = e.ts ? new Date(e.ts * 1000).toLocaleTimeString() : '-';
+    const kind = e.kind === 'action' ? '行动' : '通知';
+    h += '<tr class="' + (e.kind === 'action' ? 'action' : '') + '"><td>' +
+         e.order + '</td><td>' + kind + '</td><td>' + esc(e.session) +
+         '</td><td>' + (e.mention ? '⚠️' : '') + '</td><td>' + e.attempts +
+         '</td><td>' + esc((e.sources || []).join(',')) + '</td><td>' + ts +
+         '</td><td>' + esc(e.payload_brief || '') + '</td></tr>';
+  }
+  return h + '</table>';
+}
+
+// ------------------------------------------------------------- 实况页
+function loadLive() {
+  Promise.all([
+    api('/api/status').catch(() => null),
+    api('/api/home_scan').catch(() => null),
+    api('/api/events?n=80').catch(() => null),
+  ]).then(([st, hs, ev]) => {
+    document.getElementById('live-queue').innerHTML =
+      queueTable(st && st.queue);
+    document.getElementById('live-home').innerHTML =
+      renderHome(hs && hs.scan);
+    document.getElementById('live-events').innerHTML =
+      renderEvents(ev ? ev.events : []);
+  });
+}
+
+function renderHome(scan) {
+  if (!scan || !scan.sessions || !scan.sessions.length)
+    return '<p class="dim">暂无数据（等待下一轮扫描）</p>';
+  const ts = scan.ts ? new Date(scan.ts * 1000).toLocaleTimeString() : '-';
+  let h = '<p class="dim">更新于 ' + ts + '</p><table><tr><th>会话</th>' +
+          '<th>未读</th><th>@我</th><th>免打扰</th></tr>';
+  for (const s of scan.sessions) {
+    const unread = s.unread_count > 0 ? String(s.unread_count)
+                 : (s.unread_kind === 'dot' ? '红点' : '');
+    const hot = s.unread_count > 0 || s.unread_kind === 'dot' || s.mention_me;
+    h += '<tr class="' + (hot ? 'unread' : '') + '"><td>' + esc(s.label) +
+         (s.partial ? ' <span class="dim">(残缺)</span>' : '') + '</td><td>' +
+         unread + '</td><td>' + (s.mention_me ? '⚠️' : '') + '</td><td>' +
+         (s.muted ? '🔕' : '') + '</td></tr>';
+  }
+  return h + '</table>';
+}
+
+function eventSummary(e) {
+  switch (e.type) {
+    case 'decision_start':
+      return (e.session || '') + ' trigger=' + (e.trigger || '') +
+             ' 新消息=' + e.new_messages;
+    case 'prompt':
+      return (e.session || '') + ' round=' + e.round;
+    case 'llm_output':
+      return (e.session || '') + ' round=' + e.round + ' ' +
+             String(e.output || '').slice(0, 80).replace(/\\n/g, ' ');
+    case 'route':
+      return (e.session || '') + ' 块=[' + (e.blocks || []).join(',') +
+             '] 投递=' + (e.deliveries || [])
+               .map(d => d.session + ':' + (d.ok ? 'ok' : 'fail')).join(',');
+    case 'media_convert':
+      return (e.session || '') + ' 成功 ' + e.ok + '/' + e.total;
+    case 'task_start':
+      return (e.task_id || '') + ' ' + (e.session || '') + ' ' +
+             (e.desc || '');
+    case 'task_done':
+      return (e.task_id || '') + ' ' + (e.session || '') + ' ' +
+             (e.desc || '') + ' ' + (e.ok ? '成功' : '失败');
+    case 'decision_end':
+      return (e.session || '') + ' 回复=' + (e.replied ? '是' : '否') +
+             ' ' + e.elapsed_ms + 'ms';
+    default:
+      return JSON.stringify(e).slice(0, 120);
+  }
+}
+
+function renderEvents(events) {
+  if (!events || !events.length) return '<p class="dim">暂无事件</p>';
+  let h = '';
+  for (const e of events) {
+    const ts = e.ts ? new Date(e.ts * 1000).toLocaleTimeString() : '-';
+    const head = '<span class="ts">' + ts + '</span>' +
+                 '<span class="etype">' + esc(e.type) + '</span>' +
+                 esc(eventSummary(e));
+    if (e.type === 'prompt' || e.type === 'llm_output') {
+      const full = e.type === 'prompt'
+        ? '[system]\\n' + (e.system || '') + '\\n\\n[user]\\n' + (e.user || '')
+        : (e.output || '');
+      h += '<div class="ev"><details><summary>' + head + '</summary><pre>' +
+           esc(full) + '</pre></details></div>';
+    } else {
+      h += '<div class="ev">' + head + '</div>';
+    }
+  }
+  return h;
+}
+
+// 实况页每 3 秒自动刷新（仅实况标签页激活时）
+setInterval(() => { if (curTab === 'live') loadLive(); }, 3000);
+
+showTab('live');
 </script>
 </body>
 </html>
