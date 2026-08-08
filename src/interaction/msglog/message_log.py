@@ -339,6 +339,25 @@ def session_tail(conn, session_id, n=LOG_TAIL_N):
     return [dict(r) for r in reversed(rows)]
 
 
+MEDIA_TYPES = {"multimedia", "image", "sticker", "voice", "video",
+               "unknown_nontext"}
+
+
+def _media_eq(entry, row):
+    """多媒体条目锚定（2026-08-08 YOUSAOBI gap 风暴修复）：媒体转换把日志行
+    content 改写成视觉描述后，屏幕重读到的占位符/缩略图 OCR 文本永远匹配不上，
+    增量分界零命中 -> 反复 gap -> backlog 锚不住 -> MergeError。
+    两侧都是多媒体且发送人一致即视为同一条（先后顺序由 LCS/分界逻辑保证，
+    媒体消息密度低，误锚风险可接受）。"""
+    if row["content_type"] == "time_divider":
+        return False
+    if row["content_type"] not in MEDIA_TYPES and not row["media_path"]:
+        return False
+    if (getattr(entry, "content_type", "text") or "text") not in MEDIA_TYPES:
+        return False
+    return normalize(_entry_sender(entry)) == normalize(row["sender"])
+
+
 def _entry_fuzzy_eq_row(entry, row):
     """栈条目 vs 日志行的 L2 判定。divider 用精确文本等值（分割线是锚定成员，
     但不做唯一键——同一文本可出现多次，靠 L3 保序兜底）。"""
@@ -347,6 +366,8 @@ def _entry_fuzzy_eq_row(entry, row):
                 and normalize(entry.content) == normalize(row["content"]))
     if row["content_type"] == "time_divider":
         return False
+    if _media_eq(entry, row):
+        return True
     return fuzzy_eq(entry.sender, entry.content, row["sender"], row["content"])
 
 
@@ -565,8 +586,9 @@ def _entry_in_tail(entry, tail):
                    for row in tail)
     sender = _entry_sender(entry)
     return any(row["content_type"] != "time_divider"
-               and fuzzy_eq(sender, entry.content,
-                            row["sender"], row["content"])
+               and (_media_eq(entry, row)
+                    or fuzzy_eq(sender, entry.content,
+                                row["sender"], row["content"]))
                for row in tail)
 
 
