@@ -194,9 +194,9 @@ qr.parse_chat = lambda img, items, title: (
 res = qr.quote_reply(dev, match_text="爬山", reply_text="来啦",
                      ocr_fn=fake_ocr, sleep_fn=lambda s: None)
 check("S4 quote_reply 八步成功", res["ok"] and res["verified"], str(res))
-check("S4 quote_reply 长按+输入+两次tap",
+check("S4 quote_reply 长按+输入+三次tap（聚焦+引用+发送）",
       len(dev.long_presses) == 1 and dev.inputs == ["来啦"]
-      and len(dev.taps) == 2,
+      and len(dev.taps) == 3,
       f"lp={len(dev.long_presses)} in={dev.inputs} taps={len(dev.taps)}")
 qr.parse_chat = orig_parse
 
