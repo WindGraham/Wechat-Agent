@@ -37,6 +37,9 @@ Proxy 的三项职责：
 3. **入向汇聚**：交互层的新消息事件、子进程的工具输出/任务完成，
    统一变成一个事件流，在合适的时机回灌给 LLM（工具结果立即回灌续生成；
    任务完成为一条"伪消息事件"进入对应会话的下一轮决策）
+4. **任务台账**：每个 subprocess 登记 `task_id → {session, ref, ref 消息摘要,
+   desc(agent 自写任务描述), started_at, deliver}`。子进程完成时按台账拼
+   【任务回执】喂给 LLM——LLM 永远不需要自己记 task 对应哪条消息
 
 EventGate（闸门，不调 LLM）→ ContextBuilder（拼 prompt）→ LLM →
 OutputParser（信号解析）都跑在 Proxy 的循环里；Policy（必回/@逐条/兜底）
@@ -67,67 +70,88 @@ user 每次决策动态组装。
 
 ```
 【人设】（人格卡全文）
-【输出协议】（三态信号规定）
+【输出协议】（XML 动作块契约，措辞最强硬）
 【可用工具】chat_history / delegate_task 用法
 
 【会话信息】会话: 特高课（群聊） | 时间: 2026-08-08 15:20 周六
-【触发原因】有人@我
+【触发原因】新消息（5 条）
 【历史记录】（最近 200 条，[我]=你自己，[@我]=@你的消息）
 帽子女孩: 这周去不去爬山
 [@我] Leisure: @陈曦 你说呢
 [我] Leisure: 我都行
-【新消息】（本次触发，需要你决策）
-Leisure: @陈曦 那就这么定了
+【新消息】（已编号供 ref 引用；不要求逐条回复，自行选择回哪几条）
+m1 帽子女孩: @陈曦 看到没
+m2 Leisure: [图片内容：一只猫趴在键盘上] 这图怎么样
+m3 风图: 帮我把本周记录整理成 PDF
+m4 8月对我好一点: 哈哈哈哈
+m5 Leisure: 周六去爬山吗
+```
+
+任务完成回调时，【触发原因】+【新消息】替换为任务回执（无新消息）：
+
+```
+【触发原因】任务完成回调
+【任务回执】task_id=t7 | 归属: 特高课 m3（风图: 帮我把本周记录整理成 PDF）
+           你的任务描述: 整理本周聊天记录生成 PDF
+           结果: 成功，文件已生成 /tmp/weekly.pdf
 ```
 
 硬性规则：输出协议措辞必须放 system（放 user 服从率明显下降，实测教训）；
-历史与新消息严格分区不混排；决策层不驱动 UI，因此 prompt 不含屏幕状态
+历史与新消息严格分区不混排；**新消息逐条编号（m1..mN），回复是选择性的，
+没被引用的消息不回复是常态**；决策层不驱动 UI，因此 prompt 不含屏幕状态
 （升级任务时屏幕现场经 TaskBrief 走，不进对话 prompt）。
 
 ## 三、输出信号格式（Proxy 强解析契约）
 
-LLM 的每次输出**必须是且只是一个 JSON 对象**，无 markdown 围栏、
-无任何前后文字。唯一合法形态：
+LLM 的每次输出是一串**有序 XML 动作块**（选 XML 不选 JSON 的调研结论：
+自由文本在标签内无需转义、逐块提取有故障隔离、长文输出不易崩）。
+无围栏、无前后文字。块类型全集（此外一律非法）：
 
-```json
-{"actions": [ <动作>, ... ]}
+```xml
+<reply session="特高课" ref="m1">
+  <quote match="被引用内容片段"/>
+  <text>看到了，这就来</text>
+</reply>
+
+<reply session="特高课" ref="m2">
+  <text>图里是一只趴在键盘上的猫</text>
+  <text>还挺会挑地方</text>
+</reply>
+
+<task session="特高课" ref="m3" desc="整理本周记录生成PDF" deliver="reply+file">
+  任务简报全文（含输出约定句）
+</task>
+
+<silent/>
 ```
 
-动作类型（全集，此外一律非法）：
+块语义：
 
-```json
-{"send": "text",  "session": "特高课", "text": "定了，周六见"}
-{"send": "image", "session": "特高课", "url": "https://..."}     // 或 "path": "/tmp/x.jpg"
-{"send": "file",  "session": "风图",   "path": "/tmp/x.pdf"}
-{"send": "quote", "session": "特高课", "match_text": "被引用片段", "text": "回复内容"}
+| 块 | 含义 | Proxy 路由 |
+|---|---|---|
+| `<reply>` | 发消息。多个 `<text>` = 拟人拆句连发；`<quote>` = 引用回复；`<file path="..."/>` = 发本机文件 | 交互层 `execute()` |
+| `<task>` | 委派工具层起 subprocess。`desc` 是 agent 自写的任务简述（进 Proxy 台账）；`deliver` 声明结果交付方式 | 工具层 `run_task()` |
+| `<silent/>` | 沉默（本轮无任何动作） | 结束 |
 
-{"tool": "chat_history", "session": "特高课", "keyword": "店", "n": 20}
-{"delegate": "task", "goal": "...", "context": "...", "deliver": "session:特高课"}
-```
+属性规则：
 
-规则（Proxy 逐条强校验）：
+- `session` 可省略，默认当前会话；`ref` 引用【新消息】里的编号（m1..mN）
+- **回复是选择性的**：没被 ref 引用的消息不回复是常态
+- 顺序即执行顺序：Proxy 按块出现顺序逐个执行
+- 拟人拆句 vs 长文由 agent 自决策：闲聊拆多个 `<text>`，办事汇报允许长文
 
-1. **沉默 = 空数组**：`{"actions": []}`（没有 [SILENT] 文本形态）
-2. `session` 可省略，默认当前会话
-3. 一轮输出 send 类动作最多 2 个（防刷屏）
-4. **含 `tool`/`delegate` 动作 = 非终止输出**：Proxy 执行后把结果回灌，
-   继续下一轮生成；**只含 `send` 或空数组 = 终止输出**，路由执行后结束
-5. 终止输出里禁止混 tool/delegate；出现即判格式错误
-6. **格式错误处理**：重试一次（system 追加"上次输出不是合法 JSON，只输出
-   规定对象"）；再错丢弃本轮，记日志
-7. Proxy 解析：`json.loads` 失败先剥一次 ``` 围栏再试；键白名单校验，
-   未知键/未知动作类型即格式错误
+循环规则：
 
-路由表（Proxy 唯一分支逻辑）：
+- 输出含 `<task>` 或工具调用块 = **非终止输出**：Proxy 执行/登记后回灌，继续生成
+- 只含 `<reply>`/`<silent/>` = **终止输出**
+- 一轮 `<task>` 最多 1 个，`<reply>` 最多 3 个（防刷屏）
 
-| 动作 | 去向 |
-|---|---|
-| `send:*` | 交互层 `execute(ActionRequest)` |
-| `tool:chat_history` | 内部执行 → 结果回灌 LLM |
-| `delegate:task` | 工具层 `run_task(TaskBrief)` |
+解析与容错（Proxy 强校验）：
 
-远期升级：provider 支持原生 function calling 时，同一套动作 schema
-平移到 tool_calls，解析逻辑不变。
+1. 顺序扫描顶层标签逐块提取；单个坏块只丢自己，不污染其他块
+2. 未知标签/未知属性/缺必填属性 → 该块判错跳过，记日志
+3. 全文无任何合法块 → 重试一次（system 追加警告）；再错丢弃本轮
+4. 远期升级：原生 function calling 时动作 schema 平移，块语义不变
 
 ## 四、回复策略（Policy）
 
