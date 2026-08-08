@@ -295,6 +295,24 @@ def main(argv=None):
         return 0
 
     comp["bridge"].start()
+
+    # 网关随主程序一并启动（管理面：prompt/人格/配置/状态）
+    try:
+        from .gateway import create_app
+        gw_host = os.environ.get("WECHAT_AGENT_GATEWAY_HOST", "127.0.0.1")
+        gw_port = int(os.environ.get("WECHAT_AGENT_GATEWAY_PORT", "13014"))
+        gw_app = create_app()
+        gw = threading.Thread(
+            target=lambda: gw_app.run(host=gw_host, port=gw_port,
+                                      debug=False, use_reloader=False,
+                                      threaded=True),
+            daemon=True, name="gateway")
+        gw.start()
+        comp["gateway"] = gw
+        log.info("gateway started on %s:%d", gw_host, gw_port)
+    except Exception as e:
+        log.warning("网关启动失败（不影响主流程）: %s", e)
+
     loop = comp["loop"]
     try:
         loop.run(once=args.once)
