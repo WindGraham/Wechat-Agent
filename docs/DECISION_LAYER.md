@@ -3,24 +3,44 @@
 > 本项目的 agent 核心。**如何回复用户信息，决策权全部在这一层。**
 > 系统里唯一调用 LLM 的层。拼 prompt（上下文工程）也全部在这一层。
 
-## 一、运行循环
+## 一、运行循环与内部结构
+
+决策层内部有一个 **Proxy**——它是 LLM 唯一的对话对象，也是唯一同时连接
+交互层和工具层的组件。LLM 不直接见两个层，两个层也不直接见 LLM。
 
 ```
-交互层 MessageEvent（"某某会话有 N 条新消息，@我=…"）
-  │
-  ▼
-EventGate     全局暂停/静默、群类型规则、连续错误熔断（纯规则，不调 LLM）
-  │
-  ▼
-ContextBuilder  拼 prompt（下文输入格式）：
-  │   人格卡 + 会话历史（调交互层 get_context，默认 200 条）
-  │   + 新消息标注 + 屏幕状态摘要 + 工具说明
-  ▼
-ReplyEngine   LLM 循环（目标：原生 function calling）：
-  │   模型可调用 chat_history 工具再查更早记录（回灌后续生成）
-  ▼
-OutputParser  解析输出信号（下文输出格式）→ 交交互层 execute()
+ MessageEvent ──►┌──────────────────────────────────────────┐
+ (交互层推入)     │ EventGate → ContextBuilder → 调 LLM       │
+                │                │                           │
+                │                ▼                           │
+                │   OutputParser 解析 LLM 输出信号            │
+                │      │              │                      │
+                │      ▼              ▼                      │
+                │  ActionRequest   delegate_task             │
+                │  → 交互层.execute   → 起 subprocess(kimi -p) │
+                │      │              │                      │
+                │      ▼              ▼                      │
+                │  ActionResult    监听 stdout → TaskResult   │
+                │      └──────┬───────┘                      │
+                │             ▼                              │
+                │   结果回灌 LLM / 人格化后回用户               │
+                └──────────────────────────────────────────┘
+                          这一整个框 = Proxy
 ```
+
+Proxy 的三项职责：
+
+1. **出向路由**：解析 LLM 输出——文本/图片/文件动作 → 交互层 `execute()`；
+   任务委派 → 工具层。LLM 不需要知道两层的存在
+2. **进程执行与监听**：实际拉起 `kimi -p` 子进程、流式读 stdout、
+   超时杀进程、收集结果文本和 session_id
+3. **入向汇聚**：交互层的新消息事件、子进程的工具输出/任务完成，
+   统一变成一个事件流，在合适的时机回灌给 LLM（工具结果立即回灌续生成；
+   任务完成为一条"伪消息事件"进入对应会话的下一轮决策）
+
+EventGate（闸门，不调 LLM）→ ContextBuilder（拼 prompt）→ LLM →
+OutputParser（信号解析）都跑在 Proxy 的循环里；Policy（必回/@逐条/兜底）
+是 Proxy 调用的规则集；Provider（k3/DeepSeek/本地）是 Proxy 手里的 LLM 句柄。
 
 ## 二、输入 prompt 格式（本层组装）
 
