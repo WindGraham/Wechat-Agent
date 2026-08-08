@@ -1,0 +1,14 @@
+{
+  "max_concurrent_decisions": 1,
+  "media_convert_concurrency": 2,
+  "history_size": 200,
+  "sweep_interval": [45, 90],
+  "notify_interval": [3, 6],
+  "paused": false,
+  "muted_until": 0.0,
+  "owner": "",
+  "owner_nick": "",
+  "action_max_attempts": 2,
+  "task_retention_days": 14,
+  "tool_model": "kimi-code/k3"
+}
