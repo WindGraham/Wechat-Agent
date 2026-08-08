@@ -206,6 +206,60 @@ def create_app(project_root=None):
         return jsonify({"ok": True,
                         "scan": data if isinstance(data, dict) else None})
 
+    # ------------------------------------------------------------- 群聊配置
+    @app.route("/api/groups", methods=["GET"])
+    def api_groups():
+        """列出所有会话及其热情度级别。"""
+        from .group_config import LEVELS, read_level
+        personas_dir = os.path.join(root, "config", "personas")
+        sessions = set()
+        # 来源 1：消息库里的会话
+        try:
+            import sqlite3
+            db = os.path.join(root, "workspace", "chatlogs", "chatlog.db")
+            if os.path.exists(db):
+                conn = sqlite3.connect(db)
+                for r in conn.execute("SELECT name FROM sessions"):
+                    sessions.add(r[0])
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        # 来源 2：已有人格卡
+        try:
+            for f in os.listdir(personas_dir):
+                if f.endswith(".yaml") and f not in ("default.yaml",
+                                                    "tool_group.yaml"):
+                    sessions.add(f[:-5])
+        except OSError:
+            pass
+        groups = []
+        for name in sorted(sessions):
+            level, extra = read_level(personas_dir, name)
+            groups.append({"session": name,
+                           "level": level or "normal",
+                           "extra_rule": extra})
+        return jsonify({"ok": True, "groups": groups,
+                        "levels": {k: {"label": v["label"],
+                                       "desc": v["desc"]}
+                                   for k, v in LEVELS.items()}})
+
+    @app.route("/api/groups", methods=["PUT"])
+    def api_groups_put():
+        """设置某会话的热情度（写入人格卡，下次决策热生效）。"""
+        from .group_config import write_level
+        body = request.get_json(silent=True) or {}
+        session = (body.get("session") or "").strip()
+        level = (body.get("level") or "").strip()
+        extra = body.get("extra_rule", "")
+        if not session:
+            return jsonify({"ok": False, "error": "缺 session"}), 400
+        try:
+            path = write_level(os.path.join(root, "config", "personas"),
+                               session, level, extra)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        return jsonify({"ok": True, "path": os.path.basename(path)})
+
     return app
 
 
@@ -441,6 +495,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <button data-tab="live" onclick="showTab('live')">实况</button>
     <button data-tab="prompts" onclick="showTab('prompts')">Prompt 编辑</button>
     <button data-tab="personas" onclick="showTab('personas')">人格卡</button>
+    <button data-tab="groups" onclick="showTab('groups')">群聊配置</button>
     <button data-tab="runtime" onclick="showTab('runtime')">运行配置</button>
     <button data-tab="env" onclick="showTab('env')">密钥</button>
     <button data-tab="status" onclick="showTab('status')">状态</button>
@@ -463,6 +518,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="card"><h2>首页红点</h2><div id="live-home"></div></div>
     <div class="card"><h2>Proxy 流水</h2><div id="live-events"></div></div>
   </div>
+  <div class="pane" id="pane-groups"></div>
   <div class="pane" id="pane-runtime"></div>
   <div class="pane" id="pane-env"></div>
   <div class="pane" id="pane-status"></div>
@@ -491,16 +547,55 @@ function showTab(name) {
   const editing = (name === 'prompts' || name === 'personas');
   document.getElementById('editor').style.display = editing ? 'flex' : 'none';
   document.getElementById('sidebar').style.display = editing ? '' : 'none';
-  for (const p of ['live', 'runtime', 'env', 'status'])
+  for (const p of ['live', 'groups', 'runtime', 'env', 'status'])
     document.getElementById('pane-' + p).style.display =
       (p === name) ? 'block' : 'none';
   for (const b of document.querySelectorAll('nav button'))
     b.classList.toggle('active', b.dataset.tab === name);
   if (editing) loadFiles(name);
   if (name === 'live') loadLive();
+  if (name === 'groups') loadGroups();
   if (name === 'runtime') loadRuntime();
   if (name === 'env') loadEnv();
   if (name === 'status') loadStatus();
+}
+
+let GROUPS = [], LEVELS = {};
+function loadGroups() {
+  api('/api/groups').then(j => {
+    GROUPS = j.groups; LEVELS = j.levels;
+    let h = '<div class="card"><h2>群聊热情度</h2>' +
+      '<p style="color:var(--dim)">改动写入对应会话的人格卡，下一次决策即生效，无需重启。</p>' +
+      '<table><tr><th>会话</th><th>热情度</th><th>补充规则</th><th></th></tr>';
+    for (const g of GROUPS) {
+      let opts = '';
+      for (const [k, v] of Object.entries(LEVELS))
+        opts += '<option value="' + k + '"' +
+                (g.level === k ? ' selected' : '') + '>' +
+                v.label + '（' + v.desc + '）</option>';
+      h += '<tr><td>' + g.session + '</td><td><select id="lv-' +
+           encodeURIComponent(g.session) + '">' + opts + '</select></td>' +
+           '<td><input id="ex-' + encodeURIComponent(g.session) +
+           '" value="' + (g.extra_rule || '').replace(/"/g, '&quot;') +
+           '" style="width:220px" placeholder="选填，如：少发表情包"/></td>' +
+           '<td><button onclick="setLevel(\'' + g.session.replace(/'/g, "\\'") +
+           '\')">保存</button></td></tr>';
+    }
+    h += '</table></div>';
+    document.getElementById('pane-groups').innerHTML = h;
+  });
+}
+function setLevel(session) {
+  const key = encodeURIComponent(session);
+  const level = document.getElementById('lv-' + key).value;
+  const extra = document.getElementById('ex-' + key).value;
+  fetch('/api/groups', {method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({session, level, extra_rule: extra})})
+    .then(r => r.json()).then(j => {
+      if (!j.ok) alert(j.error || '保存失败');
+      loadGroups();
+    }).catch(e => alert(e.message));
 }
 
 function loadFiles(which) {
