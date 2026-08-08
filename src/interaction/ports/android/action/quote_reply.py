@@ -260,24 +260,42 @@ def _quote_preview_visible(ocr_items, target_content):
 
 
 def _send_btn_visible(img, ocr_items):
-    """发送按钮校验（参考 wechat_tools._send_btn_visible）：OCR "发送" 落在扫描区，
-    或 layout.SEND_BTN 区域内绿色占比达标。"""
-    x0, y0, x1, y1 = LC.SEND_SCAN_ZONE
+    """发送按钮存在性校验（宽区域版）。"""
+    return _find_send_btn(img, ocr_items) is not None
+
+
+def _find_send_btn(img, ocr_items):
+    """动态定位发送按钮中心 (cx, cy)。
+
+    引用预览条/输入栏聚焦会把按钮顶起不同高度，固定坐标必偏
+    （2026-08-08 实测：引用态下 SEND_BTN 标定点按空）。
+    OCR "发送" 文字优先（区域：右下 x>850, y 1850~2280），绿色掩膜兜底。"""
+    # 1) OCR "发送" 文字
     for it in ocr_items:
         cx, cy = _item_cxy(it)
-        if "发送" in (it.get("text") or "") and x0 <= cx <= x1 and y0 <= cy <= y1:
-            return True
+        if "发送" in (it.get("text") or "") and cx > 850 and 1800 < cy < 2280:
+            return int(cx), int(cy)
+    # 2) 绿色掩膜最大连通域中心
     if img is not None:
+        import numpy as np
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        green = (h >= LC.GREEN_H_LO) & (h <= LC.GREEN_H_HI) \
-            & (s > LC.GREEN_S_MIN) & (v > LC.GREEN_V_MIN)
-        b = layout.SEND_BTN
-        ratio = float(green[b.y:b.y + b.h, b.x:b.x + b.w].mean())
-        log.info("send btn green ratio: %.3f", ratio)
-        if ratio > 0.15:
-            return True
-    return False
+        green = ((h >= LC.GREEN_H_LO) & (h <= LC.GREEN_H_HI)
+                 & (s > LC.GREEN_S_MIN) & (v > LC.GREEN_V_MIN)).astype(np.uint8)
+        region = green[1800:2280, 850:1080]
+        n, _labels, stats, cents = cv2.connectedComponentsWithStats(region)
+        best, best_area = None, 0
+        for k in range(1, n):
+            area = stats[k, cv2.CC_STAT_AREA]
+            if area > best_area:
+                best, best_area = k, area
+        if best is not None and best_area > 400:    # 按钮级面积（防噪点）
+            cx = int(cents[best][0]) + 850
+            cy = int(cents[best][1]) + 1800
+            log.info("send btn green mask center: (%d, %d) area=%d",
+                     cx, cy, best_area)
+            return cx, cy
+    return None
 
 
 def _sent_visible(ocr_items, reply_text):
@@ -358,11 +376,12 @@ def quote_reply(dev, match_text=None, match_sender=None, reply_text=None,
     dev.input_text(reply_text)
     _dev_wait(dev, sleep_fn, 400, 800)
 
-    # 7. 验证发送按钮出现后点发送（逻辑参考 wechat_tools._send_once）
+    # 7. 验证发送按钮出现后点发送（动态定位：引用预览条会把按钮顶高）
     img4 = dev.capture_bytes()
-    if not _send_btn_visible(img4, ocr_fn(img4)):
+    btn = _find_send_btn(img4, ocr_fn(img4))
+    if btn is None:
         return fail("send_button", "输入后发送按钮未出现（文本未上屏？）")
-    _dev_tap(dev, *layout.SEND_BTN.center)
+    _dev_tap(dev, *btn)
     _dev_wait(dev, sleep_fn, 600, 1200)
 
     # 8. 轻验证（不判失败：发送按钮已点下，判失败会导致上层重发刷屏）
