@@ -203,7 +203,7 @@ LLM 的每次输出是一串**有序 XML 动作块**（选 XML 不选 JSON 的�
 
 | 块 | 含义 | Proxy 路由 |
 |---|---|---|
-| `<reply>` | 发消息。多个 `<text>` = 拟人拆句连发；`<quote>` = 引用回复；`<file path="..."/>` = 发本机文件 | 交互层 `execute()` |
+| `<reply>` | 发消息。多个 `<text>` = 拟人拆句连发；`<quote>` = 引用回复；`<image path/>` = 发图片（相册流程）、`<file path/>` = 发文件（加号面板流程），**只接受本机绝对路径，禁止 url**，二者绝不可混用 | 交互层 `submit_bundle()` |
 | `<task>` | 委派工具层起 subprocess。`desc` 是 agent 自写的任务简述（进 Proxy 台账）；`deliver` 声明结果交付方式 | 工具层 `run_task()` |
 | `<silent/>` | 沉默（本轮无任何动作） | 结束 |
 
