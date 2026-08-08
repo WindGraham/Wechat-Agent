@@ -240,7 +240,7 @@ class Proxy:
 
             # 终止输出：路由执行
             for b in reply_blocks[:MAX_REPLY_BLOCKS]:
-                xml = self._block_to_xml(b)
+                xml = self._block_to_xml(b, session)
                 if self._submit_bundle(session, xml).ok:
                     replied = True
             for b in task_blocks[:MAX_TASK_BLOCKS]:
@@ -250,10 +250,30 @@ class Proxy:
 
     # ---------------------------------------------------------------- 块处理
     @staticmethod
-    def _block_to_xml(block) -> str:
+    def _norm_session_attr(attr_session: str, current: str) -> str:
+        """归一化块上的 session 属性：LLM 会从 prompt 里抄上
+        "（群聊）/（私聊）" 后缀（实测），剥掉；与当前会话匹配则用规范名。"""
+        import re as _re
+        from ...shared.name_match import _name_match
+        s = _re.sub(r"[（(][^）)]*[）)]$", "", (attr_session or "").strip())
+        if not s:
+            return current
+        return current if _name_match(s, current) else s
+
+    def _block_to_xml(self, block, current_session: str = "") -> str:
         """Block → 原始 XML 文本（用 raw_inner 原样转发：inner 已反转义，
         再转义会把 <text> 结构标签变成字面量发到微信里）。"""
         attrs = block.attrs.rstrip()
+        # session 属性归一化（剥 LLM 抄来的类型后缀）
+        if current_session:
+            norm = self._norm_session_attr(
+                parse_attrs(attrs).get("session", ""), current_session)
+            if "session=" in attrs:
+                import re as _re
+                attrs = _re.sub(r'session="[^"]*"', f'session="{norm}"',
+                                attrs)
+            else:
+                attrs = f'{attrs} session="{norm}"'
         if block.self_closing:
             return f"<{block.tag}{attrs}/>"
         return f"<{block.tag}{attrs}>{block.raw_inner}</{block.tag}>"
@@ -342,7 +362,7 @@ class Proxy:
             out = self._provider.chat(messages)
             for b in extract_blocks(out):
                 if b.valid and b.tag == "reply":
-                    self._submit_bundle(session, self._block_to_xml(b))
+                    self._submit_bundle(session, self._block_to_xml(b, session))
 
     # ---------------------------------------------------------------- 媒体写回
     def _write_back(self, session, sender, old_content, new_content):
