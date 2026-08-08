@@ -682,17 +682,24 @@ function queueTable(queue) {
 
 // ------------------------------------------------------------- 实况页
 function loadLive() {
+  // 有展开的事件详情（正在读 prompt/输出）时，只冻结事件流，
+  // 队列/红点照常刷新
+  const eventsFrozen =
+    !!document.querySelector('#live-events details[open]');
   Promise.all([
     api('/api/status').catch(() => null),
     api('/api/home_scan').catch(() => null),
-    api('/api/events?n=80').catch(() => null),
+    eventsFrozen ? Promise.resolve(null)
+                 : api('/api/events?n=80').catch(() => null),
   ]).then(([st, hs, ev]) => {
     document.getElementById('live-queue').innerHTML =
       queueTable(st && st.queue);
     document.getElementById('live-home').innerHTML =
       renderHome(hs && hs.scan);
-    document.getElementById('live-events').innerHTML =
-      renderEvents(ev ? ev.events : []);
+    if (ev) {
+      document.getElementById('live-events').innerHTML =
+        renderEvents(ev.events || []);
+    }
   });
 }
 
