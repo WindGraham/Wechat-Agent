@@ -430,6 +430,31 @@ def _sent_visible(ocr_items, reply_text):
     return False
 
 
+def _voice_mode_item(ocr_items):
+    """语音模式的"按住说话"项（cy>1900）。引用预览条会把栏顶起/压下，
+    位置不固定，全底部扫描而不是固定裁剪带。找不到返回 None。"""
+    for it in ocr_items:
+        t = it.get("text") or ""
+        if "按住" in t and "说话" in t and _item_cxy(it)[1] > 1900:
+            return it
+    return None
+
+
+def _close_menu_if_open(dev, ocr_fn):
+    """长按菜单还开着就收掉（点菜单外右侧空白，气泡很少伸到 x>1000）。
+    失败清理用：菜单残留会挡住后续页面判定和导航。"""
+    try:
+        img = dev.capture_bytes()
+        if detect_longpress_menu(img, ocr_fn(img)):
+            _dev_tap(dev, 1010, 600)
+            _dev_wait(dev, time.sleep, 300, 600)
+            log.info("longpress menu closed by neutral tap")
+            return True
+    except Exception:
+        log.exception("close menu check failed")
+    return False
+
+
 # ------------------------------------------------------------------ 引用回复流程
 def quote_reply(dev, match_text=None, match_sender=None, reply_text=None,
                 ocr_fn=None, sleep_fn=None):
@@ -437,11 +462,20 @@ def quote_reply(dev, match_text=None, match_sender=None, reply_text=None,
 
     返回 dict：成功 {"ok": True, "step": "sent", "verified": bool, "target": ...,
     "quote_tap": (x, y)}；失败 {"ok": False, "step": <失败步骤>, "error": <原因>}，
-    失败步骤之前已发生的动作不回滚（菜单未点开则无任何触屏动作）。
+    失败后会尽力清理现场（收菜单/关预览条/清输入残留），不留脏状态。
     """
     def fail(step, error):
         log.warning("quote_reply fail @%s: %s", step, error)
         return {"ok": False, "step": step, "error": error}
+
+    def cleanup():
+        """失败现场清理：收长按菜单 → 关引用预览条 → 清输入框残留。"""
+        _close_menu_if_open(dev, ocr_fn)
+        dismiss_quote_preview(dev, ocr_fn)
+        try:
+            dev.clear_text()
+        except Exception:
+            pass
 
     if not reply_text or not reply_text.strip():
         return fail("args", "reply_text 不能为空")
@@ -476,6 +510,7 @@ def quote_reply(dev, match_text=None, match_sender=None, reply_text=None,
     if menu is None:
         return fail("detect_menu", "长按后未检测到菜单展开（长按未生效？）")
     if "引用" not in menu:
+        cleanup()
         return fail("detect_menu", "菜单中无“引用”选项（该消息类型不支持引用）")
     qcx, qcy = menu["引用"]["center"]
 
@@ -485,8 +520,31 @@ def quote_reply(dev, match_text=None, match_sender=None, reply_text=None,
 
     # 5. 验证输入栏出现引用预览条
     img3 = dev.capture_bytes()
-    if not _quote_preview_visible(ocr_fn(img3), target["content"]):
+    items3 = ocr_fn(img3)
+    if not _quote_preview_visible(items3, target["content"]):
+        cleanup()
         return fail("quote_preview", "输入栏未出现引用预览条（点引用未生效）")
+
+    # 5.5 确保文本输入框聚焦：
+    # - 语音模式没有文本框，广播必然不上屏；且此时整个栏被预览条压下，
+    #   语音切换钮/输入框都不在固定坐标——按"按住说话"实测行高定位
+    #   （2026-08-09 用户实测"卡在引用之后输入不了信息"就是这个态）
+    # - 文本模式未聚焦：点未聚焦坐标聚焦（预览条在上方，不冲突）
+    # - 文本模式已聚焦（点引用自动聚焦）：不补点，保持现状
+    voice = _voice_mode_item(items3)
+    if voice is not None:
+        cy = int(_item_cxy(voice)[1])
+        log.info("引用流程检测到语音模式（行高 %d），切文本模式并聚焦", cy)
+        _dev_tap(dev, 66, cy)        # 语音/键盘切换钮与"按住说话"同行同高
+        _dev_wait(dev, sleep_fn, 700, 1100)
+        _dev_tap(dev, 486, cy)       # 文本输入框出现在同一行位置
+        _dev_wait(dev, sleep_fn, 400, 800)
+    elif not any("ADB Keyboard" in (it.get("text") or "") for it in items3):
+        if hasattr(dev, "tap_rect"):
+            dev.tap_rect(layout.CHAT_INPUT_BAR)
+        else:
+            _dev_tap(dev, 486, 2185)
+        _dev_wait(dev, sleep_fn, 400, 800)
 
     # 6. 输入回复文本（现有输入链：ADBKeyBoard 分块广播，封装在 dev.input_text）
     dev.input_text(reply_text)
@@ -496,8 +554,19 @@ def quote_reply(dev, match_text=None, match_sender=None, reply_text=None,
     img4 = dev.capture_bytes()
     btn = _find_send_btn(img4, ocr_fn(img4))
     if btn is None:
-        # 清理残留预览条：不点掉会盖住输入框点按区、下一条普通发送变引用
-        dismiss_quote_preview(dev, ocr_fn)
+        # 补一次聚焦+重输（首次聚焦未生效的兜底），仍不行再清理失败
+        log.info("quote 输入未上屏，补聚焦重试一次")
+        if hasattr(dev, "tap_rect"):
+            dev.tap_rect(layout.CHAT_INPUT_BAR)
+        else:
+            _dev_tap(dev, 486, 2185)
+        _dev_wait(dev, sleep_fn, 400, 700)
+        dev.input_text(reply_text)
+        _dev_wait(dev, sleep_fn, 500, 900)
+        img5 = dev.capture_bytes()
+        btn = _find_send_btn(img5, ocr_fn(img5))
+    if btn is None:
+        cleanup()
         return fail("send_button", "输入后发送按钮未出现（文本未上屏？）")
     _dev_tap(dev, *btn)
     _dev_wait(dev, sleep_fn, 600, 1200)
