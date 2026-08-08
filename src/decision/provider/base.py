@@ -90,12 +90,22 @@ class LLMProvider:
 
 
 class KimiProvider(LLMProvider):
-    """Kimi for Coding API（k3 等）。k3 只允许 temperature=1 → 省略该参数。"""
+    """Kimi for Coding API（k3 等）。k3 只允许 temperature=1 → 省略该参数。
+
+    注意：k3 是思考型模型，reasoning 会消耗 max_tokens——上限给太小
+    （<100）会出现 content 为空（finish_reason=length）。强制下限 256。"""
+
+    MIN_MAX_TOKENS = 256
 
     def __init__(self, api_key: str, model: str = "k3", **kw):
         super().__init__(api_key, model,
                          "https://api.kimi.com/coding/v1",
                          omit_temperature=True, **kw)
+
+    def chat(self, messages, max_tokens=300, temperature=0.8) -> str:
+        return super().chat(messages,
+                            max_tokens=max(max_tokens, self.MIN_MAX_TOKENS),
+                            temperature=temperature)
 
 
 class DeepSeekProvider(LLMProvider):
