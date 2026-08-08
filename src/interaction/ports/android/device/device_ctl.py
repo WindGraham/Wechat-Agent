@@ -24,7 +24,6 @@ import time
 import jieba
 import threading
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from .random_touch import Rect, RandomTouch
 
 PROJECT_ROOT = os.path.abspath(os.path.join(
@@ -337,31 +336,6 @@ class DeviceCtl:
 
 # --------------------------------------------------------------------- 自测
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    import layout
-
-    d = DeviceCtl()
-    print("== ensure_device ok ==")
-
-    act = d.get_current_activity()
-    print("== current activity:", act)
-
-    # 1. 内存截图验证（不落盘）
-    img = d.capture_bytes()
-    assert img is not None and img.shape[0] == SCREEN_H and img.shape[1] == SCREEN_W
-    print("== capture_bytes ok:", img.shape)
-
-    # 2. 微信首页空白区随机 tap 3 次（会话列表下方空白，安全区）
-    if act.startswith(WECHAT_PKG):
-        for i in range(3):
-            d.tap_rect(layout.Rect(300, 1600, 480, 300))
-        print("== 3 random taps on empty area ok ==")
-        # 3. 列表滑动一次（下翻再上翻，旧签名兼容路径）
-        d.swipe(540, 1700, 540, 900)
-        d.wait_random(400, 800)
-        d.swipe(540, 900, 540, 1700)
-        print("== legacy swipe wrapper ok ==")
-    else:
-        print("!! not on wechat, skip tap/swipe test")
-    print("SELF-TESTS DONE（输入链真机验证走 /tmp 独立脚本，不进会话）")
+    print("device_ctl.py 不提供自测入口：直接运行会真实操作手机，已禁用。"
+              "请用离线单测（假对象）。")
+    raise SystemExit(1)
