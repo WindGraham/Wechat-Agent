@@ -73,3 +73,4 @@
 4. 每端一份端口实现，允许硬编码标定；不做跨端自适应。
 
 详细职责：[交互层](./INTERACTION_LAYER.md) · [决策层](./DECISION_LAYER.md) · [工具层](./TOOL_LAYER.md)
+配套：[目录与工作区](./WORKSPACE.md) · [网关](./GATEWAY.md)
