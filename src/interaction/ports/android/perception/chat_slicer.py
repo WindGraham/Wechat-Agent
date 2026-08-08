@@ -499,10 +499,16 @@ def slice_chat(img, ocr_items, is_group, title):
                     lines, low_confidence = [], True
             if content_type == "multimedia":
                 # OCR 提取段内一切可读文字，显式标注 multimedia（§2.10）
+                # 排除输入栏区域（cy >= 聚焦态栏顶 2015）：输入框里未发送的
+                # 文字和"发送"按钮在末段 y 范围内（cy~2067/2076 < 2110），
+                # 不剔除会被粘进最后一条 multimedia（实测污染日志导致锚点
+                # 永远对不上、反复 gap）。文字泡内容走 bubble_rect 分配，
+                # 不受影响。
                 rest = sorted(
                     (i for i, it in enumerate(ocr_items)
                      if not consumed[i]
                      and seg_y0 <= it["cy"] < seg_y1
+                     and it["cy"] < LC.INPUT_BAR_Y0 - 95
                      and not any(rect_contains(
                          (r[0], r[1], r[2] - r[0], r[3] - r[1]),
                          it["cx"], it["cy"]) for r in capsule_rects)),
