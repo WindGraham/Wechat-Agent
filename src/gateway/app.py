@@ -47,12 +47,14 @@ _RUNTIME_FIELDS = {
 _RUNTIME_INTERVAL_FIELDS = ("sweep_interval", "notify_interval")
 
 
-def create_app(project_root=None):
+def create_app(project_root=None, proxy=None):
     """Flask 应用工厂。project_root 指向仓库根（含 config/ 与 workspace/），
-    缺省取仓库根；测试传 tmp 目录副本。main.py 可用线程挂载本工厂产物。"""
+    缺省取仓库根；测试传 tmp 目录副本。main.py 可用线程挂载本工厂产物。
+    proxy 注入后开放 /api/task_done（进程外任务完成回执注入）。"""
     app = Flask(__name__)
     root = os.path.abspath(project_root or PROJECT_ROOT)
     app.config["PROJECT_ROOT"] = root
+    app.config["PROXY"] = proxy
 
     # ------------------------------------------------------------- 鉴权
     token = os.environ.get("WECHAT_AGENT_GATEWAY_TOKEN") or None
@@ -82,6 +84,19 @@ def create_app(project_root=None):
     @app.route("/")
     def index():
         return INDEX_HTML
+
+    # -------------------------------------------------- 任务回执注入
+    @app.route("/api/task_done", methods=["POST"])
+    def api_task_done():
+        """进程外完成的任务打入回执事件（让 agent 走正常回执流程自己交付）。
+        body: {"task_id": "t..."}"""
+        p = app.config.get("PROXY")
+        if p is None:
+            return jsonify({"ok": False, "error": "proxy 未接线"}), 503
+        task_id = (request.get_json(silent=True) or {}).get("task_id", "")
+        if not task_id:
+            return jsonify({"ok": False, "error": "缺 task_id"}), 400
+        return jsonify({"ok": bool(p.inject_task_done(task_id))})
 
     # ------------------------------------------------------------- 文件列表
     @app.route("/api/files")

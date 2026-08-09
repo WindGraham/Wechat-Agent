@@ -117,7 +117,28 @@ class TaskLedger:
         log.info("task %s: %s", task_id, task["status"])
 
     def get(self, task_id: str):
-        return self._tasks.get(task_id)
+        """内存台账查询；查不到时扫磁盘 task.json 兜底
+        （进程外补跑的任务重启后内存没有，但 task.json 是事实源，
+        回执流程不能因为进程边界丢任务——2026-08-09 补跑 PDF 实测）。"""
+        t = self._tasks.get(task_id)
+        if t is not None:
+            return t
+        for day in os.listdir(self._root):
+            day_dir = os.path.join(self._root, day)
+            if not os.path.isdir(day_dir):
+                continue
+            for dirname in os.listdir(day_dir):
+                if not dirname.startswith(task_id):
+                    continue
+                try:
+                    with open(os.path.join(day_dir, dirname, "task.json"),
+                              encoding="utf-8") as f:
+                        t = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                self._tasks[task_id] = t
+                return t
+        return None
 
     def running(self) -> list:
         return [t for t in self._tasks.values() if t["status"] == "running"]

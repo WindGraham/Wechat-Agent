@@ -159,6 +159,17 @@ class Proxy:
                           "version": 0, "mention": True, "owner": True,
                           "ts": self._clock()})
 
+    def inject_task_done(self, task_id: str):
+        """外部注入任务完成事件（进程外补跑的任务完成后由网关打入，
+        走正常回执流程让她自己交付——2026-08-09 用户要求）。"""
+        task = self._ledger.get(task_id)
+        if not task:
+            log.warning("inject_task_done: 找不到任务 %s", task_id)
+            return False
+        self._push_event({"type": EV_TASK_DONE, "task_id": task_id,
+                          "session": task["session"], "ts": self._clock()})
+        return True
+
     def _push_event(self, ev: dict):
         with self._ev_lock:
             # 同会话同类事件合并（保留最新）

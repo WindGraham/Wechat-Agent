@@ -307,7 +307,7 @@ def main(argv=None):
         from .gateway import create_app
         gw_host = os.environ.get("WECHAT_AGENT_GATEWAY_HOST", "127.0.0.1")
         gw_port = int(os.environ.get("WECHAT_AGENT_GATEWAY_PORT", "13014"))
-        gw_app = create_app()
+        gw_app = create_app(proxy=comp.get("proxy"))
         gw = threading.Thread(
             target=lambda: gw_app.run(host=gw_host, port=gw_port,
                                       debug=False, use_reloader=False,
