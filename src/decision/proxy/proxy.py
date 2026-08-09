@@ -438,7 +438,8 @@ class Proxy:
             full_brief = (f"{TASK_BRIEF_PREAMBLE}\n\n"
                           f"【本次任务】\n{brief.goal}\n\n"
                           f"【相关背景】\n{brief.context}")
-            result = self._cli.run(full_brief, task["workdir"])
+            result = self._cli.run(full_brief, task["workdir"],
+                                   timeout_s=self._rt("task_timeout_s", 1800))
             self._ledger.finish(task["task_id"], result.ok,
                                 result.cli_session_id)
             with open(os.path.join(task["workdir"], "result.txt"),

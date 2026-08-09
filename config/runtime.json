@@ -21,5 +21,6 @@
   "screen_watch_interval": [
     2.0,
     4.0
-  ]
+  ],
+  "task_timeout_s": 1800
 }
