@@ -121,11 +121,17 @@
 | `WECHAT_AGENT_CONFIG` | 无 | 传给 agent 的 --config |
 | `WECHAT_AGENT_CALLBACK_PORT` | 13015 | agent 侧 task_done 回调端口 |
 
-### 热重启
+### 热重启 / 刷新网关
 
-改 `src/gateway/*.py`（app.py 路由/页面/group_config）→ 自动 reload 重建
-server（1~2 秒短暂不可用），**agent 不受影响**。改 prompt/人格/runtime 等
-内容文件则完全不需要重启。
+两种方式，**都不影响 agent**：
+
+1. **自动**：改 `src/gateway/*.py` → 自动 reload 重建 server（1~2 秒短暂
+   不可用）。改坏代码时保持旧 server 继续服务，修好后保存自动恢复
+2. **手动**：网页"控制台"页 →「刷新网关」按钮（`POST /api/gateway/reload`）
+   —— 只重载网关代码，**进程不动、agent 不受影响**；代码有问题时返回错误、
+   保持旧网关服务
+
+改 prompt/人格/runtime 等内容文件则完全不需要任何操作（文件热读）。
 
 ### 网关自身重启
 

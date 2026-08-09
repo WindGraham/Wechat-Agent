@@ -59,7 +59,7 @@ def main(argv=None):
         """每次（含热重启）重建 app；supervisor 常驻不随 reload 变化。"""
         from .app import create_app
         return create_app(project_root=root, supervisor=supervisor,
-                          agent_callback_url=callback)
+                          agent_callback_url=callback, reloader=server)
 
     server = HotReloadServer(create_factory, host=host, port=port)
     print(f"[gateway] 网关管理面 http://{host}:{port}/ "

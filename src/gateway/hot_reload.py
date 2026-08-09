@@ -139,12 +139,76 @@ class HotReloadServer:
         self._stop.set()
         self._stop_server()
 
+    # ---------------------------------------------------------------- 手动刷新
+    def reload_now(self) -> dict:
+        """手动触发热重启（网关"刷新网关"按钮）。
+
+        与自动检测的区别：
+          - 强制忽略 mtime 快照，每次都执行完整 reload 流程（即使文件没变）
+          - 同样走"先验证再切换"：代码有问题时保持旧 server，返回错误
+          - 不影响 agent 子进程（supervisor 常驻不重载）
+
+        返回 {"ok": bool, "reloaded": bool, "error": str|None}
+          - reloaded=False 且 ok=True：无可重载的代码变更（文件没变）
+          - ok=False：代码有问题，保持旧 server 继续服务
+        """
+        import src.gateway as pkg
+        now = time.time()
+        cur = _snapshot(self._gw_dir)
+        changed = [p for p in cur if cur.get(p) != self._snap.get(p)]
+        try:
+            _reload_modules()
+        except Exception as e:  # noqa: BLE001
+            log.error("手动刷新失败（模块 reload 出错，保持旧代码服务）: %s", e)
+            self._fail_until = now + FAIL_BACKOFF_S
+            return {"ok": False, "reloaded": False,
+                    "error": f"模块 reload 失败: {type(e).__name__}"}
+        try:
+            self._build_app()
+        except Exception as e:  # noqa: BLE001
+            log.exception("手动刷新失败（新代码 create_app 出错，保持旧 server）")
+            self._fail_until = now + FAIL_BACKOFF_S
+            return {"ok": False, "reloaded": False,
+                    "error": f"create_app 失败: {type(e).__name__}"}
+        try:
+            self._verify_bind()      # 临时端口验证（不碰真实端口）
+        except Exception as e:  # noqa: BLE001
+            log.error("手动刷新失败（新代码无法 serve，保持旧 server）: %s", e)
+            self._fail_until = now + FAIL_BACKOFF_S
+            return {"ok": False, "reloaded": False,
+                    "error": f"新代码 serve 验证失败: {type(e).__name__}"}
+        # 全部验证通过 → 停旧起新（热切换，agent 不受影响）
+        self._stop_server()
+        time.sleep(PORT_RELEASE_WAIT)
+        if not self._start_server_with_retry():
+            log.error("手动刷新：真实端口重建失败，尝试用旧 factory 恢复")
+            self._snap = _snapshot(self._gw_dir)
+            self._fail_until = now + FAIL_BACKOFF_S
+            return {"ok": False, "reloaded": False,
+                    "error": f"端口 {self._port} 重建失败"}
+
+        self._snap = cur
+        self._snap = cur
+        if not changed:
+            return {"ok": True, "reloaded": True,
+                    "error": None, "note": "代码无变更，已强制重载"}
+        return {"ok": True, "reloaded": True,
+                "error": None, "changed": changed}
+
     # ---------------------------------------------------------------- 内部
     def _spawn_watch(self):
         t = threading.Thread(target=self._watch_loop, daemon=True,
                              name="gateway-hotreload-watch")
         t.start()
         return t
+
+    def _verify_bind(self):
+        """用临时端口验证当前 self._app 能被 werkzeug 正常 bind+serve。
+        不碰真实端口（真实端口被旧 server 占着，预绑定必然失败——2026-08-10
+        实测教训）。返回 None；失败抛异常。"""
+        from werkzeug.serving import make_server
+        probe = make_server(self._host, 0, self._app, threaded=True)
+        probe.server_close()   # 只验证构造+临时 bind，随即释放
 
     def _build_app(self):
         """创建 app（不 bind 端口）。失败抛异常——用于热重启前验证。"""
@@ -253,27 +317,21 @@ class HotReloadServer:
                           "请修复后再次保存文件触发重载")
             self._fail_until = now + FAIL_BACKOFF_S
             return
-        # 3. 先验证新 server 能 bind（端口空闲检查），成功才切换
-        new_srv = None
+        # 3. 临时端口验证新代码能 serve（不碰真实端口）
         try:
-            from werkzeug.serving import make_server
-            with self._lock:
-                new_srv = make_server(self._host, self._port, self._app,
-                                      threaded=True)
-        except (OSError, SystemExit) as e:
-            log.error("新 server bind 失败（端口被占？）: %s，保持旧 server 运行", e)
+            self._verify_bind()
+        except Exception:  # noqa: BLE001
+            log.error("新代码 serve 验证失败，保持旧 server 继续服务", exc_info=True)
             self._fail_until = now + FAIL_BACKOFF_S
             return
         # 4. 全部验证通过 → 停旧起新
         log.info("检测到网关代码变化: %s，热重启中…", changed)
         self._stop_server()
         time.sleep(PORT_RELEASE_WAIT)
-        try:
-            self._bind_server_with(new_srv)
-        except Exception:  # noqa: BLE001
-            log.exception("新 server 启动异常，尝试用旧代码恢复")
+        if not self._start_server_with_retry():
+            log.error("热重启：真实端口重建失败（网关可能不可用），"
+                      "请检查端口占用或重启网关")
             self._fail_until = now + FAIL_BACKOFF_S
-            return
 
     def _bind_server_with(self, srv):
         """把已建好的 werkzeug server 投入使用（起 serve 线程）。"""

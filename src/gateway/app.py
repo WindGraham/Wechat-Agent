@@ -48,7 +48,7 @@ _RUNTIME_INTERVAL_FIELDS = ("sweep_interval", "notify_interval")
 
 
 def create_app(project_root=None, proxy=None, supervisor=None,
-               agent_callback_url=None):
+               agent_callback_url=None, reloader=None):
     """Flask 应用工厂。project_root 指向仓库根（含 config/ 与 workspace/），
     缺省取仓库根；测试传 tmp 目录副本。
 
@@ -56,6 +56,8 @@ def create_app(project_root=None, proxy=None, supervisor=None,
     - supervisor 注入后开放 /api/agent/*（agent 子进程管理，独立网关模式）
     - agent_callback_url：独立网关模式下 /api/task_done 转发目标
       （agent 侧回调端口，默认 http://127.0.0.1:13015/task_done）
+    - reloader：HotReloadServer 实例，注入后开放 /api/gateway/reload
+      （手动"刷新网关"：只重载网关代码，不影响 agent）
     """
     app = Flask(__name__)
     root = os.path.abspath(project_root or PROJECT_ROOT)
@@ -63,6 +65,7 @@ def create_app(project_root=None, proxy=None, supervisor=None,
     app.config["PROXY"] = proxy
     app.config["SUPERVISOR"] = supervisor
     app.config["AGENT_CALLBACK_URL"] = agent_callback_url
+    app.config["RELOADER"] = reloader
 
     # ------------------------------------------------------------- 鉴权
     token = os.environ.get("WECHAT_AGENT_GATEWAY_TOKEN") or None
@@ -169,6 +172,27 @@ def create_app(project_root=None, proxy=None, supervisor=None,
         except ValueError:
             n = 200
         return jsonify({"ok": True, "log": sup.logs_tail(n)})
+
+    # -------------------------------------------------- 网关自身刷新（热重启）
+    @app.route("/api/gateway/reload", methods=["POST"])
+    def api_gateway_reload():
+        """手动刷新网关（只重载网关代码，不影响 agent）。
+
+        与"重启网关进程"的区别：本接口不重启进程、不关 agent——
+        只 reload src/gateway/*.py 并热切换 server（先验证再切换，
+        代码有问题时保持旧 server 继续服务）。
+        """
+        reloader = app.config.get("RELOADER")
+        if reloader is None:
+            return jsonify({"ok": False,
+                            "error": "网关未注入热重启能力（内嵌模式？）"}), 400
+        try:
+            r = reloader.reload_now()
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": False,
+                            "error": f"刷新异常: {type(e).__name__}"}), 500
+        status = 200 if r.get("ok") else 400
+        return jsonify(r), status
 
     # ------------------------------------------------------------- 文件列表
     @app.route("/api/files")
@@ -982,11 +1006,20 @@ function loadConsole() {
       '<span class="stat-chip">启动 ' + st + '</span>' +
       (exit ? '<span class="stat-chip">' + esc(exit) + '</span>' : '') +
       '</div>' +
+      '<div class="dim" style="font-size:11px;text-transform:uppercase;' +
+      'letter-spacing:.1em;margin:10px 0 6px">Agent 进程控制</div>' +
       '<div style="display:flex;gap:10px">' +
       '<button class="btn" onclick="agentAction(\'start\')">启动</button>' +
       '<button class="btn ghost" onclick="agentAction(\'stop\')">停止</button>' +
       '<button class="btn ghost" onclick="agentAction(\'restart\')">重启</button>' +
-      '</div><div style="margin-top:12px"><span id="agent_msg"></span></div>';
+      '</div>' +
+      '<div class="dim" style="font-size:11px;text-transform:uppercase;' +
+      'letter-spacing:.1em;margin:18px 0 6px">网关自身（不影响 agent）</div>' +
+      '<div style="display:flex;gap:10px;align-items:center">' +
+      '<button class="btn ghost" onclick="gatewayReload()">刷新网关</button>' +
+      '<span class="dim" style="font-size:12px">只重载网关代码，agent 不受影响</span>' +
+      '</div>' +
+      '<div style="margin-top:12px"><span id="agent_msg"></span></div>';
     document.getElementById('console-log').innerHTML =
       '<pre class="log-pre">' + esc(j.log || '(无日志)') + '</pre>';
     // 运行中自动刷新日志
@@ -1009,6 +1042,20 @@ function agentAction(action) {
     else toast('操作失败：' + (j.error || '未知错误'), 'err');
     loadConsole();
     refreshNavAgent();
+  }).catch(e => toast(e.message, 'err'));
+}
+
+// 手动刷新网关：只重载网关代码，不影响 agent（进程不动）
+function gatewayReload() {
+  toast('正在刷新网关…');
+  api('/api/gateway/reload', {method: 'POST'}).then(j => {
+    if (j.ok) {
+      toast(j.reloaded ? '网关已刷新（agent 不受影响）'
+                       : '网关刷新完成', 'ok');
+      if (j.changed) console.log('变更文件:', j.changed);
+    } else {
+      toast('刷新失败，保持旧网关服务：' + (j.error || '未知错误'), 'err');
+    }
   }).catch(e => toast(e.message, 'err'));
 }
 
