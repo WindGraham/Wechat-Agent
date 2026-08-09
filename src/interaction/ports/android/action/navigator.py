@@ -57,6 +57,15 @@ class Navigator:
             return False
         return state.get("page", {}).get("type") == page_type
 
+    def page_title(self) -> str:
+        """当前页标题（原始 state 标题，供特殊页面判定用）。"""
+        try:
+            state = self.tools._snap()
+        except Exception as e:
+            log.warning("page_title snap failed: %s", e)
+            return ""
+        return (state.get("page", {}) or {}).get("title") or ""
+
     # ---------------------------------------------------------- 回首页
     def back_to_home(self) -> bool:
         """尽量回到微信首页：最多 3 次 back，仍失败则 open_wechat 兜底。"""

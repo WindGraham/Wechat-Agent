@@ -170,45 +170,40 @@ class TestJourneyFriend(unittest.TestCase):
                 calls.append(max_accept) or
                 {"ok": True, "accepted": ["A", "B"], "remaining": 0,
                  "error": None}),
-            "probe": lambda tools, sleep_fn: (0, []),
+            "probe": lambda tools, sleep_fn: self.fail("auto_accept 不应巡检"),
         })
-        got = []
-        jm.set_on_friend_result(got.append)
-        entry = q.push_friend(source="probe")
+        q.push_friend(source="probe")
         sent = jm.process_entry(q.pop_next())
-        self.assertTrue(sent)
-        self.assertEqual(len(got), 1)
-        self.assertEqual(got[0]["accepted"], ["A", "B"])
+        self.assertTrue(sent)                  # 有通过 → True
+        self.assertEqual(len(calls), 1)        # accept 被调一次
 
     def test_probe_only_when_auto_off(self):
+        calls = []
         class Cfg:
             @staticmethod
             def get(k, d=None):
                 return {"friend_auto_accept": False}.get(k, d)
         q, jm = self._mk({
             "accept": lambda *a, **k: self.fail("auto_accept=False 不应通过"),
-            "probe": lambda tools, sleep_fn: (3, ["A", "B", "C"]),
+            "probe": lambda tools, sleep_fn: (
+                calls.append(1) or (3, ["A", "B", "C"])),
         }, config=Cfg)
-        got = []
-        jm.set_on_friend_result(got.append)
         q.push_friend(source="auto_probe")
-        jm.process_entry(q.pop_next())
-        self.assertEqual(got[0]["probed"], 3)
-        self.assertEqual(got[0]["accepted"], [])
+        sent = jm.process_entry(q.pop_next())
+        self.assertFalse(sent)                 # 只巡检不通过 → False
+        self.assertEqual(len(calls), 1)        # probe 被调一次
 
-    def test_zero_pending_no_callback(self):
-        """巡检为 0 且无错误：不回传（不打扰决策层）。"""
+    def test_zero_pending_ok(self):
+        """巡检为 0：流程正常结束，不重排、返回 False。"""
         q, jm = self._mk({
             "accept": lambda tools, max_accept, sleep_fn:
                 {"ok": True, "accepted": [], "remaining": 0, "error": None},
             "probe": lambda tools, sleep_fn: (0, []),
         })
-        got = []
-        jm.set_on_friend_result(got.append)
         q.push_friend(source="auto_probe")
         sent = jm.process_entry(q.pop_next())
         self.assertFalse(sent)
-        self.assertEqual(got, [])
+        self.assertEqual(len(q), 0)            # ok 不重排
 
     def test_failure_requeues(self):
         q, jm = self._mk({

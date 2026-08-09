@@ -55,7 +55,6 @@ class JourneyManager:
         # friend_ops 可注入 {"probe": fn, "accept": fn}（测试用假实现）
         self._config = config
         self._friend_ops = friend_ops
-        self._on_friend_result = None
 
         self._dirty: set = set()   # 同步失败的会话：下轮循环优先补同步
 
@@ -67,10 +66,6 @@ class JourneyManager:
     def set_on_log_updated(self, cb):
         """LogUpdated 回调热替换（决策层装配时接线用）。"""
         self._on_log_updated = cb
-
-    def set_on_friend_result(self, cb):
-        """好友申请处理结果回调（决策层装配时接线用）。"""
-        self._on_friend_result = cb
     @property
     def navigator(self):
         """端口导航器（供 run_loop 乱逛等场景使用）。"""
@@ -183,10 +178,9 @@ class JourneyManager:
     def _on_friend_page(self) -> bool:
         """当前是否停留在好友申请相关页（新的朋友列表/通过朋友验证）。"""
         try:
-            state = self._nav.tools._snap()
+            title = self._nav.page_title() or ""
         except Exception:  # noqa: BLE001
             return False
-        title = (state.get("page", {}) or {}).get("title") or ""
         return "新的朋友" in title or "通过朋友验证" in title
 
     def _friend_cfg(self, key, default):
@@ -202,11 +196,11 @@ class JourneyManager:
                 "accept": friend_requests.accept_all}
 
     def _process_friend(self, entry: QueueEntry) -> bool:
-        """好友申请处理流程：巡检计数 →（自动通过开启时）逐条通过 → 结果回传。
+        """好友申请处理流程：巡检计数 →（自动通过开启时）逐条通过 → 记日志。
 
         与聊天旅程的区别：不进任何会话、不同步消息日志；屏幕占用发生在
         主循环分发线程内，与盯屏/旅程天然互斥（盯屏见非首页自动跳过）。
-        结果通过 on_friend_result 回传决策层（Proxy 转成回执决策轮）。
+        结果只落行为日志（决策层不参与好友申请流程，2026-08-09 用户定）。
         """
         log.info("=== friend journey start (sources=%s) ===",
                  sorted(entry.sources))
@@ -234,16 +228,6 @@ class JourneyManager:
         # 失败重排（retryable：导航/设备瞬时故障占多数）
         if not result.get("ok"):
             self._queue.requeue_entry(entry)
-
-        # 有实质内容才回传决策层（巡检为 0 不打扰）
-        interesting = (result.get("accepted") or
-                       (result.get("probed") or 0) > 0 or
-                       result.get("error"))
-        if interesting and self._on_friend_result:
-            try:
-                self._on_friend_result(result)
-            except Exception:  # noqa: BLE001
-                log.exception("on_friend_result 回调失败")
 
         self._safe_back_home("新的朋友")
         log.info("=== friend journey end: %s ===", result)
