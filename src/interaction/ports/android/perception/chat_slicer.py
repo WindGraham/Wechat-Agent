@@ -490,7 +490,16 @@ def slice_chat(img, ocr_items, is_group, title):
                     if len(filled) > len(content):
                         content, lines = filled, filled.split("\n")
                 if content.strip():
-                    content_type = "text"
+                    # 大泡 + 极短文本 = 图片/视频泡上的 OCR 噪声（视频时长
+                    # "00:00"、图中角标文字等），不是真文字泡——真文字泡的
+                    # 尺寸随内容收紧，不会又大又只有两三个字
+                    # （2026-08-09 风图照片被识别成文字"00"实测）
+                    _tight = "".join(str(content).split())
+                    if w >= 300 and h >= 150 and len(_tight) <= 6:
+                        content_type = "multimedia"
+                        content, lines = "", []
+                    else:
+                        content_type = "text"
                 elif w <= 300 and h <= 300:
                     content_type = "multimedia"         # 小泡无字 → 表情类
                 else:
