@@ -8,16 +8,19 @@
   - stop / restart：优雅停止（SIGTERM → 超时 SIGKILL）+ 日志轮转重启
   - status：running/stopped/crashed + pid + 启动时间 + 退出码
   - 日志轮转逻辑与旧 restart.sh 一致（保留最近 5 份历史日志）
+  - **pid 持久化 + 重启认领**：agent pid 落盘 agent.pid；网关（systemd）重启后
+    从 pid 文件认领仍在运行的 agent（agent 是独立进程组 start_new_session=True，
+    网关重启不影响它），避免"agent 在跑但网关以为停了"
 
 设计要点：
   - 本模块**不依赖 flask**，只依赖标准库 + subprocess——热重启 flask 模块时
     本模块实例常驻内存，agent 进程句柄不丢
   - 线程安全：所有状态变更加锁；monitor 线程与 API 线程并发访问安全
+  - 配套 systemd：unit 用 KillMode=process（只杀网关主进程，不连带 agent 子进程）
 """
 
 import logging
 import os
-import shutil
 import signal
 import subprocess
 import threading
@@ -37,18 +40,58 @@ STOP_GRACE_S = 10
 MONITOR_POLL_S = 2.0
 
 
+def _pid_alive(pid: int) -> bool:
+    """进程是否存在（不判断僵尸态，够用即可）。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+class _AdoptedProc:
+    """认领进程的轻量代理：伪装成 Popen 的 poll/pid/wait 接口。
+    网关重启后认领的 agent 不是本进程 spawn 的，没有句柄可 wait，
+    只轮询 /proc 存活状态（poll 返回 None=活着）。"""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self._dead = False
+
+    def poll(self):
+        if self._dead:
+            return 0
+        if _pid_alive(self.pid):
+            return None
+        self._dead = True
+        return 0
+
+    def wait(self, timeout=None):
+        deadline = time.time() + (timeout if timeout else 10)
+        while time.time() < deadline:
+            if self.poll() is not None:
+                return 0
+            time.sleep(0.2)
+        return 0
+
+
 class AgentSupervisor:
     """管理单个 agent 子进程的生命周期。"""
 
     def __init__(self, python=DEFAULT_PYTHON, main_args=None,
                  workspace=None, config=None, logs_dir=None,
-                 clock=time.time, sleep=time.sleep):
+                 pid_file=None, clock=time.time, sleep=time.sleep):
         self._python = python
         self._main_args = list(main_args if main_args is not None
                                else DEFAULT_MAIN)
         self._workspace = workspace      # None = 不传 --workspace
         self._config = config            # None = 不传 --config
         self._logs_dir = logs_dir or self._default_logs_dir()
+        self._pid_file = pid_file or self._default_pid_file()
         self._clock = clock
         self._sleep = sleep
 
@@ -61,6 +104,7 @@ class AgentSupervisor:
         self._last_log_rotate = None     # 最近一次日志轮转文件名
 
         os.makedirs(self._logs_dir, exist_ok=True)
+        self._adopt_existing()           # 网关重启后认领仍在跑的 agent
 
     # ---------------------------------------------------------------- 路径
     @staticmethod
@@ -70,9 +114,52 @@ class AgentSupervisor:
             os.path.dirname(os.path.abspath(__file__)))))
         return os.path.join(root, "logs")
 
+    @staticmethod
+    def _default_pid_file():
+        """workspace/runtime/agent.pid（与队列快照同目录）。"""
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))))
+        return os.path.join(root, "workspace", "runtime", "agent.pid")
+
     @property
     def log_path(self):
         return os.path.join(self._logs_dir, "agent.log")
+
+    # ---------------------------------------------------------------- pid 持久化
+    def _write_pid(self, pid: int):
+        try:
+            os.makedirs(os.path.dirname(self._pid_file), exist_ok=True)
+            with open(self._pid_file, "w") as f:
+                f.write(str(pid))
+        except OSError as e:
+            log.warning("pid 文件写入失败: %s", e)
+
+    def _clear_pid(self):
+        try:
+            if os.path.exists(self._pid_file):
+                os.remove(self._pid_file)
+        except OSError as e:
+            log.warning("pid 文件清理失败: %s", e)
+
+    def _adopt_existing(self):
+        """网关重启后：读 pid 文件，若进程仍在运行则认领（附身跟踪）。
+        agent 是 start_new_session=True 的独立进程组，网关重启不杀它。"""
+        try:
+            with open(self._pid_file) as f:
+                pid = int(f.read().strip())
+        except (OSError, ValueError):
+            return
+        if not _pid_alive(pid):
+            self._clear_pid()
+            return
+        # 认领：构造一个不可 wait 的轻量句柄（认领进程不是我们 spawn 的）
+        proc = _AdoptedProc(pid)
+        with self._lock:
+            self._proc = proc
+            self._started_at = None
+            self._last_exit = None
+            self._ensure_monitor()
+        log.info("认领已运行的 agent: pid=%d（网关重启后恢复跟踪）", pid)
 
     # ---------------------------------------------------------------- 公开 API
     def start(self, extra_args=None):
@@ -108,6 +195,7 @@ class AgentSupervisor:
             f.close()
             self._started_at = self._clock()
             self._last_exit = None
+            self._write_pid(self._proc.pid)
             self._ensure_monitor()
             return True
 
@@ -139,6 +227,7 @@ class AgentSupervisor:
             proc.wait(timeout=5)
         with self._lock:
             self._proc = None
+            self._clear_pid()
             self._monitor_stop()
         return True
 
@@ -226,6 +315,7 @@ class AgentSupervisor:
                 with self._lock:
                     self._last_exit = {"code": rc, "ts": self._clock()}
                     self._proc = None
+                    self._clear_pid()
                 log.warning("agent 退出，code=%s", rc)
                 return
             self._stop_monitor.wait(MONITOR_POLL_S)

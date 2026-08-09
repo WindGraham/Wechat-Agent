@@ -84,7 +84,7 @@
 
 ## 三、运行与运维
 
-### 启动
+### 启动（前台调试）
 
 ```bash
 ./run.sh            # 前台跑网关（Ctrl+C 退出）
@@ -92,7 +92,22 @@
 ./run.sh stop       # 停止后台网关
 ```
 
-网关起来后浏览器打开 http://127.0.0.1:13014/ → 控制台页启动 agent。
+### 开机自启 + 保活常驻（推荐，一键安装）
+
+```bash
+./install.sh               # 安装为 systemd user 服务：开机自启 + 崩溃自愈
+./install.sh --system      # 或装为系统服务（需 sudo，headless 更彻底）
+./install.sh status        # 查看服务状态
+./install.sh uninstall     # 卸载
+```
+
+安装后网关**常驻**：开机自动起、崩溃自动拉起（Restart=always）。agent 的
+启动/停止/重启/看日志全部在网页"控制台"页完成，与网关服务无关。
+
+**保活关键设计**：
+- `KillMode=process`：重启/拉起网关时**不杀 agent 子进程**——agent 是独立
+  进程组，网关重启后从 `workspace/runtime/agent.pid` **认领**继续跟踪
+- 网关只托管一个网页，资源占用极小，常驻无负担
 
 ### 环境变量
 

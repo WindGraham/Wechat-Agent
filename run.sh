@@ -1,13 +1,15 @@
 #!/bin/bash
-# Wechat-Agent 启动脚本：用户唯一入口——只启动网关（常驻控制平面）。
+# Wechat-Agent 启动脚本：用户唯一入口——启动网关（常驻控制平面）。
 #
 # 用法：
 #   ./run.sh              前台运行网关（Ctrl+C 退出）
 #   ./run.sh -d           后台运行网关（日志 logs/gateway.log）
 #   ./run.sh stop         停止后台网关
+#   ./install.sh          一键安装为 systemd 服务（开机自启 + 崩溃自愈，推荐）
 #
 # 网关起来后，浏览器打开 http://127.0.0.1:13014/ ，
 # agent 的启动/停止/重启/日志全在网页"控制台"页完成。
+# 注意：agent 本身由网关管理，本脚本不直接启动 agent。
 set -e
 cd "$(dirname "$0")"
 
