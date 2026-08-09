@@ -68,12 +68,12 @@ def main(argv=None):
     print("[gateway] agent 由网关控制台管理：进入网页 → 控制台 → 启动/停止/重启",
           flush=True)
     try:
-        server.serve_forever()
+        ok = server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        ok = True
     finally:
         server.shutdown()
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
