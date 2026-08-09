@@ -102,7 +102,9 @@ class KimiProvider(LLMProvider):
                          "https://api.kimi.com/coding/v1",
                          omit_temperature=True, **kw)
 
-    def chat(self, messages, max_tokens=300, temperature=0.8) -> str:
+    def chat(self, messages, max_tokens=2048, temperature=0.8) -> str:
+        # 默认上限 2048：思考+正文共享额度，300 时代办回执这类复杂 prompt
+        # 会被 thinking 吃光 → content 空 → 交付静默丢失（2026-08-09 实测）
         return super().chat(messages,
                             max_tokens=max(max_tokens, self.MIN_MAX_TOKENS),
                             temperature=temperature)
