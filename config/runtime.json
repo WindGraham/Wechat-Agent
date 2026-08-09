@@ -26,5 +26,6 @@
   "tool_model_mm": "kimi-code/kimi-for-coding",
   "tool_model_text": "deepseek/v4-pro",
   "friend_auto_accept": true,
+  "friend_check_interval": 1800,
   "friend_max_accept": 30
 }

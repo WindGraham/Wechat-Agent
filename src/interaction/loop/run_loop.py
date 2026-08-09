@@ -47,6 +47,8 @@ class InteractionLoop:
         self._sleep = time.sleep
         self._rand = random.uniform
         self._clock = time.time
+        # 好友申请兜底巡检时间戳；0 = 启动后第一个空闲周期立刻巡检一次
+        self._last_friend_probe = 0.0
 
     # ------------------------------------------------------------------ 配置
     @property
@@ -60,6 +62,18 @@ class InteractionLoop:
         if self._config:
             return getattr(self._config, 'notify_interval', (3, 6))
         return (3, 6)
+
+    @property
+    def friend_check_interval(self):
+        """好友申请兜底巡检间隔（秒，默认 1800）。
+
+        只负责"点开过详情但没通过"的残留态（红点全消但申请还在，
+        tab 红点识别永远看不到）；即时识别走 tab 红点，不靠它。
+        """
+        if self._config:
+            return getattr(self._config, 'get', lambda k, d=None: d)(
+                'friend_check_interval', 1800)
+        return 1800
 
     @property
     def is_paused(self):
@@ -128,6 +142,15 @@ class InteractionLoop:
                     except Exception:
                         log.exception("sweep failed")
                 next_sweep = self._clock() + self._rand(*self.sweep_interval)
+
+            # 好友申请兜底巡检（队列空且距上次超过间隔）：
+            # 只抓"点开未通过"的残留态，即时识别靠 tab 红点
+            if not self.is_paused and len(self._queue) == 0:
+                if self._clock() - self._last_friend_probe >= \
+                        self.friend_check_interval:
+                    self._last_friend_probe = self._clock()
+                    log.info("好友申请兜底巡检")
+                    self._queue.push_friend(source="probe_backstop")
 
             # 乱逛：队列空时模拟真人随机浏览
             if not self.is_paused and len(self._queue) == 0:
