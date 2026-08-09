@@ -499,10 +499,24 @@ class Proxy:
                 session, n=self._rt("history_size", 200))
             messages = self._builder.build_task_receipt(
                 session, bool(is_group), receipt, history)
+            _journal("prompt", session=session, round="receipt",
+                     system=_clip("\n\n".join(
+                         m.get("content", "") for m in messages
+                         if m.get("role") == "system")),
+                     user=_clip("\n\n".join(
+                         m.get("content", "") for m in messages
+                         if m.get("role") == "user")))
             out = self._provider.chat(messages)
+            _journal("llm_output", session=session, round="receipt",
+                     output=_clip(out))
+            delivered = []
             for b in extract_blocks(out):
                 if b.valid and b.tag == "reply":
-                    self._submit_bundle(session, self._block_to_xml(b, session))
+                    ok = self._submit_bundle(
+                        session, self._block_to_xml(b, session)).ok
+                    delivered.append({"session": session, "ok": bool(ok)})
+            _journal("route", session=session, blocks=["receipt_reply"],
+                     deliveries=delivered)
 
     # ---------------------------------------------------------------- 媒体写回
     def _write_back(self, session, sender, old_content, new_content):
