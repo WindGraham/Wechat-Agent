@@ -135,7 +135,8 @@ class ContextBuilder:
                 ref=receipt.get("ref", "?"),
                 ref_brief=receipt.get("ref_brief", ""),
                 desc=receipt.get("desc", ""),
-                result=receipt.get("result", "")),
+                result=receipt.get("result", ""),
+                deliverables=receipt.get("deliverables", "（无）")),
         ]
         if history:
             user_parts.append(self._lib.user_block(

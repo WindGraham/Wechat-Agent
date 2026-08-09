@@ -486,12 +486,20 @@ class Proxy:
                 summary = f.read()
         except OSError:
             summary = ""
+        deliverables = [ln.split("DELIVERABLE:", 1)[1].strip()
+                        for ln in summary.splitlines()
+                        if "DELIVERABLE:" in ln]
+        brief_text = "\n".join(ln for ln in summary.splitlines()
+                               if "DELIVERABLE:" not in ln)
         receipt = {
             "task_id": task_id, "ref": "+".join(task["refs"]),
             "ref_brief": "; ".join(task["ref_briefs"]),
             "desc": task["desc"],
             "result": ("成功。" if task["status"] == "done" else "失败。")
-                      + summary[:300],
+                      + brief_text[:300],
+            # DELIVERABLE 行单独抽全量路径：塞在 summary[:300] 里会被截断，
+            # 截断的路径她照抄 → 发文件报"本地文件不存在"（2026-08-09 实测）
+            "deliverables": "\n".join(deliverables) or "（无）",
         }
         with self._sem, self._session_lock(session):
             is_group = self._reader.last_is_group(session)
