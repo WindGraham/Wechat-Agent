@@ -148,14 +148,16 @@ class AgentSupervisor:
         return self.start()
 
     def status(self) -> dict:
-        """当前状态。running/stopped/crashed + pid + 启动时间 + 退出信息。"""
+        """当前状态。running/stopped/crashed + pid + 启动时间 + 退出信息。
+        退出码 0 视为正常结束（stopped），非 0 才标 crashed。"""
         with self._lock:
             proc = self._proc
             if proc is not None and proc.poll() is None:
                 return {"state": "running", "pid": proc.pid,
                         "started_at": self._started_at}
             if self._last_exit is not None:
-                return {"state": "crashed", "pid": None,
+                state = "crashed" if self._last_exit.get("code") else "stopped"
+                return {"state": state, "pid": None,
                         "started_at": self._started_at,
                         "exit": self._last_exit}
             return {"state": "stopped", "pid": None,

@@ -734,6 +734,47 @@ INDEX_HTML = """<!DOCTYPE html>
                background: var(--stone); border-radius: var(--r-pill);
                padding: 4px 12px; font-size: 12px; color: var(--body-muted); }
   .chip-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* ---------- 卡片 hover 微交互（Cohere: 边框微亮，无阴影） ---------- */
+  .card { transition: border-color .2s; }
+  .card:hover { border-color: var(--hairline); }
+
+  /* ---------- 侧边栏 agent 状态灯 ---------- */
+  .agent-dot { display: inline-block; width: 8px; height: 8px;
+               border-radius: 50%; margin-right: 6px; vertical-align: middle;
+               background: var(--muted); }
+  .agent-dot.running { background: #34d399; box-shadow: 0 0 6px rgba(52,211,153,.6); }
+  .agent-dot.stopped { background: var(--muted); }
+  .agent-dot.crashed { background: var(--error); box-shadow: 0 0 6px rgba(179,0,0,.5); }
+  .agent-line { display: flex; align-items: center; justify-content: space-between;
+                font-size: 11px; color: var(--muted); }
+  .agent-line b { color: rgba(255,255,255,.85); font-weight: 500; }
+
+  /* ---------- toast 提示 ---------- */
+  #toast { position: fixed; top: 18px; right: 24px; z-index: 9999;
+           display: flex; flex-direction: column; gap: 8px; }
+  .toast-item { background: var(--primary); color: #fff; border-radius: var(--r-sm);
+                padding: 10px 16px; font-size: 13px; box-shadow: 0 4px 16px
+                rgba(0,0,0,.18); opacity: 0; transform: translateY(-6px);
+                transition: opacity .25s, transform .25s; max-width: 360px;
+                word-break: break-all; }
+  .toast-item.show { opacity: 1; transform: translateY(0); }
+  .toast-item.ok { background: var(--deep-green); }
+  .toast-item.err { background: var(--error); }
+
+  /* ---------- 空状态 ---------- */
+  .empty { text-align: center; padding: 28px 12px; color: var(--muted);
+           font-size: 13px; }
+  .empty::before { content: "—"; display: block; font-size: 20px;
+                   margin-bottom: 6px; color: var(--hairline); }
+
+  /* ---------- 加载态 ---------- */
+  .loading { color: var(--muted); font-size: 12px; padding: 12px 0;
+             display: flex; align-items: center; gap: 8px; }
+  .spinner { width: 12px; height: 12px; border: 2px solid var(--hairline);
+             border-top-color: var(--primary); border-radius: 50%;
+             animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -770,7 +811,10 @@ INDEX_HTML = """<!DOCTYPE html>
         <span class="ico">▤</span>状态
       </button>
     </nav>
-    <div class="nav-foot">gateway · 13014<br>agent 由控制台管理</div>
+    <div class="nav-foot">
+      <div class="agent-line"><span><span class="agent-dot" id="nav-agent-dot"></span><b id="nav-agent-state">—</b></span></div>
+      <div style="margin-top:6px">gateway · 13014</div>
+    </div>
   </aside>
 
   <!-- 右侧主内容区 -->
@@ -834,6 +878,7 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
   </div>
 </div>
+<div id="toast"></div>
 <script>
 let curPath = null, savedContent = "", dirty = false, curTab = "live";
 
@@ -847,6 +892,34 @@ function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
                         .replace(/>/g, '&gt;');
 }
+// toast 提示（替代 alert）
+function toast(msg, kind) {
+  const t = document.createElement('div');
+  t.className = 'toast-item ' + (kind || '');
+  t.textContent = msg;
+  document.getElementById('toast').appendChild(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  setTimeout(() => {
+    t.classList.remove('show');
+    setTimeout(() => t.remove(), 300);
+  }, 3200);
+}
+// 侧边栏 agent 状态灯（5s 轮询）
+function refreshNavAgent() {
+  api('/api/agent/status').then(j => {
+    const state = (j.agent || {}).state || (j.mode === 'embedded' ? 'embedded' : 'stopped');
+    const dot = document.getElementById('nav-agent-dot');
+    const txt = document.getElementById('nav-agent-state');
+    if (!dot || !txt) return;
+    dot.className = 'agent-dot ' + (state === 'running' ? 'running'
+                                    : state === 'crashed' ? 'crashed' : 'stopped');
+    txt.textContent = state === 'running' ? 'Agent 运行中'
+                     : state === 'crashed' ? 'Agent 崩溃'
+                     : state === 'embedded' ? '内嵌模式' : 'Agent 未启动';
+  }).catch(() => {});
+}
+setInterval(refreshNavAgent, 5000);
+refreshNavAgent();
 function markDirty() {
   dirty = (document.getElementById('ta').value !== savedContent);
   document.getElementById('dirty').style.display = dirty ? 'inline' : 'none';
@@ -889,9 +962,9 @@ function loadConsole() {
   api('/api/agent/status').then(j => {
     if (j.mode === 'embedded') {
       document.getElementById('console-status').innerHTML =
-        '<p class="dim">网关以内嵌模式运行（随 agent 主进程），无需在网关上管理。</p>';
+        '<div class="empty">网关以内嵌模式运行（随 agent 主进程）</div>';
       document.getElementById('console-log').innerHTML =
-        '<p class="dim">日志由 agent 进程输出。</p>';
+        '<div class="empty">日志由 agent 进程输出</div>';
       return;
     }
     const a = j.agent || {};
@@ -926,17 +999,17 @@ function loadConsole() {
         }).catch(() => {});
       }, 3000);
     }
-  }).catch(e => alert(e.message));
+  }).catch(e => toast(e.message, 'err'));
 }
 function agentAction(action) {
   api('/api/agent/' + action, {method: 'POST'}).then(j => {
-    const m = document.getElementById('agent_msg');
-    if (m) {
-      m.textContent = action + (j.ok ? ' 成功' : ' 失败');
-      setTimeout(() => m.textContent = '', 3000);
-    }
+    if (j.ok) toast(action === 'start' ? 'Agent 已启动'
+                : action === 'stop' ? 'Agent 已停止'
+                : 'Agent 已重启', 'ok');
+    else toast('操作失败：' + (j.error || '未知错误'), 'err');
     loadConsole();
-  }).catch(e => alert(e.message));
+    refreshNavAgent();
+  }).catch(e => toast(e.message, 'err'));
 }
 
 let GROUPS = [], LEVELS = {};
@@ -972,9 +1045,9 @@ function setLevel(session) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({session, level, extra_rule: extra})})
     .then(r => r.json()).then(j => {
-      if (!j.ok) alert(j.error || '保存失败');
+      if (!j.ok) toast(j.error || '保存失败', 'err');
       loadGroups();
-    }).catch(e => alert(e.message));
+    }).catch(e => toast(e.message, 'err'));
 }
 
 function loadFiles(which) {
@@ -990,7 +1063,7 @@ function loadFiles(which) {
       d.onclick = () => openFile(f.path);
       sb.appendChild(d);
     }
-  }).catch(e => alert(e.message));
+  }).catch(e => toast(e.message, 'err'));
 }
 
 function openFile(path) {
@@ -1001,7 +1074,7 @@ function openFile(path) {
     document.getElementById('ta').value = j.content;
     document.getElementById('cur').textContent = path;
     markDirty();
-  }).catch(e => alert(e.message));
+  }).catch(e => toast(e.message, 'err'));
 }
 
 function saveFile() {
@@ -1013,7 +1086,7 @@ function saveFile() {
     savedContent = document.getElementById('ta').value;
     markDirty();
     flash('已保存（热生效）');
-  }).catch(e => alert(e.message));
+  }).catch(e => toast(e.message, 'err'));
 }
 
 function flash(t) {
@@ -1059,7 +1132,7 @@ function loadRuntime() {
          '<button class="btn" onclick="saveRuntime()">保存</button>' +
          ' <span id="rt_msg"></span></div></div>';
     p.innerHTML = h;
-  }).catch(e => alert(e.message));
+  }).catch(e => toast(e.message, 'err'));
 }
 
 function saveRuntime() {
@@ -1079,7 +1152,7 @@ function saveRuntime() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body)
   }).then(() => document.getElementById('rt_msg').textContent = '已保存')
-    .catch(e => alert(e.message));
+    .catch(e => toast(e.message, 'err'));
 }
 
 function loadEnv() {
@@ -1100,7 +1173,7 @@ function loadEnv() {
          '<button class="btn" onclick="saveEnv()">保存</button>' +
          ' <span id="env_msg"></span></div></div>';
     p.innerHTML = h;
-  }).catch(e => alert(e.message));
+  }).catch(e => toast(e.message, 'err'));
 }
 
 function saveEnv() {
@@ -1113,7 +1186,7 @@ function saveEnv() {
   api('/api/env', {method: 'PUT',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body)
-  }).then(() => { loadEnv(); }).catch(e => alert(e.message));
+  }).then(() => { loadEnv(); }).catch(e => toast(e.message, 'err'));
 }
 
 function loadStatus() {
@@ -1143,7 +1216,7 @@ function loadStatus() {
     }
     h += '</div></div>';
     p.innerHTML = h;
-  }).catch(e => alert(e.message));
+  }).catch(e => toast(e.message, 'err'));
 }
 
 function queueTable(queue) {
@@ -1175,17 +1248,37 @@ function loadLive() {
                  : api('/api/events?n=80').catch(() => null),
     api('/api/ops?n=40').catch(() => null),
   ]).then(([st, hs, ev, ops]) => {
-    document.getElementById('live-queue').innerHTML =
-      queueTable(st && st.queue);
-    document.getElementById('live-home').innerHTML =
-      renderHome(hs && hs.scan);
+    // 统计 chips（卡片标题栏）
+    const q = st && st.queue || [];
+    const scan = hs && hs.scan;
+    const hot = scan && scan.sessions
+      ? scan.sessions.filter(s => s.unread_count > 0 || s.unread_kind === 'dot'
+                                  || s.mention_me).length : 0;
+    const chips = (n, label) =>
+      '<span class="stat-chip">' + n + ' ' + label + '</span>';
+    const qHead = document.querySelector('#pane-live .card:nth-child(1) h2');
+    const hHead = document.querySelector('#pane-live .card:nth-child(2) h2');
+    if (qHead) qHead.innerHTML = '时序队列 ' + chips(q.length, '条');
+    if (hHead) hHead.innerHTML = '首页红点 ' +
+      chips(scan ? (scan.sessions || []).length : 0, '会话') +
+      chips(hot, '有未读');
+
+    const qEl = document.getElementById('live-queue');
+    const hEl = document.getElementById('live-home');
+    if (!q.length) qEl.innerHTML = '<div class="empty">队列为空，无待办</div>';
+    else qEl.innerHTML = queueTable(q);
+    if (!scan || !scan.sessions || !scan.sessions.length)
+      hEl.innerHTML = '<div class="empty">暂无数据（等待下一轮扫描）</div>';
+    else hEl.innerHTML = renderHome(scan);
     if (ev) {
       document.getElementById('live-events').innerHTML =
-        renderEvents(ev.events || []);
+        ev.events && ev.events.length ? renderEvents(ev.events)
+                                      : '<div class="empty">暂无决策事件</div>';
     }
     if (ops) {
       document.getElementById('live-ops').innerHTML =
-        renderOps(ops.ops || []);
+        ops.ops && ops.ops.length ? renderOps(ops.ops)
+                                  : '<div class="empty">暂无原子操作</div>';
     }
   });
 }
