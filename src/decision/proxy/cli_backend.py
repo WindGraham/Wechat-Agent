@@ -19,6 +19,25 @@ log = logging.getLogger("decision.proxy.cli")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 TASKS_ROOT = os.path.join(PROJECT_ROOT, "workspace", "tasks")
+ENV_PATH = os.path.join(PROJECT_ROOT, "workspace", ".env")
+
+
+def _task_env() -> dict:
+    """任务子进程环境：os.environ + workspace/.env 的全部键值。
+    树洞 token 等凭据配在 .env 里，不注入的话子进程环境变量是空的，
+    kimi 拿到空 Bearer 请求 401，还会误判成"密钥过期"（2026-08-09 实测）。"""
+    env = dict(os.environ)
+    try:
+        with open(ENV_PATH, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln or ln.startswith("#") or "=" not in ln:
+                    continue
+                k, v = ln.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return env
 
 
 class CLIBackend:
@@ -59,7 +78,7 @@ class KimiCodeCLI(CLIBackend):
         trace_lines = []
         try:
             proc = subprocess.Popen(
-                cmd, cwd=workdir,
+                cmd, cwd=workdir, env=_task_env(),
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True)
         except OSError as e:
