@@ -279,19 +279,3 @@ def verify_chat_avatars(img, gray=None, hsv=None):
     for i, e in enumerate(elements, 1):
         e["id"] = f"avatar_chat_{i}"
     return elements
-
-
-# ---------------------------------------------------------------- sanity check
-if __name__ == "__main__":
-    import json
-    import sys
-
-    base = "/media/data_old/wechat-agent/samples/ui_inventory"
-    for path, mode in (
-            (f"{base}/03_chat/chat_group_jiaoliu.png", "chat"),
-            (f"{base}/03_chat/chat_group_leisure.png", "chat")):
-        img = cv2.imread(path)
-        avatars = verify_chat_avatars(img)
-        print(path.split("/")[-1], json.dumps([
-            (e["side"], e["top"], e["position"], round(e["confidence"], 2))
-            for e in avatars], ensure_ascii=False, indent=1))

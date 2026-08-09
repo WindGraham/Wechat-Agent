@@ -16,6 +16,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -23,10 +24,12 @@ import time
 import jieba
 import threading
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from .random_touch import Rect, RandomTouch
+from .....shared.ops_journal import log_op
 
-ADB_PATH = "/media/data_old/wechat-agent/tools/platform-tools/adb"
+PROJECT_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "..", ".."))
+ADB_PATH = os.path.join(PROJECT_ROOT, "tools", "platform-tools", "adb")
 SERIAL = "cf04642e"
 
 WECHAT_PKG = "com.tencent.mm"
@@ -34,8 +37,13 @@ WECHAT_MAIN_ACTIVITY = "com.tencent.mm/.ui.LauncherUI"
 
 ADBKB_PKG = "com.android.adbkeyboard"
 ADBKB_IME = "com.android.adbkeyboard/.AdbIME"
-ADBKB_APK = "/tmp/ADBKeyboard.apk"
+# apk 放项目内（/tmp 会丢）；缺失时从旧位置拷贝兜底，都没有则报错提示
+ADBKB_APK = os.path.join(PROJECT_ROOT, "tools", "ADBKeyboard.apk")
+ADBKB_APK_LEGACY = "/tmp/ADBKeyboard.apk"
 ADBKB_APK_URL = "https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKeyboard.apk"
+
+# 截图落盘目录（capture_bytes 内存截图是主路径；落盘版仅调试用，用完即删）
+CAPTURE_TMP_DIR = os.path.join(PROJECT_ROOT, "workspace", "runtime", "tmp")
 
 SCREEN_W, SCREEN_H = 1080, 2340
 
@@ -111,12 +119,15 @@ class DeviceCtl:
 
     # ----------------------------------------------------------------- 截图
     def capture(self):
-        """截图存 /tmp/wx_cap_<timestamp>.png，校验 PNG magic，坏图重试一次。"""
+        """落盘版截图（仅供调试；主路径是 capture_bytes 内存截图）。
+        落 workspace/runtime/tmp/wx_cap_<timestamp>.png，调用方用完必须自行删除。"""
+        os.makedirs(CAPTURE_TMP_DIR, exist_ok=True)
         for attempt in range(2):
             with self._cap_lock:
                 data = self._run(["exec-out", "screencap", "-p"], timeout=30, retries=0)
             if data.startswith(PNG_MAGIC) and len(data) > 1024:
-                path = f"/tmp/wx_cap_{int(time.time() * 1000)}.png"
+                path = os.path.join(
+                    CAPTURE_TMP_DIR, f"wx_cap_{int(time.time() * 1000)}.png")
                 with open(path, "wb") as f:
                     f.write(data)
                 log.debug("captured %s (%d bytes)", path, len(data))
@@ -150,6 +161,7 @@ class DeviceCtl:
     def tap_rect(self, rect, sigma_ratio=0.25):
         """Rect 区域内高斯偏中心随机点按（随机化框架 v2 主 API）。"""
         pt = self.touch.tap_rect(rect, sigma_ratio=sigma_ratio)
+        log_op("tap", x=int(pt[0]), y=int(pt[1]), rect=str(rect))
         self.wait_random(80, 200)
         return pt
 
@@ -157,12 +169,14 @@ class DeviceCtl:
         """Rect 区域内双击（两次独立随机落点 + 随机间隔），如首页"微信"Tab。"""
         pts = self.touch.double_tap_rect(rect, interval_ms=interval_ms,
                                          sigma_ratio=sigma_ratio)
+        log_op("double_tap", rect=str(rect))
         self.wait_random(80, 200)
         return pts
 
     def long_press_rect(self, rect, sigma_ratio=0.25):
         """Rect 区域内长按（随机落点 + 500~800ms 按压，触发系统长按菜单）。"""
         pt = self.touch.long_press_rect(rect, sigma_ratio=sigma_ratio)
+        log_op("long_press", rect=str(rect))
         self.wait_random(80, 200)
         return pt
 
@@ -177,6 +191,7 @@ class DeviceCtl:
                                     length_ratio=length_ratio,
                                     diag_ratio=diag_ratio,
                                     duration_ms=duration_ms)
+        log_op("swipe", direction=direction)
         self.wait_random(100, 250)
         return pts
 
@@ -204,6 +219,7 @@ class DeviceCtl:
         self.wait_random(60, 150)
 
     def back(self):
+        log_op("back")
         self.key_event("KEYCODE_BACK")
 
     def home_key(self):
@@ -216,6 +232,7 @@ class DeviceCtl:
     # ----------------------------------------------------------------- 输入
     def input_text(self, text):
         """输入文本（中英文统一走 ADBKeyBoard 广播方案，IME 已锁定无需切换）。"""
+        log_op("input_text", text=text)
         self._input_text_unicode(text)
         self.wait_random(150, 350)
 
@@ -225,8 +242,16 @@ class DeviceCtl:
             return
         log.info("ADBKeyBoard not installed, installing...")
         if not os.path.exists(ADBKB_APK):
-            subprocess.run(["curl", "-sL", "-o", ADBKB_APK, ADBKB_APK_URL],
-                           check=True, timeout=120)
+            # 项目内 apk 缺失：从旧位置（/tmp）拷贝兜底
+            if os.path.exists(ADBKB_APK_LEGACY):
+                os.makedirs(os.path.dirname(ADBKB_APK), exist_ok=True)
+                shutil.copy(ADBKB_APK_LEGACY, ADBKB_APK)
+                log.info("ADBKeyboard.apk copied from %s", ADBKB_APK_LEGACY)
+            else:
+                raise RuntimeError(
+                    f"ADBKeyboard.apk 缺失：{ADBKB_APK} 不存在，"
+                    f"旧位置 {ADBKB_APK_LEGACY} 也没有。"
+                    f"请手动下载放到项目内：{ADBKB_APK_URL}")
         self._run(["install", "-r", ADBKB_APK], timeout=120)
 
     def _split_chunks(self, text):
@@ -277,6 +302,7 @@ class DeviceCtl:
             self._shell(f"ime set {ADBKB_IME}")
 
     def clear_text(self, times=40):
+        log_op("clear_text")
         """ADBKeyBoard 自带 ADB_CLEAR_TEXT 广播一次清空输入框（2026-08-04 真机验证）。
 
         根除 v1 连发 30 次 KEYCODE_DEL 丢事件残留旧文本的问题（AGENTS.md 第 9 条）。
@@ -288,6 +314,7 @@ class DeviceCtl:
     # ----------------------------------------------------------------- 应用
     def open_wechat(self, timeout_s=10):
         """monkey 拉起微信并等待 activity 验证。"""
+        log_op("open_wechat")
         self._shell(f"monkey -p {WECHAT_PKG} -c android.intent.category.LAUNCHER 1")
         deadline = time.time() + timeout_s
         while time.time() < deadline:
@@ -318,31 +345,6 @@ class DeviceCtl:
 
 # --------------------------------------------------------------------- 自测
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    import layout
-
-    d = DeviceCtl()
-    print("== ensure_device ok ==")
-
-    act = d.get_current_activity()
-    print("== current activity:", act)
-
-    # 1. 内存截图验证（不落盘）
-    img = d.capture_bytes()
-    assert img is not None and img.shape[0] == SCREEN_H and img.shape[1] == SCREEN_W
-    print("== capture_bytes ok:", img.shape)
-
-    # 2. 微信首页空白区随机 tap 3 次（会话列表下方空白，安全区）
-    if act.startswith(WECHAT_PKG):
-        for i in range(3):
-            d.tap_rect(layout.Rect(300, 1600, 480, 300))
-        print("== 3 random taps on empty area ok ==")
-        # 3. 列表滑动一次（下翻再上翻，旧签名兼容路径）
-        d.swipe(540, 1700, 540, 900)
-        d.wait_random(400, 800)
-        d.swipe(540, 900, 540, 1700)
-        print("== legacy swipe wrapper ok ==")
-    else:
-        print("!! not on wechat, skip tap/swipe test")
-    print("SELF-TESTS DONE（输入链真机验证走 /tmp 独立脚本，不进会话）")
+    print("device_ctl.py 不提供自测入口：直接运行会真实操作手机，已禁用。"
+              "请用离线单测（假对象）。")
+    raise SystemExit(1)

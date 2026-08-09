@@ -31,6 +31,10 @@ class Navigator:
         """返回上一页。"""
         return self.tools.back()
 
+    def chat_is_group(self):
+        """当前聊天页是否群聊（标题栏"(人数)"后缀实测）。"""
+        return self.tools.chat_is_group()
+
     def scroll_up(self) -> "ToolResult":
         """聊天页看更早消息 / 列表看更靠上。"""
         return self.tools.scroll_up()
@@ -52,6 +56,15 @@ class Navigator:
             log.warning("is_on_page snap failed: %s", e)
             return False
         return state.get("page", {}).get("type") == page_type
+
+    def page_title(self) -> str:
+        """当前页标题（原始 state 标题，供特殊页面判定用）。"""
+        try:
+            state = self.tools._snap()
+        except Exception as e:
+            log.warning("page_title snap failed: %s", e)
+            return ""
+        return (state.get("page", {}) or {}).get("title") or ""
 
     # ---------------------------------------------------------- 回首页
     def back_to_home(self) -> bool:

@@ -100,3 +100,9 @@ class QueueEntry:
     mention: bool = False      # @我/主人 → 插队队首
     payload: str = ""          # action 时为 XML bundle 原文；notify 时为空
     attempts: int = 0          # 行动条目已尝试次数（上限 2，耗尽排队尾）
+    sources: set = field(default_factory=set)  # {"sweep", "notify", "heartbeat"}
+
+    @property
+    def is_priority(self) -> bool:
+        """是否为优先条目（@我/主人）。"""
+        return self.mention

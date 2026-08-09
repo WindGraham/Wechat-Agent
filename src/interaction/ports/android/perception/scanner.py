@@ -5,13 +5,21 @@
 通过 on_config_change 回调响应热更新。
 """
 
+import json
 import logging
+import os
+import time
 from dataclasses import dataclass
 
 from ..device import layout
-from ..action.wechat_tools import _name_match
+from .....shared.name_match import _name_match
 
 log = logging.getLogger("perception.scanner")
+
+PROJECT_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "..", ".."))
+HOME_SCAN_PATH = os.path.join(PROJECT_ROOT, "workspace", "runtime",
+                              "home_scan.json")
 
 
 @dataclass
@@ -53,9 +61,24 @@ class Scanner:
         """
         r = self.tools.open_wechat()
         if not r.success or r.page != "wechat_home":
-            log.warning("sweep: open_wechat -> success=%s page=%s (skip)",
+            # 卡页自救：最多 back 3 次回首页（聊天页输入栏聚焦时第一次 back
+            # 只取消聚焦页面不退，需再按；小程序面板同理）。不自救会每轮 skip
+            log.warning("sweep: open_wechat -> success=%s page=%s，尝试 back 自救",
                         r.success, r.page)
-            return []
+            for _ in range(3):
+                if r.success and r.page == "wechat_home":
+                    break
+                try:
+                    self.tools.dev.back()
+                    self.tools.dev.wait_random(600, 1000)
+                    r = self.tools.open_wechat()
+                except Exception:  # noqa: BLE001
+                    log.exception("sweep 自救 back 失败")
+                    break
+            if not r.success or r.page != "wechat_home":
+                log.warning("sweep: 自救失败 success=%s page=%s (skip)",
+                            r.success, r.page)
+                return []
         self.tools.dev.double_tap_rect(layout.TAB_WECHAT)
         self.tools.dev.wait_random(800, 1500)
         state = self.frame_bus.capture()
@@ -110,6 +133,7 @@ class Scanner:
     def _queue_unread(self, state, source):
         """首页 state 里有未读/mention 的会话入队。
         open_all_sessions 时不再过滤监控列表（系统会话由队列黑名单拦截）。"""
+        self._write_home_scan(state)        # 实况快照（网关首页红点卡片）
         events = []
         sessions = self.sessions  # 实时读取
         open_all = getattr(self._runtime.config, "open_all_sessions", False)
@@ -152,3 +176,28 @@ class Scanner:
         if not events:
             log.info("%s: no unread in monitored sessions", source)
         return events
+
+    def _write_home_scan(self, state):
+        """首页全部会话条目 → workspace/runtime/home_scan.json（原子写，
+        网关实况页"首页红点"卡片读取）。失败只记日志，不影响扫描主流程。"""
+        try:
+            sessions = []
+            for e in state.get("elements", []):
+                if e.get("type") != "session_item":
+                    continue
+                sessions.append({
+                    "label": e.get("label") or "",
+                    "unread_count": e.get("unread_count", 0),
+                    "unread_kind": e.get("unread_kind"),
+                    "mention_me": bool(e.get("mention_me")),
+                    "muted": bool(e.get("muted")),
+                    "partial": bool(e.get("partial")),
+                })
+            payload = {"ts": time.time(), "sessions": sessions}
+            os.makedirs(os.path.dirname(HOME_SCAN_PATH), exist_ok=True)
+            tmp = HOME_SCAN_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, HOME_SCAN_PATH)
+        except Exception:  # noqa: BLE001
+            log.exception("home_scan 快照写入失败")

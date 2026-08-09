@@ -1,0 +1,186 @@
+[
+  {
+    "file": "avatar_placeholder_gray.png",
+    "name": "avatar placeholder",
+    "variant": "gray",
+    "source_page": "contacts",
+    "width": 110,
+    "height": 110
+  },
+  {
+    "file": "back_arrow_dark.png",
+    "name": "back arrow",
+    "variant": "dark",
+    "source_page": "chat",
+    "width": 110,
+    "height": 110
+  },
+  {
+    "file": "camera_icon_dark.png",
+    "name": "camera icon",
+    "variant": "dark",
+    "source_page": "scan",
+    "width": 55,
+    "height": 45
+  },
+  {
+    "file": "chat_emoji_icon_dark.png",
+    "name": "chat emoji icon",
+    "variant": "dark",
+    "source_page": "chat",
+    "width": 110,
+    "height": 110
+  },
+  {
+    "file": "chat_more_icon_dark.png",
+    "name": "chat more icon",
+    "variant": "dark",
+    "source_page": "chat",
+    "width": 110,
+    "height": 110
+  },
+  {
+    "file": "chat_plus_icon_dark.png",
+    "name": "chat plus icon",
+    "variant": "dark",
+    "source_page": "chat",
+    "width": 110,
+    "height": 110
+  },
+  {
+    "file": "chat_voice_icon_dark.png",
+    "name": "chat voice icon",
+    "variant": "dark",
+    "source_page": "chat",
+    "width": 110,
+    "height": 110
+  },
+  {
+    "file": "close_x_dark.png",
+    "name": "close x",
+    "variant": "dark",
+    "source_page": "scan",
+    "width": 70,
+    "height": 70
+  },
+  {
+    "file": "home_plus_icon_dark.png",
+    "name": "home plus icon",
+    "variant": "dark",
+    "source_page": "home",
+    "width": 110,
+    "height": 110
+  },
+  {
+    "file": "qr_code_icon_dark.png",
+    "name": "qr code icon",
+    "variant": "dark",
+    "source_page": "chat_info",
+    "width": 70,
+    "height": 70
+  },
+  {
+    "file": "search_icon_dark.png",
+    "name": "search icon",
+    "variant": "dark",
+    "source_page": "home",
+    "width": 110,
+    "height": 110
+  },
+  {
+    "file": "send_button_green.png",
+    "name": "send button",
+    "variant": "green",
+    "source_page": "chat",
+    "width": 140,
+    "height": 95
+  },
+  {
+    "file": "switch_off_dark.png",
+    "name": "switch off",
+    "variant": "dark",
+    "source_page": "settings",
+    "width": 138,
+    "height": 84
+  },
+  {
+    "file": "switch_on_green.png",
+    "name": "switch on",
+    "variant": "green",
+    "source_page": "settings",
+    "width": 138,
+    "height": 84
+  },
+  {
+    "file": "tab_contacts_active.png",
+    "name": "tab contacts",
+    "variant": "active",
+    "source_page": "contacts",
+    "width": 120,
+    "height": 80
+  },
+  {
+    "file": "tab_contacts_inactive.png",
+    "name": "tab contacts",
+    "variant": "inactive",
+    "source_page": "home",
+    "width": 120,
+    "height": 80
+  },
+  {
+    "file": "tab_discover_active.png",
+    "name": "tab discover",
+    "variant": "active",
+    "source_page": "discover",
+    "width": 120,
+    "height": 80
+  },
+  {
+    "file": "tab_discover_inactive.png",
+    "name": "tab discover",
+    "variant": "inactive",
+    "source_page": "home",
+    "width": 120,
+    "height": 80
+  },
+  {
+    "file": "tab_me_active.png",
+    "name": "tab me",
+    "variant": "active",
+    "source_page": "me",
+    "width": 120,
+    "height": 80
+  },
+  {
+    "file": "tab_me_inactive.png",
+    "name": "tab me",
+    "variant": "inactive",
+    "source_page": "home",
+    "width": 120,
+    "height": 80
+  },
+  {
+    "file": "tab_wechat_active.png",
+    "name": "tab wechat",
+    "variant": "active",
+    "source_page": "home",
+    "width": 120,
+    "height": 80
+  },
+  {
+    "file": "tab_wechat_inactive.png",
+    "name": "tab wechat",
+    "variant": "inactive",
+    "source_page": "contacts",
+    "width": 120,
+    "height": 80
+  },
+  {
+    "file": "quote_close_x.png",
+    "name": "quote preview close x",
+    "variant": "dark",
+    "source_page": "chat",
+    "width": 48,
+    "height": 46
+  }
+]
