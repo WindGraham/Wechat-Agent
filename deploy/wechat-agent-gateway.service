@@ -1,0 +1,35 @@
+# Wechat-Agent 网关 systemd 服务（可选，推荐生产用）
+#
+# 用途：让网关常驻（开机自启 + 崩溃自动拉起）。agent 仍由网关网页控制台管理。
+#
+# 安装步骤：
+#   1. 把本文件放到 /etc/systemd/system/wechat-agent-gateway.service
+#   2. 按需修改下面的 User / WorkingDirectory / ExecStart 路径
+#   3. systemctl daemon-reload
+#   4. systemctl enable --now wechat-agent-gateway
+#
+# 常用命令：
+#   systemctl status wechat-agent-gateway   # 看状态
+#   journalctl -u wechat-agent-gateway -f   # 看日志
+#   重启网关：systemctl restart wechat-agent-gateway
+#   （agent 的重启在网关网页"控制台"页操作，不影响网关本身）
+
+[Unit]
+Description=Wechat-Agent Gateway (control plane)
+After=network.target
+
+[Service]
+Type=simple
+# 换成实际运行用户
+User=AsusGraham
+# 换成仓库实际路径
+WorkingDirectory=/media/data_old/Wechat-Agent
+# 换成 venv 实际路径（run.sh 依赖自检同样会执行）
+ExecStart=/home/AsusGraham/.venvs/wechat-agent/bin/python -m src.gateway
+Restart=on-failure
+RestartSec=3
+# 可选：网关鉴权 token（设置后网页需 Authorization）
+# Environment=WECHAT_AGENT_GATEWAY_TOKEN=your_token_here
+
+[Install]
+WantedBy=multi-user.target

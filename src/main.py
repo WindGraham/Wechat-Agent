@@ -263,6 +263,42 @@ def _bridge_notify_queue(notify_queue, unified_queue, stop_ev):
                                   source="notify")
 
 
+# agent 侧 task_done 回调端口（独立网关模式用）：默认 127.0.0.1:13015
+TASK_DONE_CALLBACK_PORT = 13015
+
+
+def _start_task_done_callback(comp):
+    """启动极薄的本地 HTTP 回调：网关 /api/task_done 转发到这里，
+    注入 proxy.inject_task_done（进程外任务完成回执，2026-08-09 用户要求）。
+
+    独立网关模式：网关进程拿不到本进程的 proxy 对象，故用本地端口桥接。
+    失败只记日志，不影响主流程。"""
+    proxy = comp.get("proxy")
+    if proxy is None:
+        return
+
+    from flask import Flask, jsonify, request
+    cb_app = Flask("agent-callback")
+
+    @cb_app.route("/task_done", methods=["POST"])
+    def _task_done():
+        task_id = (request.get_json(silent=True) or {}).get("task_id", "")
+        if not task_id:
+            return jsonify({"ok": False, "error": "缺 task_id"}), 400
+        return jsonify({"ok": bool(proxy.inject_task_done(task_id))})
+
+    port = int(os.environ.get("WECHAT_AGENT_CALLBACK_PORT",
+                              TASK_DONE_CALLBACK_PORT))
+    cb = threading.Thread(
+        target=lambda: cb_app.run(host="127.0.0.1", port=port,
+                                  debug=False, use_reloader=False,
+                                  threaded=True),
+        daemon=True, name="task-done-callback")
+    cb.start()
+    comp["task_done_callback"] = cb
+    log.info("task_done 回调端口已启动: 127.0.0.1:%d", port)
+
+
 # ------------------------------------------------------------------ 入口
 def main(argv=None):
     parser = argparse.ArgumentParser(
@@ -279,6 +315,9 @@ def main(argv=None):
                         help="只装配不启动：打印装配清单后退出（不触设备）")
     parser.add_argument("--once", action="store_true",
                         help="主循环只跑一轮（冒烟用）")
+    parser.add_argument("--with-gateway", action="store_true",
+                        help="开发模式：本进程内嵌网关线程（生产用独立网关进程，"
+                             "见 run.sh / python -m src.gateway）")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="DEBUG 日志")
     args = parser.parse_args(argv)
@@ -302,22 +341,29 @@ def main(argv=None):
 
     comp["bridge"].start()
 
-    # 网关随主程序一并启动（管理面：prompt/人格/配置/状态）
-    try:
-        from .gateway import create_app
-        gw_host = os.environ.get("WECHAT_AGENT_GATEWAY_HOST", "127.0.0.1")
-        gw_port = int(os.environ.get("WECHAT_AGENT_GATEWAY_PORT", "13014"))
-        gw_app = create_app(proxy=comp.get("proxy"))
-        gw = threading.Thread(
-            target=lambda: gw_app.run(host=gw_host, port=gw_port,
-                                      debug=False, use_reloader=False,
-                                      threaded=True),
-            daemon=True, name="gateway")
-        gw.start()
-        comp["gateway"] = gw
-        log.info("gateway started on %s:%d", gw_host, gw_port)
-    except Exception as e:
-        log.warning("网关启动失败（不影响主流程）: %s", e)
+    # agent 侧 task_done 回调端口（独立网关模式：网关 /api/task_done 转发至此）
+    _start_task_done_callback(comp)
+
+    # 开发模式内嵌网关（生产用独立网关进程：python -m src.gateway）
+    if args.with_gateway:
+        try:
+            from .gateway import create_app
+            gw_host = os.environ.get("WECHAT_AGENT_GATEWAY_HOST", "127.0.0.1")
+            gw_port = int(os.environ.get("WECHAT_AGENT_GATEWAY_PORT", "13014"))
+            gw_app = create_app(proxy=comp.get("proxy"))
+            gw = threading.Thread(
+                target=lambda: gw_app.run(host=gw_host, port=gw_port,
+                                          debug=False, use_reloader=False,
+                                          threaded=True),
+                daemon=True, name="gateway")
+            gw.start()
+            comp["gateway"] = gw
+            log.info("gateway (embedded) started on %s:%d", gw_host, gw_port)
+        except Exception as e:
+            log.warning("内嵌网关启动失败（不影响主流程）: %s", e)
+    else:
+        log.info("独立网关模式：本进程不内嵌网关，"
+                 "管理面请访问 python -m src.gateway（run.sh）")
 
     loop = comp["loop"]
     try:

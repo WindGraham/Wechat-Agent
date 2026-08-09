@@ -47,14 +47,22 @@ _RUNTIME_FIELDS = {
 _RUNTIME_INTERVAL_FIELDS = ("sweep_interval", "notify_interval")
 
 
-def create_app(project_root=None, proxy=None):
+def create_app(project_root=None, proxy=None, supervisor=None,
+               agent_callback_url=None):
     """Flask 应用工厂。project_root 指向仓库根（含 config/ 与 workspace/），
-    缺省取仓库根；测试传 tmp 目录副本。main.py 可用线程挂载本工厂产物。
-    proxy 注入后开放 /api/task_done（进程外任务完成回执注入）。"""
+    缺省取仓库根；测试传 tmp 目录副本。
+
+    - proxy 注入后开放 /api/task_done（进程内任务完成回执注入，内嵌模式）
+    - supervisor 注入后开放 /api/agent/*（agent 子进程管理，独立网关模式）
+    - agent_callback_url：独立网关模式下 /api/task_done 转发目标
+      （agent 侧回调端口，默认 http://127.0.0.1:13015/task_done）
+    """
     app = Flask(__name__)
     root = os.path.abspath(project_root or PROJECT_ROOT)
     app.config["PROJECT_ROOT"] = root
     app.config["PROXY"] = proxy
+    app.config["SUPERVISOR"] = supervisor
+    app.config["AGENT_CALLBACK_URL"] = agent_callback_url
 
     # ------------------------------------------------------------- 鉴权
     token = os.environ.get("WECHAT_AGENT_GATEWAY_TOKEN") or None
@@ -89,14 +97,78 @@ def create_app(project_root=None, proxy=None):
     @app.route("/api/task_done", methods=["POST"])
     def api_task_done():
         """进程外完成的任务打入回执事件（让 agent 走正常回执流程自己交付）。
-        body: {"task_id": "t..."}"""
-        p = app.config.get("PROXY")
-        if p is None:
-            return jsonify({"ok": False, "error": "proxy 未接线"}), 503
+        body: {"task_id": "t..."}
+
+        双模式：
+        - 内嵌模式（proxy 已注入）：直接调 proxy.inject_task_done
+        - 独立网关模式：转发到 agent 侧回调端口（agent_callback_url）
+        """
         task_id = (request.get_json(silent=True) or {}).get("task_id", "")
         if not task_id:
             return jsonify({"ok": False, "error": "缺 task_id"}), 400
-        return jsonify({"ok": bool(p.inject_task_done(task_id))})
+        p = app.config.get("PROXY")
+        if p is not None:
+            return jsonify({"ok": bool(p.inject_task_done(task_id))})
+        url = app.config.get("AGENT_CALLBACK_URL")
+        if not url:
+            return jsonify({"ok": False, "error": "agent 未运行/未接线"}), 503
+        try:
+            import requests as _req
+            r = _req.post(url.rstrip("/") + "/task_done",
+                          json={"task_id": task_id}, timeout=5)
+            if r.status_code == 200:
+                return jsonify(r.json())
+            return jsonify({"ok": False,
+                            "error": f"agent 回调失败 HTTP {r.status_code}"}), 502
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": False,
+                            "error": f"agent 回调异常: {type(e).__name__}"}), 502
+
+    # -------------------------------------------------- agent 子进程管理
+    @app.route("/api/agent/status")
+    def api_agent_status():
+        """agent 子进程状态（独立网关模式；内嵌模式返回 embedded）。"""
+        sup = app.config.get("SUPERVISOR")
+        if sup is None:
+            return jsonify({"ok": True, "mode": "embedded"})
+        return jsonify({"ok": True, "mode": "supervised",
+                        "agent": sup.status()})
+
+    @app.route("/api/agent/start", methods=["POST"])
+    def api_agent_start():
+        sup = app.config.get("SUPERVISOR")
+        if sup is None:
+            return jsonify({"ok": False, "error": "网关未以独立模式运行"}), 400
+        ok = sup.start()
+        return jsonify({"ok": ok, "agent": sup.status()})
+
+    @app.route("/api/agent/stop", methods=["POST"])
+    def api_agent_stop():
+        sup = app.config.get("SUPERVISOR")
+        if sup is None:
+            return jsonify({"ok": False, "error": "网关未以独立模式运行"}), 400
+        sup.stop()
+        return jsonify({"ok": True, "agent": sup.status()})
+
+    @app.route("/api/agent/restart", methods=["POST"])
+    def api_agent_restart():
+        sup = app.config.get("SUPERVISOR")
+        if sup is None:
+            return jsonify({"ok": False, "error": "网关未以独立模式运行"}), 400
+        ok = sup.restart()
+        return jsonify({"ok": ok, "agent": sup.status()})
+
+    @app.route("/api/agent/logs")
+    def api_agent_logs():
+        """agent.log 尾部 n 行（控制台页展示）。"""
+        sup = app.config.get("SUPERVISOR")
+        if sup is None:
+            return jsonify({"ok": False, "error": "网关未以独立模式运行"}), 400
+        try:
+            n = int(request.args.get("n", "200"))
+        except ValueError:
+            n = 200
+        return jsonify({"ok": True, "log": sup.logs_tail(n)})
 
     # ------------------------------------------------------------- 文件列表
     @app.route("/api/files")
@@ -448,109 +520,320 @@ INDEX_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Wechat-Agent 网关</title>
 <style>
-  :root { --bg:#14181d; --panel:#1c2128; --border:#30363d; --fg:#c9d1d9;
-          --dim:#8b949e; --accent:#1f6feb; --warn:#d29922; --bad:#f85149; }
+  /* ============ Cohere design system (DESIGN.md) ============ */
+  :root {
+    --primary: #17171c;        /* cohere near-black */
+    --ink: #212121;
+    --canvas: #ffffff;
+    --stone: #eeece7;          /* soft warm neutral */
+    --pale-green: #edfce9;
+    --pale-blue: #f1f5ff;
+    --hairline: #d9d9dd;
+    --border-light: #e5e7eb;
+    --card-border: #f2f2f2;
+    --muted: #93939f;
+    --slate: #75758a;
+    --body-muted: #616161;
+    --action-blue: #1863dc;
+    --focus-blue: #4c6ee6;
+    --coral: #ff7759;
+    --coral-soft: #ffad9b;
+    --deep-green: #003c33;
+    --form-focus: #9b60aa;
+    --error: #b30000;
+    --r-xs: 4px; --r-sm: 8px; --r-md: 16px; --r-lg: 22px; --r-pill: 32px;
+  }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
-         margin: 0; background: var(--bg); color: var(--fg); }
-  header { background: var(--panel); border-bottom: 1px solid var(--border);
-           padding: 8px 16px; }
-  header h1 { font-size: 16px; margin: 0; display: inline-block; }
-  nav { display: inline-block; margin-left: 24px; }
-  nav button { margin-right: 6px; padding: 4px 14px; background: #21262d;
-               color: var(--fg); border: 1px solid var(--border);
-               border-radius: 6px; cursor: pointer; }
-  nav button:hover { border-color: var(--dim); }
-  nav button.active { background: var(--accent); border-color: var(--accent);
-                      color: #fff; }
-  main { display: flex; height: calc(100vh - 40px); }
-  #sidebar { width: 280px; overflow: auto; border-right: 1px solid var(--border);
-             padding: 8px; }
-  #sidebar .f { padding: 3px 6px; cursor: pointer; border-radius: 4px;
-                font-size: 13px; }
-  #sidebar .f:hover { background: #21262d; }
-  #sidebar .f.active { background: #1f3355; }
-  #sidebar .tag { font-size: 11px; color: #fff; border-radius: 3px;
-                  padding: 0 4px; margin-right: 4px; }
-  .tag.system { background: #587; } .tag.user { background: #975; }
-  .tag.persona { background: #759; } .tag.order { background: #555; }
-  #editor { flex: 1; display: flex; flex-direction: column; padding: 8px; }
-  #editor textarea { flex: 1; font-family: monospace; font-size: 13px;
-                     width: 100%; background: #0d1117; color: var(--fg);
-                     border: 1px solid var(--border); border-radius: 6px;
-                     padding: 8px; }
-  #bar { padding: 6px 0; }
-  #bar button, .pane button { background: #21262d; color: var(--fg);
-    border: 1px solid var(--border); border-radius: 6px; padding: 4px 14px;
-    cursor: pointer; }
-  #dirty { color: var(--warn); font-weight: bold; margin-left: 12px; }
-  .pane { flex: 1; overflow: auto; padding: 12px; display: none; }
-  .card { background: var(--panel); border: 1px solid var(--border);
-          border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; }
-  .card h2 { font-size: 14px; margin: 0 0 8px; color: var(--dim);
-             font-weight: 600; }
+  html, body { height: 100%; }
+  body {
+    font-family: 'Unica77', 'Inter', -apple-system, 'PingFang SC',
+                 'Microsoft YaHei', sans-serif;
+    margin: 0; background: var(--canvas); color: var(--ink);
+    font-size: 15px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  /* ---------- 布局：左侧深色侧边栏 + 右侧内容区 ---------- */
+  .app { display: flex; height: 100vh; overflow: hidden; }
+  .sidebar {
+    width: 236px; min-width: 236px; background: var(--primary);
+    color: #fff; display: flex; flex-direction: column;
+    padding: 20px 12px; overflow-y: auto;
+  }
+  .brand { padding: 4px 12px 20px; border-bottom: 1px solid rgba(255,255,255,.08); }
+  .brand .logo { font-size: 17px; font-weight: 600; letter-spacing: -.3px; }
+  .brand .sub { font-size: 11px; color: var(--muted); margin-top: 2px;
+                text-transform: uppercase; letter-spacing: .12em; }
+  .nav { flex: 1; padding: 16px 0; }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; margin-bottom: 2px;
+    color: rgba(255,255,255,.72); font-size: 14px;
+    border-radius: var(--r-sm); cursor: pointer; border: none;
+    background: transparent; width: 100%; text-align: left;
+    font-family: inherit; transition: background .15s, color .15s;
+  }
+  .nav-item:hover { background: rgba(255,255,255,.08); color: #fff; }
+  .nav-item.active { background: #fff; color: var(--primary); font-weight: 600; }
+  .nav-item .ico { width: 18px; text-align: center; font-size: 14px; opacity: .85; }
+  .nav-foot { padding: 12px; border-top: 1px solid rgba(255,255,255,.08);
+              font-size: 11px; color: var(--muted); }
+
+  /* ---------- 主内容区 ---------- */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 28px; border-bottom: 1px solid var(--border-light);
+    background: var(--canvas);
+  }
+  .topbar h1 { font-size: 15px; font-weight: 500; margin: 0; letter-spacing: .2px; }
+  .topbar .page { font-size: 13px; color: var(--muted); }
+  .content { flex: 1; overflow: hidden; position: relative; }
+
+  .pane {
+    position: absolute; inset: 0; overflow-y: auto; padding: 24px 28px;
+    display: none;
+  }
+  .pane.active { display: block; }
+
+  /* ---------- 模块化卡片（块内可滚动） ---------- */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .grid2 .span2 { grid-column: 1 / -1; }
+  @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--canvas); border: 1px solid var(--border-light);
+    border-radius: var(--r-md); padding: 18px 20px;
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .card > h2 {
+    font-size: 11px; font-weight: 600; margin: 0 0 12px;
+    color: var(--slate); text-transform: uppercase;
+    letter-spacing: .14em; display: flex; align-items: center;
+    justify-content: space-between;
+  }
+  .card .scroll {
+    overflow-y: auto; min-height: 120px; flex: 1;
+  }
+  .card .scroll.tall { max-height: 46vh; }
+  .card .scroll.mid { max-height: 34vh; }
+
+  /* ---------- 按钮（药丸，Cohere button-primary） ---------- */
+  .btn {
+    font-family: inherit; font-size: 13px; font-weight: 500;
+    padding: 8px 20px; border-radius: var(--r-pill); cursor: pointer;
+    border: 1px solid var(--primary); background: var(--primary); color: #fff;
+    transition: opacity .15s, background .15s; line-height: 1.6;
+  }
+  .btn:hover { opacity: .85; }
+  .btn.ghost { background: transparent; color: var(--primary); }
+  .btn.ghost:hover { background: rgba(23,23,28,.06); opacity: 1; }
+  .btn.danger { background: #fff; color: var(--error);
+                border-color: var(--error); }
+  .btn.danger:hover { background: var(--error); color: #fff; opacity: 1; }
+  .btn.sm { padding: 5px 14px; font-size: 12px; }
+
+  /* ---------- 表单 ---------- */
+  input[type=text], input[type=number], select, textarea {
+    font-family: inherit; font-size: 13px; color: var(--ink);
+    background: var(--canvas); border: 1px solid var(--hairline);
+    border-radius: var(--r-xs); padding: 7px 10px; outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--form-focus);
+    box-shadow: 0 0 0 3px rgba(155,96,170,.15);
+  }
+  input[type=text], input[type=number] { width: 100%; max-width: 340px; }
+  input[type=checkbox] { accent-color: var(--primary); width: 16px; height: 16px; }
+
+  /* ---------- 表格（research-table 风格：细线分隔） ---------- */
   table { border-collapse: collapse; width: 100%; }
-  td, th { border-bottom: 1px solid var(--border); padding: 4px 8px;
-           font-size: 13px; text-align: left; }
-  th { color: var(--dim); font-weight: 600; }
-  tr.action td { background: rgba(210, 153, 34, .12); }
-  tr.unread td { color: var(--bad); }
-  tr.unread td:first-child { font-weight: 600; }
-  input[type=text], input[type=number] { width: 220px; background: #0d1117;
-    color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
-    padding: 3px 6px; }
-  pre { background: #0d1117; border: 1px solid var(--border);
-        border-radius: 6px; padding: 8px; font-size: 12px; }
-  #msg { margin-left: 12px; color: #3fb950; }
-  .dim { color: var(--dim); }
-  .ev { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 12px; padding: 3px 0; border-bottom: 1px solid #21262d; }
-  .ev .ts { color: var(--dim); margin-right: 8px; }
-  .ev .etype { display: inline-block; min-width: 110px; color: #79c0ff; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+       color: var(--slate); font-weight: 600; text-align: left;
+       padding: 8px 10px; border-bottom: 1px solid var(--hairline); }
+  td { padding: 8px 10px; font-size: 13px; border-bottom: 1px solid var(--card-border);
+       vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr.action td { background: rgba(255,119,89,.07); }
+  tr.unread td { color: var(--error); font-weight: 500; }
+
+  /* ---------- 状态徽章 ---------- */
+  .badge { display: inline-block; padding: 2px 10px; border-radius: var(--r-pill);
+           font-size: 11px; font-weight: 600; letter-spacing: .04em; }
+  .badge.running { background: var(--pale-green); color: var(--deep-green); }
+  .badge.stopped { background: var(--stone); color: var(--body-muted); }
+  .badge.crashed { background: #fdecec; color: var(--error); }
+  .badge.coral { background: var(--coral-soft); color: #5a1f10; }
+
+  /* ---------- 事件流 / 日志 ---------- */
+  pre { margin: 0; font-family: 'SF Mono', ui-monospace, Menlo, Consolas,
+                     monospace; font-size: 12px; line-height: 1.55;
+        white-space: pre-wrap; word-break: break-all; }
+  .log-pre { background: var(--primary); color: #d7d7dc; border-radius: var(--r-sm);
+             padding: 14px; }
+  .ev { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px;
+        padding: 5px 0; border-bottom: 1px solid var(--card-border); }
+  .ev .ts { color: var(--muted); margin-right: 10px; }
+  .ev .etype { display: inline-block; min-width: 120px; color: var(--action-blue);
+               font-weight: 600; }
   .ev details summary { cursor: pointer; list-style: none; }
   .ev details summary::-webkit-details-marker { display: none; }
-  .ev details summary .etype::before { content: "▸ "; color: var(--dim); }
+  .ev details summary .etype::before { content: "▸ "; color: var(--muted); }
   .ev details[open] summary .etype::before { content: "▾ "; }
-  .ev pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0;
-            max-height: 420px; overflow: auto; }
+  .ev pre { white-space: pre-wrap; word-break: break-all; margin: 6px 0 2px;
+            max-height: 340px; overflow: auto; background: var(--stone);
+            border-radius: var(--r-xs); padding: 10px; color: var(--ink); }
+
+  .dim { color: var(--muted); }
+  .ok { color: var(--deep-green); }
+  .warn { color: #b45309; }
+
+  /* ---------- 编辑器页（prompts / personas） ---------- */
+  .editor-wrap { display: flex; gap: 20px; height: 100%; }
+  .filelist {
+    width: 300px; min-width: 300px; background: var(--canvas);
+    border: 1px solid var(--border-light); border-radius: var(--r-md);
+    overflow-y: auto; padding: 10px;
+  }
+  .filelist .f {
+    padding: 8px 10px; cursor: pointer; border-radius: var(--r-sm);
+    font-size: 13px; display: flex; align-items: center; gap: 8px;
+    border-bottom: 1px solid var(--card-border);
+  }
+  .filelist .f:hover { background: var(--stone); }
+  .filelist .f.active { background: var(--pale-blue); }
+  .filelist .tag { font-size: 10px; color: #fff; border-radius: var(--r-pill);
+                   padding: 1px 8px; text-transform: uppercase;
+                   letter-spacing: .06em; }
+  .tag.system { background: #5b6472; } .tag.user { background: #8a5a9e; }
+  .tag.persona { background: #3d7a6f; } .tag.order { background: #6b7280; }
+  .editor {
+    flex: 1; display: flex; flex-direction: column; min-width: 0;
+    background: var(--canvas); border: 1px solid var(--border-light);
+    border-radius: var(--r-md); overflow: hidden;
+  }
+  .editor .bar { display: flex; align-items: center; gap: 12px;
+                 padding: 10px 14px; border-bottom: 1px solid var(--border-light); }
+  .editor .bar #cur { font-size: 12px; color: var(--slate); flex: 1;
+                      font-family: ui-monospace, monospace; overflow: hidden;
+                      text-overflow: ellipsis; white-space: nowrap; }
+  .editor textarea {
+    flex: 1; border: none; border-radius: 0; resize: none;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 13px;
+    line-height: 1.6; padding: 16px; background: var(--canvas);
+  }
+  #dirty { color: #b45309; font-weight: 600; font-size: 12px; }
+  #msg, #rt_msg, #env_msg, #agent_msg { font-size: 12px; color: var(--deep-green); }
+
+  /* 实况页专用小卡 */
+  .stat-chip { display: inline-flex; align-items: center; gap: 6px;
+               background: var(--stone); border-radius: var(--r-pill);
+               padding: 4px 12px; font-size: 12px; color: var(--body-muted); }
+  .chip-row { display: flex; gap: 8px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
-<header>
-  <h1>Wechat-Agent 网关</h1>
-  <nav>
-    <button data-tab="live" onclick="showTab('live')">实况</button>
-    <button data-tab="prompts" onclick="showTab('prompts')">Prompt 编辑</button>
-    <button data-tab="personas" onclick="showTab('personas')">人格卡</button>
-    <button data-tab="groups" onclick="showTab('groups')">群聊配置</button>
-    <button data-tab="runtime" onclick="showTab('runtime')">运行配置</button>
-    <button data-tab="env" onclick="showTab('env')">密钥</button>
-    <button data-tab="status" onclick="showTab('status')">状态</button>
-  </nav>
-</header>
-<main>
-  <div id="sidebar"></div>
-  <div id="editor">
-    <div id="bar">
-      <span id="cur">未选择文件</span>
-      <button onclick="saveFile()">保存</button>
-      <span id="dirty" style="display:none">● 未保存</span>
-      <span id="msg"></span>
+<div class="app">
+  <!-- 左侧深色侧边栏：导航 -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">Wechat-Agent</div>
+      <div class="sub">Control Plane</div>
     </div>
-    <textarea id="ta" oninput="markDirty()"
-      placeholder="左侧选择文件开始编辑"></textarea>
+    <nav class="nav" id="nav">
+      <button class="nav-item" data-tab="live" onclick="showTab('live')">
+        <span class="ico">◉</span>实况
+      </button>
+      <button class="nav-item" data-tab="console" onclick="showTab('console')">
+        <span class="ico">▶</span>控制台
+      </button>
+      <button class="nav-item" data-tab="prompts" onclick="showTab('prompts')">
+        <span class="ico">✎</span>Prompt 编辑
+      </button>
+      <button class="nav-item" data-tab="personas" onclick="showTab('personas')">
+        <span class="ico">♟</span>人格卡
+      </button>
+      <button class="nav-item" data-tab="groups" onclick="showTab('groups')">
+        <span class="ico">☰</span>群聊配置
+      </button>
+      <button class="nav-item" data-tab="runtime" onclick="showTab('runtime')">
+        <span class="ico">⚙</span>运行配置
+      </button>
+      <button class="nav-item" data-tab="env" onclick="showTab('env')">
+        <span class="ico">🔑</span>密钥
+      </button>
+      <button class="nav-item" data-tab="status" onclick="showTab('status')">
+        <span class="ico">▤</span>状态
+      </button>
+    </nav>
+    <div class="nav-foot">gateway · 13014<br>agent 由控制台管理</div>
+  </aside>
+
+  <!-- 右侧主内容区 -->
+  <div class="main">
+    <div class="topbar">
+      <h1 id="page-title">实况</h1>
+      <div class="page" id="page-sub"></div>
+    </div>
+    <div class="content">
+
+      <!-- 实况：模块化卡片 -->
+      <div class="pane" id="pane-live">
+        <div class="grid2">
+          <div class="card"><h2>时序队列</h2>
+            <div class="scroll mid" id="live-queue"></div></div>
+          <div class="card"><h2>首页红点</h2>
+            <div class="scroll mid" id="live-home"></div></div>
+          <div class="card span2"><h2>Proxy 流水</h2>
+            <div class="scroll tall" id="live-events"></div></div>
+          <div class="card span2"><h2>原子操作</h2>
+            <div class="scroll tall" id="live-ops"></div></div>
+        </div>
+      </div>
+
+      <!-- 控制台：agent 管理 -->
+      <div class="pane" id="pane-console">
+        <div class="grid2">
+          <div class="card"><h2>Agent 控制</h2>
+            <div id="console-status"></div></div>
+          <div class="card"><h2>Agent 日志 <span class="badge coral">尾部 200 行</span></h2>
+            <div class="scroll tall" id="console-log"></div></div>
+        </div>
+      </div>
+
+      <!-- Prompt / 人格卡 编辑器 -->
+      <div class="pane" id="pane-editor" style="padding:0">
+        <div class="editor-wrap" style="height:100%">
+          <div class="filelist" id="filelist"></div>
+          <div class="editor">
+            <div class="bar">
+              <span id="cur">未选择文件</span>
+              <button class="btn sm" onclick="saveFile()">保存</button>
+              <span id="dirty" style="display:none">● 未保存</span>
+              <span id="msg"></span>
+            </div>
+            <textarea id="ta" oninput="markDirty()"
+              placeholder="左侧选择文件开始编辑"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- 群聊配置 -->
+      <div class="pane" id="pane-groups"></div>
+      <!-- 运行配置 -->
+      <div class="pane" id="pane-runtime"></div>
+      <!-- 密钥 -->
+      <div class="pane" id="pane-env"></div>
+      <!-- 状态 -->
+      <div class="pane" id="pane-status"></div>
+
+    </div>
   </div>
-  <div class="pane" id="pane-live">
-    <div class="card"><h2>时序队列</h2><div id="live-queue"></div></div>
-    <div class="card"><h2>首页红点</h2><div id="live-home"></div></div>
-    <div class="card"><h2>Proxy 流水</h2><div id="live-events"></div></div>
-    <div class="card"><h2>原子操作</h2><div id="live-ops"></div></div>
-  </div>
-  <div class="pane" id="pane-groups"></div>
-  <div class="pane" id="pane-runtime"></div>
-  <div class="pane" id="pane-env"></div>
-  <div class="pane" id="pane-status"></div>
-</main>
+</div>
 <script>
 let curPath = null, savedContent = "", dirty = false, curTab = "live";
 
@@ -573,19 +856,87 @@ window.onbeforeunload = () => dirty ? '有未保存的修改' : null;
 function showTab(name) {
   curTab = name;
   const editing = (name === 'prompts' || name === 'personas');
-  document.getElementById('editor').style.display = editing ? 'flex' : 'none';
-  document.getElementById('sidebar').style.display = editing ? '' : 'none';
-  for (const p of ['live', 'groups', 'runtime', 'env', 'status'])
-    document.getElementById('pane-' + p).style.display =
-      (p === name) ? 'block' : 'none';
-  for (const b of document.querySelectorAll('nav button'))
+  const titles = {live:'实况', console:'控制台', prompts:'Prompt 编辑',
+                  personas:'人格卡', groups:'群聊配置', runtime:'运行配置',
+                  env:'密钥', status:'状态'};
+  const subs = {live:'队列 · 红点 · 决策流水', console:'Agent 进程管理',
+                prompts:'输出协议 / 工具说明 / 模板', personas:'各会话态度卡',
+                groups:'每群热情度', runtime:'runtime.json 热生效',
+                env:'workspace/.env 脱敏', status:'队列 / 水位 / 任务台账'};
+  document.getElementById('page-title').textContent = titles[name] || name;
+  document.getElementById('page-sub').textContent = subs[name] || '';
+  // 所有 pane 隐藏，只显示当前
+  for (const p of ['live', 'console', 'groups', 'runtime', 'env', 'status'])
+    document.getElementById('pane-' + p).classList.toggle('active',
+                                                          p === name);
+  // 编辑器页共用 pane-editor
+  document.getElementById('pane-editor').classList.toggle('active', editing);
+  // 侧边栏高亮
+  for (const b of document.querySelectorAll('.nav-item'))
     b.classList.toggle('active', b.dataset.tab === name);
   if (editing) loadFiles(name);
   if (name === 'live') loadLive();
+  if (name === 'console') loadConsole();
   if (name === 'groups') loadGroups();
   if (name === 'runtime') loadRuntime();
   if (name === 'env') loadEnv();
   if (name === 'status') loadStatus();
+}
+
+// ------------------------------------------------------------- 控制台（agent 管理）
+let AGENT_TIMER = null;
+function loadConsole() {
+  api('/api/agent/status').then(j => {
+    if (j.mode === 'embedded') {
+      document.getElementById('console-status').innerHTML =
+        '<p class="dim">网关以内嵌模式运行（随 agent 主进程），无需在网关上管理。</p>';
+      document.getElementById('console-log').innerHTML =
+        '<p class="dim">日志由 agent 进程输出。</p>';
+      return;
+    }
+    const a = j.agent || {};
+    const state = a.state || 'unknown';
+    const pid = a.pid ? ('PID ' + a.pid) : '-';
+    const st = a.started_at ? new Date(a.started_at * 1000).toLocaleTimeString()
+                            : '-';
+    const exit = a.exit ? ('退出码 ' + a.exit.code +
+                            (a.exit.ts ? ' @ ' + new Date(a.exit.ts * 1000)
+                             .toLocaleTimeString() : '')) : '';
+    document.getElementById('console-status').innerHTML =
+      '<div class="chip-row" style="margin-bottom:14px">' +
+      '<span class="badge ' + state + '">' + state + '</span>' +
+      '<span class="stat-chip">' + pid + '</span>' +
+      '<span class="stat-chip">启动 ' + st + '</span>' +
+      (exit ? '<span class="stat-chip">' + esc(exit) + '</span>' : '') +
+      '</div>' +
+      '<div style="display:flex;gap:10px">' +
+      '<button class="btn" onclick="agentAction(\'start\')">启动</button>' +
+      '<button class="btn ghost" onclick="agentAction(\'stop\')">停止</button>' +
+      '<button class="btn ghost" onclick="agentAction(\'restart\')">重启</button>' +
+      '</div><div style="margin-top:12px"><span id="agent_msg"></span></div>';
+    document.getElementById('console-log').innerHTML =
+      '<pre class="log-pre">' + esc(j.log || '(无日志)') + '</pre>';
+    // 运行中自动刷新日志
+    if (AGENT_TIMER) clearInterval(AGENT_TIMER);
+    if (state === 'running') {
+      AGENT_TIMER = setInterval(() => {
+        api('/api/agent/logs?n=200').then(j => {
+          const el = document.querySelector('#console-log pre');
+          if (el && j.log) el.textContent = j.log;
+        }).catch(() => {});
+      }, 3000);
+    }
+  }).catch(e => alert(e.message));
+}
+function agentAction(action) {
+  api('/api/agent/' + action, {method: 'POST'}).then(j => {
+    const m = document.getElementById('agent_msg');
+    if (m) {
+      m.textContent = action + (j.ok ? ' 成功' : ' 失败');
+      setTimeout(() => m.textContent = '', 3000);
+    }
+    loadConsole();
+  }).catch(e => alert(e.message));
 }
 
 let GROUPS = [], LEVELS = {};
@@ -593,8 +944,8 @@ function loadGroups() {
   api('/api/groups').then(j => {
     GROUPS = j.groups; LEVELS = j.levels;
     let h = '<div class="card"><h2>群聊热情度</h2>' +
-      '<p style="color:var(--dim)">改动写入对应会话的人格卡，下一次决策即生效，无需重启。</p>' +
-      '<table><tr><th>会话</th><th>热情度</th><th>补充规则</th><th></th></tr>';
+      '<p class="dim" style="margin:0 0 12px">改动写入对应会话的人格卡，下一次决策即生效，无需重启。</p>' +
+      '<div class="scroll tall"><table><tr><th>会话</th><th>热情度</th><th>补充规则</th><th></th></tr>';
     for (const g of GROUPS) {
       let opts = '';
       for (const [k, v] of Object.entries(LEVELS))
@@ -606,10 +957,10 @@ function loadGroups() {
            '<td><input id="ex-' + encodeURIComponent(g.session) +
            '" value="' + (g.extra_rule || '').replace(/"/g, '&quot;') +
            '" style="width:220px" placeholder="选填，如：少发表情包"/></td>' +
-           '<td><button data-sess="' + encodeURIComponent(g.session) +
+           '<td><button class="btn sm" data-sess="' + encodeURIComponent(g.session) +
            '" onclick="setLevel(decodeURIComponent(this.dataset.sess))">保存</button></td></tr>';
     }
-    h += '</table></div>';
+    h += '</table></div></div>';
     document.getElementById('pane-groups').innerHTML = h;
   });
 }
@@ -628,7 +979,7 @@ function setLevel(session) {
 
 function loadFiles(which) {
   api('/api/files?dir=' + which).then(j => {
-    const sb = document.getElementById('sidebar');
+    const sb = document.getElementById('filelist');
     sb.innerHTML = '';
     for (const f of j.files) {
       const d = document.createElement('div');
@@ -683,10 +1034,11 @@ const RUNTIME_SCHEMA = [
 function loadRuntime() {
   api('/api/runtime').then(j => {
     const p = document.getElementById('pane-runtime');
-    let h = '<div class="card"><h2>运行配置（config/runtime.json）</h2><table>';
+    let h = '<div class="card"><h2>运行配置 <span class="badge coral">mtime 热生效</span></h2>' +
+            '<div class="scroll tall"><table>';
     for (const [k, t] of RUNTIME_SCHEMA) {
       const v = j.config[k];
-      h += '<tr><td>' + k + '</td><td>';
+      h += '<tr><td style="width:40%">' + k + '</td><td>';
       if (t === 'bool')
         h += '<input type="checkbox" id="rt_' + k + '"' +
              (v ? ' checked' : '') + '>';
@@ -703,8 +1055,9 @@ function loadRuntime() {
              (v ?? '') + '">';
       h += '</td></tr>';
     }
-    h += '</table><br><button onclick="saveRuntime()">保存</button>' +
-         ' <span id="rt_msg"></span></div>';
+    h += '</table></div><div style="margin-top:14px">' +
+         '<button class="btn" onclick="saveRuntime()">保存</button>' +
+         ' <span id="rt_msg"></span></div></div>';
     p.innerHTML = h;
   }).catch(e => alert(e.message));
 }
@@ -732,8 +1085,9 @@ function saveRuntime() {
 function loadEnv() {
   api('/api/env').then(j => {
     const p = document.getElementById('pane-env');
-    let h = '<div class="card"><h2>密钥（workspace/.env，脱敏显示）</h2>' +
-            '<table><tr><th>键</th><th>当前值</th>' +
+    let h = '<div class="card"><h2>密钥 <span class="badge coral">脱敏</span></h2>' +
+            '<p class="dim" style="margin:0 0 12px">workspace/.env，只落本机文件，编辑即生效。</p>' +
+            '<div class="scroll tall"><table><tr><th>键</th><th>当前值</th>' +
             '<th>新值（留空=不变）</th></tr>';
     for (const item of j.keys)
       h += '<tr><td>' + esc(item.key) + '</td><td>' + esc(item.masked) +
@@ -742,8 +1096,9 @@ function loadEnv() {
     h += '<tr><td><input type="text" id="env_newkey" ' +
          'placeholder="NEW_KEY"></td><td></td>' +
          '<td><input type="text" id="env_newval"></td></tr>';
-    h += '</table><br><button onclick="saveEnv()">保存</button>' +
-         ' <span id="env_msg"></span></div>';
+    h += '</table></div><div style="margin-top:14px">' +
+         '<button class="btn" onclick="saveEnv()">保存</button>' +
+         ' <span id="env_msg"></span></div></div>';
     p.innerHTML = h;
   }).catch(e => alert(e.message));
 }
@@ -765,13 +1120,17 @@ function loadStatus() {
   api('/api/status').then(j => {
     const p = document.getElementById('pane-status');
     const block = (title, obj) => '<div class="card"><h2>' + title +
-      '</h2>' + (obj == null ? '<p class="dim">暂无数据</p>'
-                 : '<pre>' + esc(JSON.stringify(obj, null, 2)) + '</pre>') +
-      '</div>';
-    let h = '<div class="card"><h2>时序队列（出队顺序）</h2>' +
-            queueTable(j.queue) + '</div>';
-    h += block('水位（runtime/watermarks.json）', j.watermarks);
-    h += '<div class="card"><h2>任务台账（tasks/）</h2>';
+      '</h2><div class="scroll tall">' +
+      (obj == null ? '<p class="dim">暂无数据</p>'
+                   : '<pre>' + esc(JSON.stringify(obj, null, 2)) + '</pre>') +
+      '</div></div>';
+    let h = '<div class="grid2">' +
+            '<div class="card"><h2>时序队列（出队顺序）</h2>' +
+            '<div class="scroll tall">' + queueTable(j.queue) + '</div></div>' +
+            block('水位（watermarks.json）', j.watermarks) +
+            '</div>';
+    h += '<div class="card" style="margin-top:20px"><h2>任务台账（tasks/）</h2>' +
+         '<div class="scroll tall">';
     if (!j.tasks.length) h += '<p class="dim">暂无数据</p>';
     else {
       h += '<table><tr><th>日期</th><th>task_id</th><th>会话</th>' +
@@ -782,7 +1141,7 @@ function loadStatus() {
              '</td><td>' + esc(t.status) + '</td></tr>';
       h += '</table>';
     }
-    h += '</div>';
+    h += '</div></div>';
     p.innerHTML = h;
   }).catch(e => alert(e.message));
 }
@@ -880,16 +1239,15 @@ function eventSummary(e) {
 }
 
 function renderOps(ops) {
-  if (!ops.length) return '<p>暂无数据</p>';
+  if (!ops.length) return '<p class="dim">暂无数据</p>';
   let h = '';
   for (const o of ops) {
     const ts = new Date(o.ts * 1000).toLocaleTimeString();
     const detail = Object.entries(o)
       .filter(([k]) => !['ts', 'op'].includes(k))
       .map(([k, v]) => k + '=' + v).join(' ');
-    h += '<div class="ev" style="padding:2px 6px;border-bottom:1px solid #21262d">' +
-         '<span style="color:var(--dim)">' + ts + '</span> <b>' + esc(o.op) +
-         '</b> <span style="color:var(--dim)">' + esc(detail) + '</span></div>';
+    h += '<div class="ev"><span class="ts">' + ts + '</span> <b>' + esc(o.op) +
+         '</b> <span class="dim">' + esc(detail) + '</span></div>';
   }
   return h;
 }
