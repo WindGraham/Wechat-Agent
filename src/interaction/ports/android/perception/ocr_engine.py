@@ -17,6 +17,9 @@ fill_missing_lines/enhance_small_text/ocr_badge_digit。
 import cv2
 import numpy as np
 
+import onnxruntime as _ort
+_ort.set_default_logger_severity(3)  # suppress "No registered plugin EP device" noise on CUDA 13
+
 from . import bubble_model
 
 # ---------------------------------------------------------------- OCR 单例（模块级懒加载）

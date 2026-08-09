@@ -490,7 +490,16 @@ def slice_chat(img, ocr_items, is_group, title):
                     if len(filled) > len(content):
                         content, lines = filled, filled.split("\n")
                 if content.strip():
-                    content_type = "text"
+                    # 大泡 + 极短文本 = 图片/视频泡上的 OCR 噪声（视频时长
+                    # "00:00"、图中角标文字等），不是真文字泡——真文字泡的
+                    # 尺寸随内容收紧，不会又大又只有两三个字
+                    # （2026-08-09 风图照片被识别成文字"00"实测）
+                    _tight = "".join(str(content).split())
+                    if w >= 300 and h >= 150 and len(_tight) <= 6:
+                        content_type = "multimedia"
+                        content, lines = "", []
+                    else:
+                        content_type = "text"
                 elif w <= 300 and h <= 300:
                     content_type = "multimedia"         # 小泡无字 → 表情类
                 else:
@@ -499,10 +508,16 @@ def slice_chat(img, ocr_items, is_group, title):
                     lines, low_confidence = [], True
             if content_type == "multimedia":
                 # OCR 提取段内一切可读文字，显式标注 multimedia（§2.10）
+                # 排除输入栏区域（cy >= 聚焦态栏顶 2015）：输入框里未发送的
+                # 文字和"发送"按钮在末段 y 范围内（cy~2067/2076 < 2110），
+                # 不剔除会被粘进最后一条 multimedia（实测污染日志导致锚点
+                # 永远对不上、反复 gap）。文字泡内容走 bubble_rect 分配，
+                # 不受影响。
                 rest = sorted(
                     (i for i, it in enumerate(ocr_items)
                      if not consumed[i]
                      and seg_y0 <= it["cy"] < seg_y1
+                     and it["cy"] < LC.INPUT_BAR_Y0 - 95
                      and not any(rect_contains(
                          (r[0], r[1], r[2] - r[0], r[3] - r[1]),
                          it["cx"], it["cy"]) for r in capsule_rects)),

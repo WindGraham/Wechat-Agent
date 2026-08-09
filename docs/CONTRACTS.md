@@ -45,6 +45,12 @@ get_new_since(session, last_seq) -> list[Message]  # 水位差分
 ## 二、动作与结果
 
 ```python
+ActionBundle:             # 决策层 → 交互层：一个会话的一包 XML 动作块
+    session: str
+    blocks_xml: str         # 原始 XML 动作块文本（含 <reply>/<task>/<silent/> 等块）
+    ref: str|None           # 引用的消息编号（m1..mN）
+    # 交互层 sender 负责解释执行 blocks_xml
+
 ActionResult:             # submit_bundle 的返回
     ok: bool
     error: str|None
@@ -98,6 +104,8 @@ QueueEntry:
     mention: bool   # @我/主人 → 插队队首
     payload: str    # action 时为 XML bundle 原文；notify 时为空
     attempts: int   # 行动条目已尝试次数（上限 2，耗尽排队尾）
+    sources: set[str]  # 入队来源 {"sweep", "notify", "heartbeat"}（JSON 序列化时
+                       # 需归一化为排序后的 list）
 ```
 
 ## 五、runtime.json（运行时配置字段表）

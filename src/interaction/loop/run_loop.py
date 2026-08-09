@@ -17,6 +17,7 @@ from typing import Optional
 
 from .unified_queue import UnifiedQueue
 from .journey import JourneyManager
+from ..ports.android.device import layout
 
 log = logging.getLogger("interaction.loop")
 
@@ -46,6 +47,8 @@ class InteractionLoop:
         self._sleep = time.sleep
         self._rand = random.uniform
         self._clock = time.time
+        # 好友申请兜底巡检时间戳；0 = 启动后第一个空闲周期立刻巡检一次
+        self._last_friend_probe = 0.0
 
     # ------------------------------------------------------------------ 配置
     @property
@@ -59,6 +62,18 @@ class InteractionLoop:
         if self._config:
             return getattr(self._config, 'notify_interval', (3, 6))
         return (3, 6)
+
+    @property
+    def friend_check_interval(self):
+        """好友申请兜底巡检间隔（秒，默认 1800）。
+
+        只负责"点开过详情但没通过"的残留态（红点全消但申请还在，
+        tab 红点识别永远看不到）；即时识别走 tab 红点，不靠它。
+        """
+        if self._config:
+            return getattr(self._config, 'get', lambda k, d=None: d)(
+                'friend_check_interval', 1800)
+        return 1800
 
     @property
     def is_paused(self):
@@ -76,6 +91,11 @@ class InteractionLoop:
             log.exception("wake_and_dim failed")
 
         self._watcher.start()
+        # 持续盯屏：首页红点即时入队（不等 sweep 周期）
+        from .screen_watch import ScreenWatcher
+        self._screen_watch = ScreenWatcher(self._tools, self._queue,
+                                           config=self._config)
+        self._screen_watch.start()
 
         try:
             if once:
@@ -83,6 +103,10 @@ class InteractionLoop:
             else:
                 self._main_loop()
         finally:
+            try:
+                self._screen_watch.stop()
+            except Exception:
+                log.exception("screen watch stop failed")
             try:
                 self._watcher.stop()
             except Exception:
@@ -97,6 +121,9 @@ class InteractionLoop:
         next_sweep = self._clock() + self._rand(*self.sweep_interval)
 
         while not self._stop:
+            # dirty 会话优先补同步（上一轮同步失败的会话，push 到队首）
+            self._resync_dirty()
+
             now = self._clock()
             timeout = max(0.0, next_sweep - now)
 
@@ -105,11 +132,25 @@ class InteractionLoop:
 
             now = self._clock()
             if now >= next_sweep:
-                try:
-                    self._do_sweep()
-                except Exception:
-                    log.exception("sweep failed")
+                if len(self._queue) > 0:
+                    # 队列未清空不开轮询（用户规则 2026-08-08）：
+                    # 旅程优先，sweep 顺延到下一周期
+                    log.debug("队列未清空（%d），sweep 顺延", len(self._queue))
+                else:
+                    try:
+                        self._do_sweep()
+                    except Exception:
+                        log.exception("sweep failed")
                 next_sweep = self._clock() + self._rand(*self.sweep_interval)
+
+            # 好友申请兜底巡检（队列空且距上次超过间隔）：
+            # 只抓"点开未通过"的残留态，即时识别靠 tab 红点
+            if not self.is_paused and len(self._queue) == 0:
+                if self._clock() - self._last_friend_probe >= \
+                        self.friend_check_interval:
+                    self._last_friend_probe = self._clock()
+                    log.info("好友申请兜底巡检")
+                    self._queue.push_friend(source="probe_backstop")
 
             # 乱逛：队列空时模拟真人随机浏览
             if not self.is_paused and len(self._queue) == 0:
@@ -117,11 +158,20 @@ class InteractionLoop:
 
     def _run_once(self):
         """单轮执行。"""
+        self._resync_dirty()
         try:
             self._do_sweep()
         except Exception:
             log.exception("sweep failed")
         self._drain_queue()
+
+    # ------------------------------------------------------------------ dirty 补同步
+    def _resync_dirty(self):
+        """把上一轮同步失败的 dirty 会话重新入队（mention 插到队首，优先补同步）。"""
+        for session in self._journey.take_dirty_sessions():
+            log.info("dirty resync: %s → queue front", session)
+            self._queue.push_notify(session=session, mention=True,
+                                    source="dirty_resync")
 
     # ------------------------------------------------------------------ Sweep
     def _do_sweep(self):
@@ -140,29 +190,46 @@ class InteractionLoop:
 
     # ------------------------------------------------------------------ 分发
     def _wait_and_dispatch(self, timeout: float):
-        """等队列事件（1s 轮询粒度），有事件时立即分发。"""
+        """等队列事件（1s 轮询粒度），有事件时立即分发。
+
+        暂停模式：只捕获不操作——notify 条目可丢（红点会再触发），
+        action 条目永不许丢，必须原样重新入队（保持原位置）。
+        """
         deadline = self._clock() + timeout
         while not self._stop:
             entry = self._queue.pop_next()
             if entry is not None:
                 if self.is_paused:
-                    log.debug("paused: event queued but not dispatched (%s)",
-                              entry.session)
+                    if entry.kind == "action":
+                        # 行动承载着对用户的承诺：暂停时原样放回队列
+                        log.info("paused: requeue action %s (keep position)",
+                                 entry.session)
+                        self._queue.reinsert(entry)
+                    else:
+                        log.debug("paused: drop notify %s (红点会再触发)",
+                                  entry.session)
+                    # 放回/丢弃后睡到本轮超时，避免暂停时空转
+                    self._sleep(min(1.0, max(0.0, deadline - self._clock())))
                 else:
                     self._dispatch(entry)
-                return
+                    return
             if self._clock() >= deadline:
                 return
             self._sleep(min(1.0, max(0.0, deadline - self._clock())))
 
     def _drain_queue(self):
-        """清空队列（once 模式）。"""
+        """清空队列（once 模式）。暂停时行动条目保留在队列中。"""
         while not self._stop:
             entry = self._queue.pop_next()
             if entry is None:
                 return
-            if not self.is_paused:
-                self._dispatch(entry)
+            if self.is_paused:
+                if entry.kind == "action":
+                    # 行动永不许丢：放回原位，暂停期间不再继续排空
+                    self._queue.reinsert(entry)
+                    return
+                continue  # notify 可丢（红点会再触发）
+            self._dispatch(entry)
 
     def _dispatch(self, entry):
         """分发一个队列条目到旅程管理器。"""
@@ -208,7 +275,6 @@ class InteractionLoop:
 
     def _wander_scroll_home(self):
         try:
-            import layout
             self._tools.dev.swipe_zone(
                 layout.HOME_LIST_ZONE,
                 direction="up" if self._rand(0, 1) > 0.5 else "down",
@@ -219,7 +285,6 @@ class InteractionLoop:
 
     def _wander_peek_chat(self):
         try:
-            import layout
             state = self._scanner.frame_bus.latest()
             if not state:
                 return
@@ -233,23 +298,22 @@ class InteractionLoop:
             label = target.get("label", "")
             if not label:
                 return
-            self._journey._nav.enter_session(label)
+            self._journey.navigator.enter_session(label)
             self._sleep(self._rand(2, 4))
             self._tools.dev.swipe_zone(
                 layout.CHAT_SCROLL_ZONE, direction="up",
                 length_ratio=(0.3, 0.6),
             )
             self._sleep(self._rand(1, 2))
-            self._journey._nav.back()
+            self._journey.navigator.back()
         except Exception:
             pass
 
     def _wander_switch_tab(self):
         try:
-            import layout
-            tabs = [layout.TAB_CONTACTS, layout.TAB_DISCOVER]
-            tab = tabs[int(self._rand(0, 1.99))]
-            self._tools.dev.tap_rect(tab)
+            # 只乱逛"发现"：点通讯录 tab 会把好友申请的红点信号消掉
+            # （tab 红点开一次就没，但申请还在——2026-08-09 用户规则）
+            self._tools.dev.tap_rect(layout.TAB_DISCOVER)
             self._sleep(self._rand(2, 4))
             self._tools.dev.tap_rect(layout.TAB_WECHAT)
         except Exception:

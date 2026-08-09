@@ -1,0 +1,12 @@
+rules:
+  reply_rules:
+  - condition: 私聊
+    action: 必须回复
+  - condition: 群聊中被@
+    action: 必须回复
+  - condition: 主人（风图）说话
+    action: 必须回复，优先级最高
+  - condition: 群聊普通消息
+    action: 积极回复，主动参与话题
+  special: []
+x_level: active

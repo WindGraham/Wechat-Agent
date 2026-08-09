@@ -1,4 +1,8 @@
 # 运行时数据（不进 git）
 workspace/
+data/
+logs/
+# 大型二进制工具（运行时下载/拷贝）
+tools/platform-tools/
 __pycache__/
 *.pyc

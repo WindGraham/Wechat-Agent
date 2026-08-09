@@ -23,6 +23,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS messages (
     align_key    TEXT NOT NULL,
     msg_uid      TEXT NOT NULL UNIQUE,
     mentions     TEXT DEFAULT '',
+    media_path   TEXT DEFAULT '',         -- 多媒体裁图归档路径（CONTRACTS §一）
     frame_phash  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_session_seq ON messages(session_id, seq);
@@ -89,30 +91,89 @@ class MergeError(Exception):
     """栈与日志无重叠且未到顶端：拒绝合并（宁可失败不可错拼）"""
 
 
+# 跨线程共享连接：主线程（journey 写入）与 Proxy 线程（决策读取/写回）
+# 共用同一连接——check_same_thread=False + 全模块 RLock 串行化
+_DB_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    import functools
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with _DB_LOCK:
+            return fn(*a, **kw)
+    return wrapper
+
+
 def connect(db_path):
     """打开/创建日志库。项目盘是 exfat：journal_mode 必须用 DELETE。"""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
+# 老库兼容：schema 后加列时，对已存在的 db 文件做 ALTER TABLE 补列
+_MIGRATIONS = (
+    ("messages", "media_path", "ALTER TABLE messages ADD COLUMN media_path TEXT DEFAULT ''"),
+)
+
+
+def _migrate(conn):
+    cols_cache = {}
+    for table, col, ddl in _MIGRATIONS:
+        if table not in cols_cache:
+            cols_cache[table] = {r["name"] for r in
+                                 conn.execute(f"PRAGMA table_info({table})")}
+        if col not in cols_cache[table]:
+            conn.execute(ddl)
+    conn.commit()
+
+
+@_locked
 def get_or_create_session(conn, name, is_group, name_full=None):
+    """按名字取会话，不存在才创建（is_group 只在新建时写入）。
+
+    已存在会话**绝不覆写 is_group**——读取路径（get_context/get_new_since）
+    拿不到真实 is_group，覆写会把群聊改成私聊（B4 数据破坏）。
+    旅程实测到真实值时用 set_session_kind 显式更新。"""
     row = conn.execute("SELECT session_id FROM sessions WHERE name=?",
                        (name,)).fetchone()
     if row:
-        # 更新 is_group（实测可能比配置更准确）
-        conn.execute("UPDATE sessions SET is_group=? WHERE session_id=?",
-                     (1 if is_group else 0, row["session_id"]))
-        conn.commit()
         return row["session_id"]
     cur = conn.execute(
         "INSERT INTO sessions(name, name_full, is_group, created_ts)"
         " VALUES(?,?,?,?)", (name, name_full, 1 if is_group else 0, time.time()))
     conn.commit()
     return cur.lastrowid
+
+
+@_locked
+def set_session_kind(conn, name, is_group):
+    """旅程实测到真实 is_group 后显式更新（get_or_create_session 不覆写）。
+    值无变化时不写库。返回是否发生了更新。"""
+    row = conn.execute("SELECT session_id, is_group FROM sessions WHERE name=?",
+                       (name,)).fetchone()
+    if not row:
+        return False
+    val = 1 if is_group else 0
+    if row["is_group"] == val:
+        return False
+    conn.execute("UPDATE sessions SET is_group=? WHERE session_id=?",
+                 (val, row["session_id"]))
+    conn.commit()
+    return True
+
+
+@_locked
+def get_session_kind(conn, name):
+    """查询会话 is_group（读路径补 Message.is_group 用）。未知会话返回 False。"""
+    row = conn.execute("SELECT is_group FROM sessions WHERE name=?",
+                       (name,)).fetchone()
+    return bool(row["is_group"]) if row else False
 
 
 # ---------------------------------------------------------------- 归一化与对齐键
@@ -148,6 +209,7 @@ def align_key(sender, content):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+@_locked
 def update_content(conn, session_id, sender, content, new_content):
     """按 sender+content 模糊匹配更新最近一条日志的内容（多媒体标注写回用）。
     返回更新的行数（0/1）。只查最近 20 条，防止误改老消息。"""
@@ -162,8 +224,8 @@ def update_content(conn, session_id, sender, content, new_content):
             break
     if target is None:
         return 0
-    conn.execute("UPDATE messages SET content=? WHERE id=?",
-                 (new_content, target))
+    conn.execute("UPDATE messages SET content=?, content_norm=? WHERE id=?",
+                 (new_content, normalize(new_content), target))
     conn.commit()
     return 1
 
@@ -177,10 +239,15 @@ def fuzzy_eq(sender_a, content_a, sender_b, content_b, iou=None):
     - 内容归一化后相等 -> True
     - 短消息（norm 长度<=6）必须完全相等；调用方若提供几何 IoU 则要求 IoU>0.4
     - 长消息 SequenceMatcher ratio >= 0.85
+
+    多媒体标注容忍（2026-08-08）：标注写回会在 content 尾部追加
+    "[多媒体消息…]描述"（或旧格式"\\n内容：…"），屏幕再读到的原文没有
+    这段——比较前先剥掉标注后缀，否则已标注消息永远锚不上（反复 gap）。
     """
     if normalize(sender_a) != normalize(sender_b):
         return False
-    na, nb = normalize(content_a), normalize(content_b)
+    na, nb = normalize(_strip_annotation(content_a)), \
+        normalize(_strip_annotation(content_b))
     if not na or not nb:
         # 纯标点消息（"?" / "..."）normalize 后为空串：退化为原文精确比较，
         # 否则 "?" 永远无法匹配，增量补尾会把整段底部误判为新消息（218 实测）
@@ -192,6 +259,17 @@ def fuzzy_eq(sender_a, content_a, sender_b, content_b, iou=None):
     if min(len(na), len(nb)) <= 6:
         return False
     return _ratio(na, nb) >= 0.85
+
+
+def _strip_annotation(content):
+    """剥掉多媒体标注后缀（新旧两种格式）。"""
+    if not content:
+        return ""
+    for mark in ("[多媒体消息", "\n内容:"):
+        i = content.find(mark)
+        if i >= 0:
+            content = content[:i]
+    return content
 
 
 # ---------------------------------------------------------------- 时间分割线
@@ -251,13 +329,33 @@ STACK_ANCHOR_KEYS = 12    # 取栈底（最新端）12 条参与锚定
 LOG_TAIL_N = 50           # 日志末尾参与锚定的条数
 
 
+@_locked
 def session_tail(conn, session_id, n=LOG_TAIL_N):
     """日志末尾 n 条，按 seq 升序（最新在尾）。mentions 一并取出（@我标注用）。"""
     rows = conn.execute(
-        "SELECT seq, sender, content, content_type, mentions FROM messages"
+        "SELECT seq, sender, content, content_type, mentions, media_path FROM messages"
         " WHERE session_id=? ORDER BY seq DESC LIMIT ?",
         (session_id, n)).fetchall()
     return [dict(r) for r in reversed(rows)]
+
+
+MEDIA_TYPES = {"multimedia", "image", "sticker", "voice", "video",
+               "unknown_nontext"}
+
+
+def _media_eq(entry, row):
+    """多媒体条目锚定（2026-08-08 YOUSAOBI gap 风暴修复）：媒体转换把日志行
+    content 改写成视觉描述后，屏幕重读到的占位符/缩略图 OCR 文本永远匹配不上，
+    增量分界零命中 -> 反复 gap -> backlog 锚不住 -> MergeError。
+    两侧都是多媒体且发送人一致即视为同一条（先后顺序由 LCS/分界逻辑保证，
+    媒体消息密度低，误锚风险可接受）。"""
+    if row["content_type"] == "time_divider":
+        return False
+    if row["content_type"] not in MEDIA_TYPES and not row["media_path"]:
+        return False
+    if (getattr(entry, "content_type", "text") or "text") not in MEDIA_TYPES:
+        return False
+    return normalize(_entry_sender(entry)) == normalize(row["sender"])
 
 
 def _entry_fuzzy_eq_row(entry, row):
@@ -268,6 +366,8 @@ def _entry_fuzzy_eq_row(entry, row):
                 and normalize(entry.content) == normalize(row["content"]))
     if row["content_type"] == "time_divider":
         return False
+    if _media_eq(entry, row):
+        return True
     return fuzzy_eq(entry.sender, entry.content, row["sender"], row["content"])
 
 
@@ -376,22 +476,24 @@ def _insert_rows(conn, session_id, entries, first_seq, source, captured_ts,
         else:
             complete = 1
         mentions = ",".join(getattr(e, "mentions", None) or [])
+        media_path = getattr(e, "media_path", None) or ""
         cur = conn.execute(
             "INSERT OR IGNORE INTO messages"
             "(session_id, seq, ts_hint, ts_text, ts_captured, sender,"
             " is_mine, content_type, content, content_norm, complete,"
-            " ocr_conf, source, align_key, msg_uid, mentions)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " ocr_conf, source, align_key, msg_uid, mentions, media_path)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (session_id, seq, ts_hint, ts_text, captured_ts, sender,
              1 if getattr(e, "is_mine", False) else 0, ctype, content,
              content_norm, complete, getattr(e, "ocr_conf", None), source,
-             akey, _msg_uid(session_id, seq, akey), mentions))
+             akey, _msg_uid(session_id, seq, akey), mentions, media_path))
         inserted += cur.rowcount
         min_seq = seq if min_seq is None else min(min_seq, seq)
         max_seq = seq if max_seq is None else max(max_seq, seq)
     return inserted, min_seq, max_seq
 
 
+@_locked
 def merge_stack(conn, session_id, entries, source="backfill",
                 top_reached=False, captured_ts=None):
     """临时栈 -> 正式日志，单事务（§3.3）。
@@ -477,18 +579,29 @@ def merge_stack(conn, session_id, entries, source="backfill",
 
 # ---------------------------------------------------------------- 增量 append
 def _entry_in_tail(entry, tail):
-    """栈条目是否已在日志尾（L2 模糊判定）。divider 用归一化精确等值。"""
+    """栈条目是否已在日志尾（L2 模糊判定）。divider 用归一化精确等值。
+
+    多媒体匹配只认尾部最后 3 行（2026-08-09 JY君 新表情被吞修复）：
+    媒体条目内容无法区分（转换后是描述、未转换是占位符），同发送人的
+    新表情包会被误判命中 10 行前的旧媒体行 → 被当"已记录"丢弃。
+    底部增量读到的一定是末尾几行，限制窗口不影响锚定。"""
     if getattr(entry, "kind", "msg") == "divider":
         return any(row["content_type"] == "time_divider"
                    and normalize(entry.content) == normalize(row["content"])
                    for row in tail)
     sender = _entry_sender(entry)
-    return any(row["content_type"] != "time_divider"
-               and fuzzy_eq(sender, entry.content,
-                            row["sender"], row["content"])
-               for row in tail)
+    n = len(tail)
+    for i, row in enumerate(tail):
+        if row["content_type"] == "time_divider":
+            continue
+        if i >= n - 3 and _media_eq(entry, row):
+            return True
+        if fuzzy_eq(sender, entry.content, row["sender"], row["content"]):
+            return True
+    return False
 
 
+@_locked
 def append_incremental(conn, session_id, entries, source="incremental",
                        captured_ts=None, gap_ok=False):
     """统一增量 append API（§4.2）：entries 屏内有序（早->晚）。
@@ -544,6 +657,7 @@ def append_incremental(conn, session_id, entries, source="incremental",
 
 
 # ---------------------------------------------------------------- 文本 log 导出
+@_locked
 def export_text_log(conn, session_id, out_dir):
     """库 -> 文本单向生成（§1.3）：全量重写 <out_dir>/<会话名>.log。
     时间分割线原样独立成行；非文本消息已是占位符（[图片]/[语音] 5秒…）；
@@ -583,6 +697,7 @@ def export_text_log(conn, session_id, out_dir):
 
 
 # ---------------------------------------------------------------- 版本号与水位差分（v4 新增）
+@_locked
 def increment_sync_version(conn, session_id):
     """每次成功同步（日志回传）后调用，sync_version +1。
     返回新的 version 值。"""
@@ -596,6 +711,7 @@ def increment_sync_version(conn, session_id):
     return row["sync_version"] if row else 0
 
 
+@_locked
 def get_sync_version(conn, session_id):
     """查询当前会话的同步版本号。"""
     row = conn.execute(
@@ -604,27 +720,30 @@ def get_sync_version(conn, session_id):
     return row["sync_version"] if row else 0
 
 
+@_locked
 def get_new_since(conn, session_id, last_seq):
     """水位差分：返回 seq > last_seq 的所有消息（严格大于），按 seq 升序。
 
     这是"哪些消息是新的"的唯一判定方式——不再需要通知正文猜测。
-    返回 list[dict]，每条含 seq/sender/content/content_type/is_mine/mentions/ts_hint。
+    返回 list[dict]，每条含 seq/sender/content/content_type/is_mine/mentions/
+    media_path/ts_hint。
     """
     rows = conn.execute(
         "SELECT seq, sender, content, content_type, is_mine, mentions,"
-        " ts_hint, ts_text, ts_captured"
+        " media_path, ts_hint, ts_text, ts_captured"
         " FROM messages WHERE session_id = ? AND seq > ?"
         " ORDER BY seq ASC",
         (session_id, last_seq)).fetchall()
     return [dict(r) for r in rows]
 
 
+@_locked
 def get_context(conn, session_id, n=200):
     """按量拉取历史：返回尾部 n 条消息，seq 升序（最新在尾）。
     用于拼 prompt 的历史灌注。"""
     rows = conn.execute(
         "SELECT seq, sender, content, content_type, is_mine, mentions,"
-        " ts_hint, ts_text"
+        " media_path, ts_hint, ts_text"
         " FROM messages WHERE session_id = ?"
         " ORDER BY seq DESC LIMIT ?",
         (session_id, n)).fetchall()

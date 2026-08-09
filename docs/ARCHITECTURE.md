@@ -1,6 +1,8 @@
 # Wechat-Agent 架构总览（v4）
 
 > 本文是架构唯一总纲。三层详细职责见同目录三个分文档。
+> 当前代码的实际运行时组件与数据流详图（mermaid）见
+> RUNTIME_ARCHITECTURE.md。
 
 ## 一、三层定义
 

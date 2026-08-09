@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
-"""decision — 决策层（Agent 核心）。
+"""decision — 决策层：agent 核心（回复决策权所在层）。"""
 
-如何回复用户信息，决策权全部在这一层。
-系统里唯一调用 LLM 的层。
-"""
+from .provider import create_provider, LLMProvider
+from .prompt import ContextBuilder, PromptLibrary, PersonaRenderer
+from .policy import Policy, RepliedMentionStore
+from .proxy import Proxy
+
+__all__ = ["create_provider", "LLMProvider", "ContextBuilder",
+           "PromptLibrary", "PersonaRenderer", "Policy",
+           "RepliedMentionStore", "Proxy"]

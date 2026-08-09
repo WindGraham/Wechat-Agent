@@ -31,6 +31,12 @@ BAND_Y1 = LC.INPUT_BAR_Y0         # 内容区底（输入栏顶）2110
 
 _SAFE_RE = re.compile(r'[\\/:*?"<>|]')
 
+# 归档根目录：workspace/media（相对 CWD 的默认值曾导致裁图散落仓库根）
+PROJECT_ROOT = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "..", "..", ".."))
+DEFAULT_MEDIA_ROOT = os.path.join(PROJECT_ROOT, "workspace", "media")
+
 
 def sanitize_session(name):
     """会话名 -> 合法目录名（与 msg_log.export_text_log 同规则）"""
@@ -60,7 +66,7 @@ def _crop_band(ordered, i):
 
 
 def archive_multimedia(img, session, is_group, messages,
-                       root="data/multimedia"):
+                       root=DEFAULT_MEDIA_ROOT):
     """裁出 messages 中所有 multimedia 消息的段条带并归档。
 
     img: BGR 全屏截图（与 slice_chat 输入同一张）；messages: slice_chat

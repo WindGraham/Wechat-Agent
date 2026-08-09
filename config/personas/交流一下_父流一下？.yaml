@@ -1,0 +1,6 @@
+rules:
+  reply_rules:
+  - condition: 任何消息
+    action: 沉默（输出 <silent/>），包括被@
+  special: []
+x_level: 'off'

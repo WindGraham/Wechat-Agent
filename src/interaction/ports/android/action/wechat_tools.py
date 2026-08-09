@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
-"""wechat_tools.py — Phase 3 工具层：把微信封装成 6 个语义化工具供 LLM agent 调用。
+"""wechat_tools.py — 端口工具层：把微信封装成语义化工具（发送/导航/滚动/读屏）。
 
 每个工具 = 动作 + 状态查询，返回 ToolResult（含页面文字描述 + 可用动作）。
 仅适配 OnePlus 6T (1080x2340, 深色模式) + 微信 8.0.76。
 
-依赖：src/device_ctl.py（DeviceCtl）、src/v2/state_builder.py（V2 感知层）。
+依赖：..device.device_ctl（DeviceCtl）、..perception.state_builder /
+..perception.ocr_engine（V2 感知层）。
 硬性约束：截图即读即删（capture_bytes 内存截图 + 内存解析，全程不落盘）。
 """
 
+# 本模块直接连接真实手机：以脚本方式直接运行没有任何安全的自测可做
+# （旧自测脚本会真实发消息，已移除）。闸门放在 import 之前——直接运行时
+# 包相对 import 必然失败，必须先拦住并给出说明。
+if __name__ == "__main__":
+    print("wechat_tools.py 不提供自测入口：直接运行会真实操作手机微信，已禁用。"
+          "请用离线单测（假 dev）验证逻辑。")
+    raise SystemExit(1)
+
 import logging
-import os
-import re
-import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ..device.device_ctl import DeviceCtl
 from ..perception.state_builder import build_state as _v2_build_state
@@ -51,48 +55,10 @@ class ToolResult:
         return head
 
 
-def _norm(s):
-    """名字匹配归一化：去空白和括号成员数。"""
-    if not s:
-        return ""
-    s = "".join(str(s).split())
-    for sep in ("(", "（"):
-        if sep in s:
-            s = s.split(sep)[0]
-    return s
-
-
-def _fold(s):
-    """OCR 易混字符折叠（实测："Doo" 被识别成 "Do0"）：0/O->o，小写化。"""
-    return s.lower().replace("0", "o")
-
-
-def _elide_match(elided, full):
-    """聊天页标题栏长名字会被微信省略成 '前段..后段'：分段按序匹配全文。
-    OCR 可能把省略号读成单个 '.'（2026-08-04 实测 '怨憎会爱别离要.风要雨得雨'），
-    因此单个点也按省略处理。"""
-    parts = [p for p in re.split(r"\.+|…", elided) if p]
-    if len(parts) < 2:
-        return False
-    pos = 0
-    for p in parts:
-        i = full.find(p, pos)
-        if i < 0:
-            return False
-        pos = i + len(p)
-    return True
-
-
-def _name_match(a, b):
-    a, b = _norm(a), _norm(b)
-    if not a or not b:
-        return False
-    if a == b or a in b or b in a:
-        return True
-    if "." in a or "." in b or "…" in a or "…" in b:
-        return _elide_match(a, b) or _elide_match(b, a)
-    fa, fb = _fold(a), _fold(b)          # OCR 混淆容错
-    return fa == fb or fa in fb or fb in fa
+# 名字匹配逻辑已下沉到 shared/name_match.py（scanner/sender 共用），
+# 此处 re-export 保持向后兼容
+from .....shared.name_match import (  # noqa: E402,F401
+    _norm, _fold, _elide_match, _name_match)
 
 
 # ------------------------------------------------------------------ 主类
@@ -407,7 +373,7 @@ class WeChatTools:
                 log.warning("send_text attempt %d failed: %s", attempt, r.error)
                 self.dev.wait_random(500, 900)
             # 清理输入框残留（可能仍处于聚焦态，输入栏在聚焦坐标）
-            self.dev.tap_rect(layout.CHAT_INPUT_BAR_FOCUSED)
+            self.dev.tap_rect(self._input_bar_rect())
             self.dev.wait_random(300, 600)
             self.dev.clear_text()
             self.dev.wait_random(400, 800)
@@ -427,7 +393,11 @@ class WeChatTools:
             log.info("输入栏处于语音模式，切回文本模式")
             self.dev.tap_rect(layout.CHAT_VOICE)
             self.dev.wait_random(800, 1200)
-        self.dev.tap_rect(layout.CHAT_INPUT_BAR)
+        # 上轮引用发送失败可能留下引用预览条：盖住输入框固定点按区（点不中
+        # 输入框），且不清掉本条普通发送会被当成引用发出（2026-08-08 实测）
+        from .quote_reply import dismiss_quote_preview
+        dismiss_quote_preview(self.dev)
+        self.dev.tap_rect(self._input_bar_rect())
         self.dev.wait_random(400, 800)
         self.dev.clear_text()
         self.dev.wait_random(200, 400)
@@ -435,19 +405,22 @@ class WeChatTools:
         self.dev.input_text(text)
         self.dev.wait_random(400, 800)
 
-        if not self._send_btn_visible():
+        btn = self._find_send_btn()
+        if not btn:
             # 文本仍没上屏（罕见：语音模式切换未生效/输入连接未建立）：
             # 重进一次文本模式 + 补一次广播
             self.dev.tap_rect(layout.CHAT_VOICE)
             self.dev.wait_random(600, 1000)
-            self.dev.tap_rect(layout.CHAT_INPUT_BAR)
+            self.dev.tap_rect(self._input_bar_rect())
             self.dev.wait_random(400, 700)
             self.dev.input_text(text)
             self.dev.wait_random(500, 900)
-        if not self._send_btn_visible():
+            btn = self._find_send_btn()
+        if not btn:
             return self._result(self._snap(), success=False,
                                 error="发送按钮未出现（输入未上屏？）")
-        self.dev.tap_rect(layout.SEND_BTN)
+        # 动态定位点按（引用预览条/聚焦态会顶起按钮，固定坐标会按空）
+        self.dev.tap_rect(layout.Rect(btn[0] - 60, btn[1] - 40, 120, 80))
         self.dev.wait_random(600, 1200)
 
         # 验证：最后一条消息 is_mine 且内容匹配。气泡渲染/OCR 有延迟，
@@ -477,6 +450,40 @@ class WeChatTools:
         log.warning("send 已点发送但验证未确认到气泡（假定已发出，不重发）")
         return state
 
+    def chat_is_group(self):
+        """当前聊天页是否群聊：标题栏原始 OCR 里找 "(人数)" 后缀。
+        群聊标题必带、私聊没有；state 里的 page.title 被规整过会丢掉
+        人数后缀，所以这里自己裁标题带跑一次 OCR（不过滤字高）。
+        返回 True/False；读不到标题文字返回 None（调用方自行兜底）。"""
+        import re as _re
+        from ..perception import layout_consts as LC
+        try:
+            img = self.dev.capture_bytes()
+            crop = img[LC.TITLE_Y0 - 20:LC.TITLE_Y1 + 20, 150:950]
+            items = _v2_run_ocr(crop)
+        except Exception:
+            log.exception("chat_is_group ocr failed")
+            return None
+        text = "".join((it.get("text") or "") for it in items)
+        if not text.strip():
+            return None
+        return bool(_re.search(r"[（(]\s*\d+\s*[)）]", text))
+
+    def _input_bar_rect(self):
+        """智能定位输入框点按区（类似发送键的动态定位，不认固定坐标）：
+        OCR 底部 "ADB Keyboard {ON}" 细条（y>=2100）出现 = 聚焦态，
+        输入栏被顶起 ~115px，点聚焦坐标；否则点未聚焦坐标。
+        上轮发送失败把输入栏留在聚焦态时，死点未聚焦坐标会按空
+        （2026-08-08 用户实测"点不中输入框"）。OCR 异常兜底未聚焦坐标。"""
+        try:
+            for it in _v2_run_ocr(self.dev.capture_bytes()):
+                if "ADB Keyboard" in (it.get("text") or "") \
+                        and it.get("cy", 0) >= 2100:
+                    return layout.CHAT_INPUT_BAR_FOCUSED
+        except Exception:
+            log.exception("input bar locate failed, fallback 未聚焦坐标")
+        return layout.CHAT_INPUT_BAR
+
     def _in_voice_mode(self):
         """输入栏是否语音模式：语音态中间显示"按住说话"，无文本输入框，
         ADBKeyBoard 广播无处落。OCR 输入栏条带区域判断。"""
@@ -490,95 +497,19 @@ class WeChatTools:
         except Exception:
             return False
 
-    def _send_btn_visible(self):
-        """发送按钮校验：绿掩膜扫描区内有绿色块、且 SEND_BTN 本体区域内绿色
-        占比达标（输入有字时 "+" 圆钮变为绿色"发送"按钮）。内存截图不落盘。"""
-        import cv2
+    def _find_send_btn(self):
+        """动态定位绿色发送按钮中心 (cx, cy)；找不到返回 None。
+        认颜色/文字不认坐标：引用预览条、聚焦态、面板态都会顶起按钮。"""
+        from .quote_reply import _find_send_btn as _find
+        from ..perception.ocr_engine import run_ocr
         img = self.dev.capture_bytes()
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        green = (h >= 60) & (h <= 90) & (s > 90) & (v > 80)
-        z = layout.SEND_SCAN_ZONE
-        zone_ratio = float(green[z.y:z.y + z.h, z.x:z.x + z.w].mean())
-        b = layout.SEND_BTN
-        btn_ratio = float(green[b.y:b.y + b.h, b.x:b.x + b.w].mean())
-        log.info("send btn green ratio: zone=%.3f btn=%.3f", zone_ratio, btn_ratio)
-        return zone_ratio > 0.02 and btn_ratio > 0.15
+        return _find(img, run_ocr(img))
+
+    def _send_btn_visible(self):
+        """发送按钮存在性（动态定位版，保留旧接口名）。"""
+        return self._find_send_btn() is not None
 
     def _full_ocr(self):
         """内存截图 -> 全图 OCR，返回 ocr_items（不落盘）。"""
         return _v2_run_ocr(self.dev.capture_bytes())
 
-
-# --------------------------------------------------------------------- 自测
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    tools = WeChatTools()
-
-    def show(tag, r, max_lines=14):
-        print(f"\n{'=' * 60}\n{tag}\n{r.summary()}")
-        lines = r.description.splitlines()
-        for ln in lines[:max_lines]:
-            print("  " + ln)
-        if len(lines) > max_lines:
-            print(f"  ... ({len(lines) - max_lines} more lines)")
-
-    # 1. open_wechat -> 首页 7 个会话
-    r1 = tools.open_wechat()
-    show("STEP 1: open_wechat", r1)
-    sessions = [ln for ln in r1.description.splitlines()
-                if ln and ln[0].isdigit() and ". " in ln]
-    print(f"  >> 会话数: {len(sessions)}")
-    assert r1.success and r1.page == "wechat_home", "step1 failed"
-
-    # 2. enter_session("风图")
-    r2 = tools.enter_session("风图")
-    show("STEP 2: enter_session(风图)", r2)
-    assert r2.success and r2.page == "wechat_chat", "step2 failed"
-
-    # 3. scroll_up -> 更早消息
-    r3 = tools.scroll_up()
-    show("STEP 3: scroll_up", r3)
-    changed = r3.description != r2.description
-    print(f"  >> 内容变化: {changed}")
-
-    # 4. scroll_down -> 回底部
-    r4 = tools.scroll_down()
-    show("STEP 4: scroll_down", r4)
-
-    # 5. send_text 测试消息（仅风图，仅此 1 条）
-    r5 = tools.send_text("自动回复功能测试，请忽略")
-    show("STEP 5: send_text", r5)
-    assert r5.success, "step5 failed: " + str(r5.error)
-
-    # 6. back -> 首页
-    r6 = tools.back()
-    show("STEP 6: back", r6)
-    assert r6.page == "wechat_home", f"step6: not home, got {r6.page}"
-
-    # 7. enter_session("特高课") 群聊 member_count=6
-    r7 = tools.enter_session("特高课")
-    show("STEP 7: enter_session(特高课)", r7)
-    assert r7.success, "step7 failed"
-
-    # 8. back -> 长群名会话（列表第 5 个）
-    r8 = tools.back()
-    show("STEP 8a: back", r8, max_lines=6)
-    r9 = tools.enter_session("怨憎会 爱别离 要风得风要雨得雨")
-    show("STEP 8b: enter_session(长群名)", r9)
-    assert r9.success, "step8 failed"
-
-    # 9. 搜索 fallback：enter_session("Leisure")（列表没有，可能搜不到）
-    r10 = tools.back()
-    r11 = tools.enter_session("Leisure")
-    show("STEP 9: enter_session(Leisure) 搜索fallback", r11)
-    print(f"  >> 搜索 fallback 结果: success={r11.success} error={r11.error}")
-    if r11.success:
-        tools.back()   # 真进去了就退出来，不发任何消息
-
-    # 清理残留截图
-    leftover = [f for f in os.listdir("/tmp") if f.startswith("wx_cap_")]
-    for f in leftover:
-        os.remove(os.path.join("/tmp", f))
-    print(f"\nALL DONE. leftover screenshots cleaned: {len(leftover)}")

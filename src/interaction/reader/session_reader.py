@@ -28,29 +28,54 @@ class SessionReader:
     port_reader: 端口感知层的 Reader 实例（如 ports/android/perception/reader.py 的 Reader）
     msglog_conn: 消息日志 SQLite 连接
     media_dir: 多媒体裁图归档根目录
+    owner_nick: 主人@我时的昵称（CONTRACTS §五 runtime.json owner_nick），
+        @我 判定用；空串则不按昵称匹配（仅认 @所有人）
     """
 
-    def __init__(self, port_reader, msglog_conn, media_dir: str = ""):
+    def __init__(self, port_reader, msglog_conn, media_dir: str = "",
+                 owner_nick: str = ""):
         self._pr = port_reader          # 端口感知 Reader
         self._conn = msglog_conn        # 消息日志连接
         self._media_dir = media_dir or ""
+        self._owner_nick = owner_nick or ""
         self._gap_fail: dict = {}       # session -> 连续 gap 次数
         self._on_log_updated = None     # 回调：决策层的 LogUpdated 处理器
 
     # ------------------------------------------------------------------ 决策层接口
+    def update_content(self, session: str, sender: str, content: str,
+                       new_content: str) -> int:
+        """消息内容写回（媒体标注等）。返回更新行数（0/1）。"""
+        from ..msglog import get_or_create_session, update_content as _upd
+        sid = get_or_create_session(self._conn, session, False)
+        return _upd(self._conn, sid, sender, content, new_content)
+
+    def last_is_group(self, session: str):
+        """该会话最近一次实测的群/私属性；未知返回 None（调用方自行兜底）。"""
+        try:
+            row = self._conn.execute(
+                "SELECT is_group FROM sessions WHERE name=?",
+                (session,)).fetchone()
+            return bool(row["is_group"]) if row else None
+        except Exception:  # noqa: BLE001
+            return None
+
     def get_context(self, session: str, n: int = 200) -> list:
         """按量拉取历史：返回尾部 n 条 Message，seq 升序（最新在尾）。"""
-        from ..msglog import get_or_create_session, get_context as _get_ctx
+        from ..msglog import (get_or_create_session, get_session_kind,
+                              get_context as _get_ctx)
         sid = get_or_create_session(self._conn, session, False)
+        is_group = get_session_kind(self._conn, session)
         rows = _get_ctx(self._conn, sid, n=n)
-        return [self._row_to_message(session, r) for r in rows]
+        return [self._row_to_message(session, r, is_group) for r in rows]
 
     def get_new_since(self, session: str, last_seq: int) -> list:
         """水位差分：返回 seq > last_seq 的新消息，seq 升序。"""
-        from ..msglog import get_or_create_session, get_new_since as _get_new
+        from ..msglog import (get_or_create_session, get_session_kind,
+                              get_new_since as _get_new)
         sid = get_or_create_session(self._conn, session, False)
+        is_group = get_session_kind(self._conn, session)
         rows = _get_new(self._conn, sid, last_seq)
-        return [self._row_to_message(session, r) for r in rows]
+        return [self._row_to_message(session, r, is_group) for r in rows]
 
     # ------------------------------------------------------------------ 同步流程（进会话→读屏→写库→回传）
     def sync_session(self, session: str, is_group: bool) -> Optional[LogUpdated]:
@@ -59,10 +84,13 @@ class SessionReader:
         流程：读当前屏 → 增量写库（gap 自愈）→ 版本号+1 → 返回 LogUpdated。
         返回 None 表示同步失败。
         """
-        from ..msglog import (get_or_create_session, append_incremental,
+        from ..msglog import (get_or_create_session, set_session_kind,
+                              append_incremental,
                               increment_sync_version, get_sync_version)
 
         sid = get_or_create_session(self._conn, session, is_group)
+        # 旅程实测到真实 is_group，显式写回（get_or_create_session 不覆写）
+        set_session_kind(self._conn, session, is_group)
 
         # 1. 读取当前屏
         try:
@@ -100,7 +128,7 @@ class SessionReader:
 
     def _append_gap_aware(self, sid: int, session: str, entries: list) -> list:
         """增量写库；gap → 积压上翻收集；连续失败达上限 → 强制追加。"""
-        from ..msglog import append_incremental, merge_stack
+        from ..msglog import append_incremental
 
         r = append_incremental(self._conn, sid, entries,
                                captured_ts=time.time())
@@ -123,8 +151,15 @@ class SessionReader:
                  session, self._gap_fail[session], self.GAP_FORCE_CAP)
         try:
             backlog, _ = self._pr.read_backlog(session)
-            mr = merge_stack(self._conn, sid, backlog,
-                             captured_ts=time.time())
+            # backlog 从当前屏底部向上翻，覆盖区间比日志尾"更新"——正确接法是
+            # 用 append_incremental 把 backlog 顶部锚进日志尾、其余续写
+            # （merge_stack 是回填语义：锚栈底最旧 N 条，前向缺口永远锚不住，
+            # 2026-08-08 YOUSAOBI 69 条未读反复 MergeError 的根因）
+            r1 = append_incremental(self._conn, sid, backlog,
+                                    captured_ts=time.time())
+            if r1.get("gap"):
+                from ..msglog.message_log import MergeError
+                raise MergeError("backlog 上翻 %d 条仍未触及日志尾" % len(backlog))
             # 合并后再试增量
             r2 = append_incremental(self._conn, sid, entries,
                                     captured_ts=time.time())
@@ -152,24 +187,35 @@ class SessionReader:
         if tagged:
             log.info("[%s] media tagged: %d non-text items", session, tagged)
 
-    @staticmethod
-    def _is_at_me(e) -> bool:
-        """检查条目是否 @我。"""
-        mentions = getattr(e, "mentions", None) or []
+    def _is_at_me(self, e) -> bool:
+        """@我 判定（CONTRACTS §六）：content 含 "@所有人"，或 mentions 中有
+        昵称与 owner_nick 归一化后相等/互为包含（容忍 OCR 粘连）。
+        注意这只是调度提示（mention_hint）， Policy 以日志 mentions 为准。"""
+        from ..msglog import normalize
         content = getattr(e, "content", "") or ""
-        return bool(mentions) or "@" in content
+        if "@所有人" in content:
+            return True
+        owner = normalize(self._owner_nick)
+        if not owner:
+            return False
+        for m in getattr(e, "mentions", None) or []:
+            nm = normalize(m)
+            if nm and (nm == owner or nm in owner or owner in nm):
+                return True
+        return False
 
     @staticmethod
-    def _row_to_message(session: str, row: dict) -> Message:
+    def _row_to_message(session: str, row: dict, is_group: bool = False) -> Message:
         """数据库行 → Message 契约类型。"""
         return Message(
             session=session,
-            is_group=False,  # 由调用方补充
+            is_group=is_group,
             sender=row.get("sender", ""),
             is_mine=bool(row.get("is_mine", False)),
             content=row.get("content", ""),
             content_type=row.get("content_type", "text"),
             mentions=(row.get("mentions") or "").split(",") if row.get("mentions") else [],
+            media_path=row.get("media_path") or None,
             ts=row.get("ts_captured", 0.0),
             seq=row.get("seq", 0),
             msg_uid="",

@@ -2,13 +2,30 @@
   "max_concurrent_decisions": 1,
   "media_convert_concurrency": 2,
   "history_size": 200,
-  "sweep_interval": [45, 90],
-  "notify_interval": [3, 6],
+  "sweep_interval": [
+    45,
+    90
+  ],
+  "notify_interval": [
+    3,
+    6
+  ],
   "paused": false,
   "muted_until": 0.0,
-  "owner": "",
-  "owner_nick": "",
+  "owner": "风图",
+  "owner_nick": "陈曦",
   "action_max_attempts": 2,
   "task_retention_days": 14,
-  "tool_model": "kimi-code/k3"
+  "tool_model": "kimi-code/k3",
+  "open_all_sessions": true,
+  "screen_watch_interval": [
+    2.0,
+    4.0
+  ],
+  "task_timeout_s": 1800,
+  "tool_model_mm": "kimi-code/kimi-for-coding",
+  "tool_model_text": "deepseek/v4-pro",
+  "friend_auto_accept": true,
+  "friend_check_interval": 1800,
+  "friend_max_accept": 30
 }

@@ -400,6 +400,21 @@ def is_generic_list_page(img, hsv, ocr_items):
     覆盖 Discover/聊天信息/公众号/表情商店等次级列表页，避免被 OCR 兜底误判为聊天页。"""
     if ocr_items is None or has_chat_buttons(hsv):
         return False
+    # 聊天页救援（2026-08-08 真机）：输入栏残留文字/引用预览时 ⊕ 变成
+    # "发送"按钮，底栏只剩 2 个圆钮，has_chat_buttons 判不出聊天页——
+    # 此时 ADB Keyboard 细条或"群名(N)标题+右下发送按钮"是强聊天证据，
+    # 绝不能按次级列表页归类（否则 send_text 误判"不在聊天页"拒绝发送）
+    import re as _re
+    title0 = _title_from_ocr(img, ocr_items)
+    group_title = bool(title0 and _re.search(r"[（(]\d+[)）]\s*$", title0))
+    for it in ocr_items:
+        if it["cy"] < 1900:
+            continue
+        t = it["text"] or ""
+        if "ADB Keyboard" in t:
+            return False
+        if group_title and "发送" in t and it["cx"] > 880:
+            return False
     # 若存在真正的 Tab 页（有绿色选中 Tab），则不是次级列表页
     if count_tab_icons(hsv) >= LC.TAB_PRESENT_MIN:
         scores = tab_scores(hsv)
@@ -522,41 +537,3 @@ def detect_page(img, ocr_items=None, hsv=None, gray=None):
             return Page("wechat_chat", title=title, reason="ocr_fallback")
 
     return Page("wechat_unknown", reason="no_features")
-
-
-# ------------------------------------------------------------------ 本地调试
-SAMPLE_PATHS = {
-    "search": "samples/ui_inventory/02_home/home_search.png",
-    "add_friend": "samples/ui_inventory/14_other/add_friend.png",
-    "scan": "samples/ui_inventory/14_other/scan_page.png",
-    "moments": "samples/ui_inventory/08_moments/moments_main_p1.png",
-    "profile": "samples/ui_inventory/06_profile/profile_contact.png",
-    "settings": "samples/ui_inventory/10_settings/settings_main_v2.png",
-    "dialog": "samples/ui_inventory/11_dialogs/dialog_delete_confirm.png",
-    # 既有类型回归
-    "home": "samples/ui_inventory/02_home/home_main_v2.png",
-    "chat": "samples/ui_inventory/03_chat/chat_group_leisure.png",
-    "contacts": "samples/ui_inventory/05_contacts/contacts_main_v2.png",
-    "discover": "samples/ui_inventory/07_discover/discover_main_v2.png",
-    "me": "samples/ui_inventory/09_me/me_main_v2.png",
-}
-
-
-if __name__ == "__main__":
-    import os
-    from .ocr_engine import run_ocr
-
-    base = os.path.join(os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "")
-    for label, rel in SAMPLE_PATHS.items():
-        path = os.path.join(base, rel)
-        if not os.path.exists(path):
-            print(f"[{label}] missing {path}")
-            continue
-        img = cv2.imread(path)
-        if img is None:
-            print(f"[{label}] unreadable {path}")
-            continue
-        ocr_items = run_ocr(img)
-        page = detect_page(img, ocr_items)
-        print(f"[{label:12s}] {page}")
