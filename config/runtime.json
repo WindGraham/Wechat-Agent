@@ -22,5 +22,7 @@
     2.0,
     4.0
   ],
-  "task_timeout_s": 1800
+  "task_timeout_s": 1800,
+  "tool_model_mm": "kimi-code/kimi-for-coding",
+  "tool_model_text": "deepseek/v4-pro"
 }

@@ -449,7 +449,12 @@ class Proxy:
             full_brief = (f"{TASK_BRIEF_PREAMBLE}\n\n"
                           f"【本次任务】\n{brief.goal}\n\n"
                           f"【相关背景】\n{brief.context}")
-            result = self._cli.run(full_brief, task["workdir"],
+            # 按任务多模态需求路由模型（2026-08-09 用户指定）：
+            # mm=1 → K2.7 Coding（有 image_in/video_in），否则 V4 Pro
+            mm = parse_attrs(block.attrs).get("mm") == "1"
+            model = self._rt("tool_model_mm", "kimi-code/kimi-for-coding") \
+                if mm else self._rt("tool_model_text", "deepseek/v4-pro")
+            result = self._cli.run(full_brief, task["workdir"], model=model,
                                    timeout_s=self._rt("task_timeout_s", 1800))
             self._ledger.finish(task["task_id"], result.ok,
                                 result.cli_session_id)
