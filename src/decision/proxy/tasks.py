@@ -117,12 +117,12 @@ class TaskLedger:
         log.info("task %s: %s", task_id, task["status"])
 
     def get(self, task_id: str):
-        """内存台账查询；查不到时扫磁盘 task.json 兜底
-        （进程外补跑的任务重启后内存没有，但 task.json 是事实源，
-        回执流程不能因为进程边界丢任务——2026-08-09 补跑 PDF 实测）。"""
+        """查任务：内存命中也重读 task.json（进程外执行器会改写状态，
+        重启时 rebuild 把 running 标 interrupted 后磁盘可能已翻 done，
+        内存缓存是旧事实——2026-08-09 补跑 PDF 回执误报失败实测）。"""
         t = self._tasks.get(task_id)
         if t is not None:
-            return t
+            return self._refresh(t) or t
         for day in os.listdir(self._root):
             day_dir = os.path.join(self._root, day)
             if not os.path.isdir(day_dir):
@@ -139,6 +139,18 @@ class TaskLedger:
                 self._tasks[task_id] = t
                 return t
         return None
+
+    @staticmethod
+    def _refresh(task: dict):
+        """从磁盘重读该任务的 task.json；读不到返回 None。"""
+        path = os.path.join(task.get("workdir", ""), "task.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                fresh = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        task.update(fresh)
+        return task
 
     def running(self) -> list:
         return [t for t in self._tasks.values() if t["status"] == "running"]
