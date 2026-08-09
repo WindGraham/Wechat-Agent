@@ -10,7 +10,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.interaction.ports.android.action.friend_requests import (
-    find_view_buttons, extract_applicant_name, dedup_names)
+    find_view_buttons, extract_applicant_name, dedup_names,
+    contacts_tab_has_dot)
+from src.interaction.ports.android.perception import layout_consts as LC
 from src.interaction.loop.unified_queue import UnifiedQueue
 from src.interaction.loop.journey import JourneyManager
 
@@ -70,6 +72,38 @@ class TestExtractName(unittest.TestCase):
                  _it("我是余念可安", 286, 1037, h=47)]
         self.assertEqual(
             extract_applicant_name(items, {"cx": 965, "cy": 1005}), "")
+
+
+class TestContactsTabDot(unittest.TestCase):
+    """通讯录 tab 红点检测（合成 HSV 帧，不触设备）。"""
+
+    def _frame(self, dot=False):
+        import numpy as np
+        import cv2
+        img = np.zeros((LC.SCREEN_H, LC.SCREEN_W, 3), np.uint8)
+        img[:] = (30, 30, 30)                       # 深色底
+        if dot:
+            x0, y0, x1, y1 = LC.TAB_ROIS["通讯录"][0]
+            # 红点涂在图标 ROI 右上角（BGR 红）
+            cv2.circle(img, (x1 - 18, y0 + 18), 16, (0, 0, 250), -1)
+        return cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    def test_dot_detected(self):
+        self.assertTrue(contacts_tab_has_dot(self._frame(dot=True)))
+
+    def test_no_dot(self):
+        self.assertFalse(contacts_tab_has_dot(self._frame(dot=False)))
+
+    def test_dot_elsewhere_not_counted(self):
+        """红点涂在微信 tab 上不算通讯录红点。"""
+        import numpy as np
+        import cv2
+        img = np.zeros((LC.SCREEN_H, LC.SCREEN_W, 3), np.uint8)
+        img[:] = (30, 30, 30)
+        x0, y0, x1, y1 = LC.TAB_ROIS["微信"][0]
+        cv2.circle(img, (x1 - 18, y0 + 18), 16, (0, 0, 250), -1)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        self.assertFalse(contacts_tab_has_dot(hsv))
 
 
 class TestDedup(unittest.TestCase):

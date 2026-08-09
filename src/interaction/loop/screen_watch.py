@@ -93,6 +93,14 @@ class ScreenWatcher:
         if page.type != "wechat_home":
             return
 
+        # 通讯录 tab 红点 = 新好友申请（即时信号，2026-08-09 用户规则：
+        # 新申请来时 tab 出红点，点开通讯录才消——比巡检快得多）
+        hsv_full = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        from ..ports.android.action.friend_requests import (
+            contacts_tab_has_dot)
+        if contacts_tab_has_dot(hsv_full):
+            self._queue.push_friend(source="tab_dot")
+
         # 首页：全量解析拿未读标记
         from ..ports.android.perception.state_builder import build_state
         state = build_state(img)

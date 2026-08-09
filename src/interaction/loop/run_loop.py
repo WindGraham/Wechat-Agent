@@ -47,7 +47,6 @@ class InteractionLoop:
         self._sleep = time.sleep
         self._rand = random.uniform
         self._clock = time.time
-        self._last_friend_probe = 0.0   # 上次好友申请巡检时间戳
 
     # ------------------------------------------------------------------ 配置
     @property
@@ -61,15 +60,6 @@ class InteractionLoop:
         if self._config:
             return getattr(self._config, 'notify_interval', (3, 6))
         return (3, 6)
-
-    @property
-    def friend_check_interval(self):
-        """好友申请空闲巡检间隔（秒，2026-08-09 用户要求：
-        申请被点开过就没有通知，必须主动巡检）。"""
-        if self._config:
-            return getattr(self._config, 'get', lambda k, d=None: d)(
-                'friend_check_interval', 600)
-        return 600
 
     @property
     def is_paused(self):
@@ -138,15 +128,6 @@ class InteractionLoop:
                     except Exception:
                         log.exception("sweep failed")
                 next_sweep = self._clock() + self._rand(*self.sweep_interval)
-
-            # 好友申请空闲巡检（红点/通知会被点开消掉，必须主动查）：
-            # 队列空且距上次巡检超过间隔 → 投一条 friend 条目
-            if not self.is_paused and len(self._queue) == 0:
-                if self._clock() - self._last_friend_probe >= \
-                        self.friend_check_interval:
-                    self._last_friend_probe = self._clock()
-                    log.info("好友申请定时巡检")
-                    self._queue.push_friend(source="auto_probe")
 
             # 乱逛：队列空时模拟真人随机浏览
             if not self.is_paused and len(self._queue) == 0:
@@ -307,9 +288,9 @@ class InteractionLoop:
 
     def _wander_switch_tab(self):
         try:
-            tabs = [layout.TAB_CONTACTS, layout.TAB_DISCOVER]
-            tab = tabs[int(self._rand(0, 1.99))]
-            self._tools.dev.tap_rect(tab)
+            # 只乱逛"发现"：点通讯录 tab 会把好友申请的红点信号消掉
+            # （tab 红点开一次就没，但申请还在——2026-08-09 用户规则）
+            self._tools.dev.tap_rect(layout.TAB_DISCOVER)
             self._sleep(self._rand(2, 4))
             self._tools.dev.tap_rect(layout.TAB_WECHAT)
         except Exception:

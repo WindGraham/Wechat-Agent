@@ -105,6 +105,32 @@ def is_friend_page(state):
     return FRIEND_PAGE_TITLE in title
 
 
+# ------------------------------------------------------------------ tab 红点
+# 通讯录 tab 红点（用户 2026-08-09 规则）：新申请来时 tab 图标右上角出红点；
+# 点一次通讯录 tab 红点即消（但申请仍在，入口行红点保留）；点开申请详情
+# 未通过则连入口红点也没了。所以 tab 红点是"有新申请"的即时信号，
+# 盯屏每帧可检，不需要定时巡检。
+def contacts_tab_has_dot(hsv):
+    """通讯录 tab 图标 ROI 内是否有红色圆点（首页帧的 HSV，纯函数可单测）。
+
+    tab 图标是白色描边/绿色填充，文字行是白色——ROI 内任何成形的红色
+    组件就是未读红点。
+    """
+    import numpy as np
+    from ..perception.img_utils import comps_from_mask
+    x0, y0, x1, y1 = LC.TAB_ROIS["通讯录"][0]
+    roi = hsv[y0:y1, x0:x1]
+    h, s, v = roi[:, :, 0], roi[:, :, 1], roi[:, :, 2]
+    red = (((h < LC.RED_H_LO) | (h > LC.RED_H_HI))
+           & (s > LC.RED_S_MIN) & (v > LC.RED_V_MIN)).astype(np.uint8)
+    for bx, by, bw, bh, area in comps_from_mask(red, min_area=40,
+                                                close_ksize=3,
+                                                min_w=8, min_h=8):
+        if bw <= 80 and bh <= 80 and 0.4 < bw / max(bh, 1) < 2.5:
+            return True
+    return False
+
+
 # ------------------------------------------------------------------ 设备侧辅助
 def _ocr(img):
     from ..perception.ocr_engine import run_ocr
