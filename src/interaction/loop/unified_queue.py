@@ -153,6 +153,10 @@ class UnifiedQueue:
         规则：会话已在队列中 → 位置不变、内容不更新（只更新 sources）。
         """
         session = _dedup_stutter(session, self._known_sessions_fn)
+        # "新的朋友"不是聊天会话，是好友申请入口——重定向到 friend 条目，
+        # 所有来源（sweep/盯屏/通知桥）统一在此收口（2026-08-09）
+        if session.strip() == self.FRIEND_SESSION:
+            return self.push_friend(source=source)
         if session in BLOCKED_SESSIONS:
             log.debug("queue: %s 被黑名单拦截（系统/feed 会话）", session)
             return None
@@ -180,6 +184,34 @@ class UnifiedQueue:
             self._persist()
             log.info("queue push notify: %s mention=%s source=%s",
                      session, mention, source)
+            return entry
+
+    # 好友申请特殊会话名（首页列表/系统通知里出现的入口，不是聊天会话）
+    FRIEND_SESSION = "新的朋友"
+
+    def push_friend(self, source: str = "probe") -> Optional[QueueEntry]:
+        """推送"好友申请处理"条目（kind="friend"）。
+
+        规则与 notify 相同：已在队列中 → 不挪动，只登记来源。
+        固定会话名"新的朋友"（网关展示友好），不进聊天旅程，
+        由旅程管理器走好友申请处理流程（journey._process_friend）。
+        """
+        session = self.FRIEND_SESSION
+        with self._lock:
+            existing = self._entries.get(session)
+            if existing is not None:
+                existing.sources.add(source)
+                self._persist()
+                log.debug("queue: friend entry already queued, sources=%s",
+                          sorted(existing.sources))
+                return existing
+            entry = QueueEntry(
+                kind="friend", session=session, ts=time.time(),
+                sources={source},
+            )
+            self._entries[session] = entry
+            self._persist()
+            log.info("queue push friend: source=%s", source)
             return entry
 
     def push_action(self, session: str, blocks_xml: str,

@@ -44,12 +44,18 @@ class JourneyManager:
 
     def __init__(self, queue: UnifiedQueue, session_reader,
                  bundle_sender, port_navigator,
-                 on_log_updated: Optional[Callable] = None):
+                 on_log_updated: Optional[Callable] = None,
+                 config=None, friend_ops=None):
         self._queue = queue
         self._reader = session_reader
         self._sender = bundle_sender
         self._nav = port_navigator
         self._on_log_updated = on_log_updated
+        # 好友申请处理（2026-08-09）：config 热读 friend_auto_accept 等；
+        # friend_ops 可注入 {"probe": fn, "accept": fn}（测试用假实现）
+        self._config = config
+        self._friend_ops = friend_ops
+        self._on_friend_result = None
 
         self._dirty: set = set()   # 同步失败的会话：下轮循环优先补同步
 
@@ -61,6 +67,10 @@ class JourneyManager:
     def set_on_log_updated(self, cb):
         """LogUpdated 回调热替换（决策层装配时接线用）。"""
         self._on_log_updated = cb
+
+    def set_on_friend_result(self, cb):
+        """好友申请处理结果回调（决策层装配时接线用）。"""
+        self._on_friend_result = cb
     @property
     def navigator(self):
         """端口导航器（供 run_loop 乱逛等场景使用）。"""
@@ -78,6 +88,10 @@ class JourneyManager:
 
         返回 True 表示有发送动作。
         """
+        # 好友申请条目：不是聊天会话，走专门流程（不进会话/不同步日志）
+        if entry.kind == "friend":
+            return self._process_friend(entry)
+
         session = entry.session
         log.info("=== journey start: %s (kind=%s mention=%s) ===",
                  session, entry.kind, entry.mention)
@@ -92,6 +106,14 @@ class JourneyManager:
             return False
 
         is_group = self._detect_is_group(session)
+
+        # 好友申请伪装会话（用户 2026-08-09 实测）：新申请在首页以
+        # "头像+昵称+打招呼"出现，红点在昵称条目上；点开后该位置变回
+        # "新的朋友"但申请仍待通过。这类条目进入后落在新的朋友/验证页，
+        # 不是聊天会话——转好友申请流程，不做日志同步。
+        if self._on_friend_page():
+            log.info("[%s] 进入后落在好友申请页，转 friend 流程", session)
+            return self._process_friend(entry)
 
         # 2. 同步日志（进会话必做，铁律）；失败重试，仍失败 → 标 dirty 退出
         updated = self._sync_with_retry(session, is_group)
@@ -158,6 +180,75 @@ class JourneyManager:
         return sent
 
     # ------------------------------------------------------------------ 内部
+    def _on_friend_page(self) -> bool:
+        """当前是否停留在好友申请相关页（新的朋友列表/通过朋友验证）。"""
+        try:
+            state = self._nav.tools._snap()
+        except Exception:  # noqa: BLE001
+            return False
+        title = (state.get("page", {}) or {}).get("title") or ""
+        return "新的朋友" in title or "通过朋友验证" in title
+
+    def _friend_cfg(self, key, default):
+        get = getattr(self._config, "get", None)
+        return get(key, default) if get else default
+
+    def _load_friend_ops(self):
+        """好友申请操作实现（延迟 import，测试可注入 friend_ops）。"""
+        if self._friend_ops is not None:
+            return self._friend_ops
+        from ..ports.android.action import friend_requests
+        return {"probe": friend_requests.probe_pending,
+                "accept": friend_requests.accept_all}
+
+    def _process_friend(self, entry: QueueEntry) -> bool:
+        """好友申请处理流程：巡检计数 →（自动通过开启时）逐条通过 → 结果回传。
+
+        与聊天旅程的区别：不进任何会话、不同步消息日志；屏幕占用发生在
+        主循环分发线程内，与盯屏/旅程天然互斥（盯屏见非首页自动跳过）。
+        结果通过 on_friend_result 回传决策层（Proxy 转成回执决策轮）。
+        """
+        log.info("=== friend journey start (sources=%s) ===",
+                 sorted(entry.sources))
+        ops = self._load_friend_ops()
+        auto_accept = bool(self._friend_cfg("friend_auto_accept", True))
+        max_accept = int(self._friend_cfg("friend_max_accept", 30))
+        tools = self._nav.tools
+
+        try:
+            if auto_accept:
+                result = ops["accept"](tools, max_accept=max_accept,
+                                       sleep_fn=self._sleep)
+                result["probed"] = None      # accept 内部自己数，不单独巡检
+            else:
+                count, names = ops["probe"](tools, sleep_fn=self._sleep)
+                result = {"ok": count is not None, "accepted": [],
+                          "remaining": count or 0, "probed": count,
+                          "pending_names": names,
+                          "error": None if count is not None else "巡检导航失败"}
+        except Exception as e:  # noqa: BLE001
+            log.exception("friend journey failed")
+            result = {"ok": False, "accepted": [], "remaining": -1,
+                      "probed": None, "error": f"{type(e).__name__}: {e}"}
+
+        # 失败重排（retryable：导航/设备瞬时故障占多数）
+        if not result.get("ok"):
+            self._queue.requeue_entry(entry)
+
+        # 有实质内容才回传决策层（巡检为 0 不打扰）
+        interesting = (result.get("accepted") or
+                       (result.get("probed") or 0) > 0 or
+                       result.get("error"))
+        if interesting and self._on_friend_result:
+            try:
+                self._on_friend_result(result)
+            except Exception:  # noqa: BLE001
+                log.exception("on_friend_result 回调失败")
+
+        self._safe_back_home("新的朋友")
+        log.info("=== friend journey end: %s ===", result)
+        return bool(result.get("accepted"))
+
     def _sync_with_retry(self, session: str, is_group: bool):
         """同步日志，失败重试 SYNC_MAX_RETRIES 次（随机间隔 1~2s）。
 
