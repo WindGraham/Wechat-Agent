@@ -178,7 +178,9 @@ class BundleSender:
         texts = [(e.text or "") for e in root.findall("text")]
         texts = [t for t in texts if t.strip()]
 
-        # <quote>：引用回复——第一条 <text> 走引用流程发出
+        # <quote>：引用回复——第一条 <text> 走引用流程发出；
+        # 引用失败（目标找不到/流程中断）降级为普通发送，不丢消息
+        # （"每条 @ 必回"优先于"必须带引用"，2026-08-09 JY君 实测）
         quote_elem = root.find("quote")
         if quote_elem is not None:
             quote_match = (quote_elem.get("match") or
@@ -191,9 +193,10 @@ class BundleSender:
                                     error="<quote> 需要至少一个 <text> 作为回复内容",
                                     retryable=False)
             r = self._do_quote_reply(session, quote_match, texts[0])
-            if not r.ok:
-                return r
-            texts = texts[1:]      # 其余 <text> 照常逐条发
+            if r.ok:
+                texts = texts[1:]  # 第一条已带引用发出，其余照常逐条发
+            else:
+                log.warning("[%s] 引用失败（%s），降级普通发送", session, r.error)
 
         if texts:
             return self._do_send_texts(session, texts)
@@ -315,7 +318,12 @@ class BundleSender:
             self._scroll_search("below")
             self._sleep(self._rand(0.6, 1.2))
             r = _try()
-            return _pack(r)
+            if r.get("ok") or r.get("step") != "find_target":
+                return _pack(r)
+            # 日志与屏幕错位（如有媒体消息没同步进日志）时"应在当前屏"
+            # 会误判，继续向上翻找（2026-08-09 JY君 实测）
+            log.info("[%s] 当前屏判定可能错位，改为向上翻找", session)
+            direction = "above"
 
         log.info("[%s] quote target 在屏幕%s侧，滚动查找", session,
                  "上" if direction == "above" else "下")

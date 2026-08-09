@@ -579,17 +579,26 @@ def merge_stack(conn, session_id, entries, source="backfill",
 
 # ---------------------------------------------------------------- 增量 append
 def _entry_in_tail(entry, tail):
-    """栈条目是否已在日志尾（L2 模糊判定）。divider 用归一化精确等值。"""
+    """栈条目是否已在日志尾（L2 模糊判定）。divider 用归一化精确等值。
+
+    多媒体匹配只认尾部最后 3 行（2026-08-09 JY君 新表情被吞修复）：
+    媒体条目内容无法区分（转换后是描述、未转换是占位符），同发送人的
+    新表情包会被误判命中 10 行前的旧媒体行 → 被当"已记录"丢弃。
+    底部增量读到的一定是末尾几行，限制窗口不影响锚定。"""
     if getattr(entry, "kind", "msg") == "divider":
         return any(row["content_type"] == "time_divider"
                    and normalize(entry.content) == normalize(row["content"])
                    for row in tail)
     sender = _entry_sender(entry)
-    return any(row["content_type"] != "time_divider"
-               and (_media_eq(entry, row)
-                    or fuzzy_eq(sender, entry.content,
-                                row["sender"], row["content"]))
-               for row in tail)
+    n = len(tail)
+    for i, row in enumerate(tail):
+        if row["content_type"] == "time_divider":
+            continue
+        if i >= n - 3 and _media_eq(entry, row):
+            return True
+        if fuzzy_eq(sender, entry.content, row["sender"], row["content"]):
+            return True
+    return False
 
 
 @_locked

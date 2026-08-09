@@ -142,7 +142,8 @@ check("最多 3 个 reply 块", r.ok and len(sender.sent) == 3)
 
 
 # ---------------------------------------------------------------- S4: quote
-# bundle_sender 接线：quote 失败必须 ok=False
+# bundle_sender 接线：quote 失败降级普通发送（每条 @ 必回优先于带引用，
+# 2026-08-09 用户要求），不再整体判失败
 import src.interaction.ports.android.action.quote_reply as qr_mod
 orig_qr = qr_mod.quote_reply
 qr_mod.quote_reply = lambda *a, **kw: {"ok": False, "step": "detect_menu",
@@ -150,8 +151,8 @@ qr_mod.quote_reply = lambda *a, **kw: {"ok": False, "step": "detect_menu",
 bs, sender, nav = make_bs()
 r = bs.submit_bundle("s", '<reply><quote match="周六去爬山吗"/>'
                           '<text>来啦</text></reply>')
-check("S4 quote 失败 -> ok=False", not r.ok and "引用回复失败" in (r.error or "")
-      and "detect_menu" in r.error, r.error)
+check("S4 quote 失败 -> 降级普通发送", r.ok and sender.sent == [("s", "来啦")],
+      f"ok={r.ok} sent={sender.sent} err={r.error}")
 
 qr_mod.quote_reply = lambda *a, **kw: {"ok": True, "step": "sent",
                                        "verified": True}
