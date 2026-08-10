@@ -32,15 +32,17 @@
 - 群里有人用别的名字称呼某人，且你确定是同一个人 → 登记
 - 登记后，无论他用哪个称呼出现，都会召回他的记忆
 
-### 调用方式（在输出里写工具块）
+### 调用方式（在输出里写工具块，严格按此格式）
+
+**格式硬规则**：内容一律放 `content` 属性（**不要用 value**，不要放标签体里）；`scope=user` 必带 `user`，`scope=session` 必带 `session`。
 
 ```
-<tool name="memory" op="add" key="风图" value="不喜欢表情包" scope="global"/>
-<tool name="memory" op="add" key="群梗" value="爱用父流一下" scope="session"/>
-<tool name="memory" op="add" key="偏好" value="喜欢短消息" scope="user" user="风图"/>
+<tool name="memory" op="add" scope="global" content="风图不喜欢表情包"/>
+<tool name="memory" op="add" scope="session" content="本群爱用父流一下这个梗"/>
+<tool name="memory" op="add" scope="user" user="风图" content="喜欢短消息，不爱长文"/>
 <tool name="memory" op="read" key="风图"/>
 <tool name="memory" op="search" keyword="爬山"/>
-<tool name="memory" op="update" id="返回结果里的id" value="新内容"/>
+<tool name="memory" op="update" id="返回结果里的id" content="新内容"/>
 <tool name="memory" op="delete" id="返回结果里的id"/>
 <tool name="memory" op="alias" user="风图" alias="图图"/>
 ```
@@ -50,10 +52,10 @@
 | 属性 | 必填 | 说明 |
 |---|---|---|
 | `op` | ✅ | `add` / `read` / `search` / `update` / `delete` / `alias` |
-| `key` | add/read | 分类键（偏好/关系/群梗…），检索用 |
-| `value` | add/update | 记忆内容 |
-| `scope` | 选填 | `global`=跨会话（主人偏好、通用事实）；`user`=某个人（需带 user）；`session`=只当前会话（群梗、本群约定）；缺省按当前会话 |
-| `user` | user/alias | 记忆归属的人 / 别名的主用户 |
+| `content` | add/update | 记忆内容（**一律用 content，不用 value**） |
+| `key` | read | 分类键（偏好/关系/群梗…），检索用 |
+| `scope` | 选填 | `global`=跨会话（主人偏好、通用事实）；`user`=某个人（**必带 user 属性**）；`session`=只当前会话（群梗、本群约定）；缺省按当前会话 |
+| `user` | user/alias | scope=user 时记忆归属的人；alias 时主称呼（**必填**） |
 | `alias` | alias | 要给该用户登记的别名（昵称/别称） |
 | `keyword` | search | 检索关键词 |
 | `id` | update/delete | 操作目标条目的稳定 id（用返回结果里的） |
