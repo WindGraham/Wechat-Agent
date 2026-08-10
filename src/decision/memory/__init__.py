@@ -24,7 +24,8 @@ class MemoryTool:
     def __init__(self, store: MemoryStore = None):
         self._store = store or MemoryStore()
 
-    def run(self, attrs: dict, current_session: str = "") -> str:
+    def run(self, attrs: dict, current_session: str = "",
+           is_group: bool = None) -> str:
         """执行 memory 操作，返回回灌给 LLM 的文本。
 
         attrs: <tool> 块解析出的属性 dict（name/op/key/value/...）。
@@ -33,7 +34,7 @@ class MemoryTool:
         op = attrs.get("op", "")
         try:
             if op == "add":
-                return self._add(attrs, current_session)
+                return self._add(attrs, current_session, is_group)
             if op == "read":
                 return self._read(attrs)
             if op == "search":
@@ -58,18 +59,28 @@ class MemoryTool:
             return "session"       # 缺省：当前会话（安全，不跨会话）
         return "global"
 
-    def _add(self, attrs: dict, current_session: str) -> str:
+    def _add(self, attrs: dict, current_session: str,
+            is_group: bool = None) -> str:
         # 兼容 value 与 content 两种属性名（LLM 输出习惯用 content）
         value = attrs.get("value", "") or attrs.get("content", "")
         if not value:
             return "memory add 缺 value/content 属性"
+        # source 区分私聊/群聊：私聊记"私聊"，群聊记会话名——
+        # 注入块据此标注 [来自私聊] vs [来自特高课]，LLM 能判断该不该说
+        explicit = attrs.get("source", "")
+        if explicit:
+            src = explicit
+        elif is_group is False:
+            src = "私聊"
+        else:
+            src = current_session or "unknown"
         entry = self._store.add(
             content=value,
             key=attrs.get("key", ""),
             scope=self._scope(attrs, current_session),
             user=attrs.get("user", ""),
             session=attrs.get("session", "") or current_session,
-            source=attrs.get("source", "") or current_session,
+            source=src,
             ref_msg=attrs.get("ref", ""),
         )
         return f"已记录（id={entry['id']}, key={entry['key']}, scope={entry['scope']}）"

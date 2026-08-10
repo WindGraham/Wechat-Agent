@@ -487,7 +487,15 @@ class Proxy:
         attrs = parse_attrs(block.attrs)
         name = attrs.get("name", "")
         if name == "memory":
-            return self._memory_tool().run(attrs, current_session=current_session)
+            # is_group 用于 source 区分私聊/群聊（隐私边界：私聊内容绝不外泄）
+            is_group = None
+            try:
+                if current_session:
+                    is_group = self._reader.last_is_group(current_session)
+            except Exception:  # noqa: BLE001
+                is_group = None
+            return self._memory_tool().run(
+                attrs, current_session=current_session, is_group=is_group)
         if name == "websearch":
             return self._exec_websearch(attrs, current_session)
         return f"未知工具: {name}"
