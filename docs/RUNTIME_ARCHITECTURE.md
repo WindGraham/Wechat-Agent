@@ -62,7 +62,7 @@ flowchart TB
 flowchart LR
     subgraph W1["通道1 · 持续盯屏 ScreenWatcher（2~4s/帧）"]
         F1["adb 截一帧"]
-        F2["detect_page<br/>掩膜快路径 &lt;5ms"]
+        F2["detect_page<br/>掩膜快路径 <5ms"]
         F3{"在首页?"}
         F4["build_state 全量解析<br/>会话红点/数字/@我"]
         F5["contacts_tab_has_dot<br/>通讯录tab红点掩膜"]
@@ -198,11 +198,11 @@ flowchart TB
 ```mermaid
 flowchart LR
     XML["XML bundle<br/>（决策层输出）"] --> EX["逐块扫描<br/>坏块只丢自己"]
-    EX --> R["&lt;reply&gt; ×≤3"]
-    R --> T1["&lt;text&gt; ×N<br/>拆句逐条发（间隔1~3s）"]
-    R --> T2["&lt;quote&gt;<br/>第一条text带引用发<br/>日志定位方向+滚动查找"]
-    R --> T3["&lt;image/&gt; 相册流程"]
-    R --> T4["&lt;file/&gt; 加号面板→SAF最近列表"]
+    EX --> R["<reply> ×≤3"]
+    R --> T1["<text> ×N<br/>拆句逐条发（间隔1~3s）"]
+    R --> T2["<quote><br/>第一条text带引用发<br/>日志定位方向+滚动查找"]
+    R --> T3["<image/> 相册流程"]
+    R --> T4["<file/> 加号面板→SAF最近列表"]
     R --> MUTEX["屏幕互斥锁<br/>发送中发现工作顺延"]
 ```
 
@@ -210,17 +210,17 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    EV["事件队列（优先序：<br/>主人 &gt; @我 &gt; task_done &gt; 普通）"] --> H["_decide_session<br/>信号量+会话锁"]
+    EV["事件队列（优先序：<br/>主人 > @我 > task_done > 普通）"] --> H["_decide_session<br/>信号量+会话锁"]
     H --> WM["水位差分<br/>watermarks.json"]
     WM --> FL["过滤：自己的/时间线/系统消息"]
     FL --> MC["媒体转换队列<br/>多媒体截图→k3视觉→描述写回日志"]
     MC --> PB["ContextBuilder 装配prompt<br/>persona + output_protocol + tools<br/>+ session_info/history/new_messages<br/>+ running_tasks"]
     PB --> K3[("k3")]
     K3 --> P["extract_blocks 解析"]
-    P --> R1["&lt;reply&gt; → submit_bundle<br/>→ queue.push_action"]
-    P --> R2["&lt;task&gt; → TaskLedger登记<br/>→ kimi CLI 子进程"]
-    P --> R3["&lt;tool chat_history&gt;<br/>同步查日志回灌续生成 ≤3次"]
-    P --> R4["&lt;silent/&gt; 沉默"]
+    P --> R1["<reply> → submit_bundle<br/>→ queue.push_action"]
+    P --> R2["<task> → TaskLedger登记<br/>→ kimi CLI 子进程"]
+    P --> R3["<tool chat_history><br/>同步查日志回灌续生成 ≤3次"]
+    P --> R4["<silent/> 沉默"]
     R2 --> DONE["子进程完成<br/>→ task_done 事件"] --> RCPT["回执决策轮<br/>人格化交付（图/文件/转述）"]
     H --> MR["必回场景（私聊/@我/主人）<br/>未回→重试→兜底文案"]
 ```

@@ -21,3 +21,4 @@
 
 - `delegate_task` — 交任务给后台核心（Kimi Code CLI）
 - `memory` — 读写长期记忆
+- `websearch` — 查资料/搜索

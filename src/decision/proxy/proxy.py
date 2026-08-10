@@ -99,6 +99,7 @@ TASK_BRIEF_PREAMBLE = """\
 EV_LOG_UPDATED = "log_updated"
 EV_TASK_DONE = "task_done"
 EV_MEMORY_WARM = "memory_warm"
+EV_SEARCH_DONE = "search_done"
 
 
 class Proxy:
@@ -130,6 +131,8 @@ class Proxy:
             max_workers=self._rt("media_convert_concurrency", 2))
         self._memory = None            # 懒加载：MemoryTool（避免 import 开销）
         self._memory_injector = None   # 懒加载：MemoryInjector（自动注入用）
+        self._websearch = None         # 懒加载：WebSearchTool
+        self._search_feedback = {}     # session -> 待回灌的搜索结果文本
         self._clock = clock
         self._watermarks_path = watermarks_path
 
@@ -236,6 +239,9 @@ class Proxy:
             self._handle_task_done(ev["task_id"])
         elif ev["type"] == EV_MEMORY_WARM:
             self._warm_memory(ev["session"], ev.get("history_batch", []))
+        elif ev["type"] == EV_SEARCH_DONE:
+            self._handle_search_done(ev["session"], ev.get("query", ""),
+                                     ev.get("results"), ev.get("error"))
 
     # ================================================================== 决策
     def _session_lock(self, session: str) -> threading.Lock:
@@ -282,7 +288,8 @@ class Proxy:
             log.info("[%s] memory warm 完成: %d 条历史, 执行 %d 个 memory 操作",
                      session, len(history_batch), executed)
 
-    def _decide_session(self, session: str, mention_hint: bool = False):
+    def _decide_session(self, session: str, mention_hint: bool = False,
+                       force: bool = False):
         """一个会话的一次决策（信号量 + 会话锁）。"""
         with self._sem, self._session_lock(session):
             is_group = self._reader.last_is_group(session)
@@ -304,7 +311,8 @@ class Proxy:
 
             # @我 逐条必回（Policy）
             unreplied = self._policy.unreplied_mentions(session, new_msgs)
-            if not new_msgs and not mention_hint and not unreplied:
+            if not new_msgs and not mention_hint and not unreplied \
+                    and not force:
                 log.info("[%s] 无新消息，跳过", session)
                 return
 
@@ -350,6 +358,10 @@ class Proxy:
         tool_feedback = ""
         tool_calls = 0
         replied = False
+        # 搜索结果回灌：若有待回灌的搜索结果，作为工具反馈拼进首轮
+        fb = self._search_feedback.pop(session, "")
+        if fb:
+            tool_feedback = fb
         # 记忆块：决策前自动拼接（L0 全局 + L2 当前会话 + L1 在场人）
         # 每轮循环都带（工具反馈轮也保持记忆上下文）
         memory_block = self._memory_block(session, is_group, history, new_msgs)
@@ -469,15 +481,82 @@ class Proxy:
 
         当前工具：
           - memory: 长期记忆读写（add/read/search/update/delete）
-        current_session: 当前决策会话（memory scope 缺省时按此推断，
-        对齐设计：缺省按当前会话记，不擅自跨会话）。
-        扩展：websearch（本地+网络，异步）后续在此加分支。
+          - websearch: 查资料/搜索（本地段同步 + 网络段异步）
+        current_session: 当前决策会话（memory scope 缺省时按此推断）。
         """
         attrs = parse_attrs(block.attrs)
         name = attrs.get("name", "")
         if name == "memory":
             return self._memory_tool().run(attrs, current_session=current_session)
+        if name == "websearch":
+            return self._exec_websearch(attrs, current_session)
         return f"未知工具: {name}"
+
+    # ---------------------------------------------------------------- websearch
+    def _websearch_tool(self):
+        """懒加载 WebSearchTool（注入 memory_store/reader 供本地段）。"""
+        if self._websearch is None:
+            from ..search import WebSearchTool
+            from ..memory import MemoryStore
+            svc = WebSearchTool.__new__(WebSearchTool)
+            from ..search.backend import SearchService
+            svc._svc = SearchService(memory_store=MemoryStore(), reader=self._reader)
+            self._websearch = svc
+        return self._websearch
+
+    def _exec_websearch(self, attrs: dict, session: str = "") -> str:
+        """websearch 分流：local 段同步回灌；web 段起子线程异步。
+
+        返回本地段文本 + 网络段状态提示（回灌给 LLM 的第一轮反馈）。
+        """
+        query = attrs.get("query", "")
+        if not query:
+            return "websearch 缺 query 属性"
+        scope = attrs.get("scope", "all")
+        tool = self._websearch_tool()
+
+        # local 段（同步，毫秒）
+        local_text = ""
+        if scope in ("local", "all"):
+            local_text = tool.run_local(attrs, session=session)
+
+        # web 段（异步，子线程，不阻塞事件循环）
+        if scope in ("web", "all"):
+            def _work():
+                try:
+                    results = tool.run_web(attrs)
+                    self._push_event({
+                        "type": EV_SEARCH_DONE, "session": session,
+                        "query": query, "results": results,
+                        "ts": self._clock()})
+                except Exception as e:  # noqa: BLE001
+                    log.warning("websearch '%s' 失败: %s", query, e)
+                    self._push_event({
+                        "type": EV_SEARCH_DONE, "session": session,
+                        "query": query, "error": f"{type(e).__name__}: {e}",
+                        "ts": self._clock()})
+            threading.Thread(target=_work, daemon=True,
+                             name=f"websearch-{query[:10]}").start()
+            tail = "\n[网络搜索进行中，结果回来后会通知你]"
+        else:
+            tail = ""
+
+        return (local_text + tail).strip() or "（无本地记录）"
+
+    def _handle_search_done(self, session: str, query: str,
+                            results=None, error=None):
+        """搜索结果回灌：把结果作为工具反馈，触发该会话再决策一轮。"""
+        from ..search.backend import SearchService
+        if error:
+            feedback = f"\n[工具返回] websearch('{query}') 失败: {error}"
+        else:
+            feedback = (f"\n[工具返回] websearch('{query}') 结果:\n"
+                        + SearchService.format_results(results or []))
+        self._search_feedback[session] = feedback
+        log.info("[%s] websearch 结果回灌: query=%s", session, query)
+        # 触发该会话再决策一轮（带上搜索结果）——force: 无新消息也进
+        # （否则"无新消息跳过"会让搜索结果永远不被消费，2026-08-10 实测）
+        self._decide_session(session, mention_hint=False, force=True)
 
     def _memory_tool(self):
         """懒加载 MemoryTool（避免 import 开销，仅首次调用时构造）。"""
