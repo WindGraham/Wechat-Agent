@@ -95,11 +95,9 @@ TASK_BRIEF_PREAMBLE = """\
 3. 需要她转达给用户的话（一两句口语，她会说微信里）
 做不到就直说做不到并说明卡在哪，不许假装成功。"""
 
-# 事件类型
-EV_LOG_UPDATED = "log_updated"
-EV_TASK_DONE = "task_done"
-EV_MEMORY_WARM = "memory_warm"
-EV_SEARCH_DONE = "search_done"
+# 事件类型（定义见 events.py）
+from .events import (EV_LOG_UPDATED, EV_TASK_DONE, EV_MEMORY_WARM,
+                     EV_SEARCH_DONE)  # noqa: E402,F401
 
 
 class Proxy:
@@ -230,18 +228,16 @@ class Proxy:
             return self._events.pop(0) if self._events else None
 
     def _handle(self, ev: dict):
+        """事件分发：查处理器注册表（热插拔，新增事件 = 新处理器文件）。"""
         if self._rt("paused", False):
             log.info("paused，事件跳过: %s", ev.get("session"))
             return
-        if ev["type"] == EV_LOG_UPDATED:
-            self._decide_session(ev["session"], mention_hint=ev.get("mention"))
-        elif ev["type"] == EV_TASK_DONE:
-            self._handle_task_done(ev["task_id"])
-        elif ev["type"] == EV_MEMORY_WARM:
-            self._warm_memory(ev["session"], ev.get("history_batch", []))
-        elif ev["type"] == EV_SEARCH_DONE:
-            self._handle_search_done(ev["session"], ev.get("query", ""),
-                                     ev.get("results"), ev.get("error"))
+        from .handlers import get_handler
+        handler_cls = get_handler(ev["type"])
+        if handler_cls is None:
+            log.warning("未知事件类型: %s", ev.get("type"))
+            return
+        handler_cls().handle(self, ev)
 
     # ================================================================== 决策
     def _session_lock(self, session: str) -> threading.Lock:

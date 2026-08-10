@@ -14,7 +14,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.gateway.app import create_app, _mask  # noqa: E402
+from src.gateway.app import create_app  # noqa: E402
+from src.gateway.api.common import mask as _mask  # noqa: E402
 
 
 class GatewayTestBase(unittest.TestCase):
