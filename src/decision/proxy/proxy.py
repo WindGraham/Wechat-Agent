@@ -70,7 +70,7 @@ def _truncate_events():
     with open(EVENTS_PATH, "wb") as f:
         f.write(half)
 
-MAX_TOOL_CALLS = 3            # chat_history 每轮最多 3 次
+MAX_TOOL_CALLS = 3            # 工具调用每轮上限(协议保留)
 MAX_REPLY_BLOCKS = 3          # 一轮最多 3 个 <reply>（防刷屏）
 MAX_TASK_BLOCKS = 1           # 一轮最多 1 个 <task>
 
@@ -127,6 +127,7 @@ class Proxy:
         self._media = MediaConverter(
             provider, writer=self._write_back,
             max_workers=self._rt("media_convert_concurrency", 2))
+        self._memory = None            # 懒加载：MemoryTool（避免 import 开销）
         self._clock = clock
         self._watermarks_path = watermarks_path
 
@@ -327,8 +328,7 @@ class Proxy:
                     reply_blocks.append(b)
                 elif b.tag == "task":
                     task_blocks.append(b)
-                elif b.tag == "tool" and tool_calls < MAX_TOOL_CALLS:
-                    tool_calls += 1
+                elif b.tag == "tool":
                     tool_feedback += "\n[工具返回] " + self._exec_tool(b)
                 elif b.tag == "silent":
                     pass
@@ -403,21 +403,26 @@ class Proxy:
             return f"<{block.tag}{attrs}/>"
         return f"<{block.tag}{attrs}>{block.raw_inner}</{block.tag}>"
 
+    # ---------------------------------------------------------------- 工具
     def _exec_tool(self, block) -> str:
-        """执行 <tool> 块（当前只有 chat_history）。"""
+        """执行 <tool> 块（决策层内联工具分发）。
+
+        当前工具：
+          - memory: 长期记忆读写（add/read/search/update/delete）
+        扩展：websearch（本地+网络，异步）后续在此加分支。
+        """
         attrs = parse_attrs(block.attrs)
-        if attrs.get("name") != "chat_history":
-            return f"未知工具: {attrs.get('name', '?')}"
-        session = attrs.get("session", "")
-        keyword = attrs.get("keyword", "")
-        n = min(int(attrs.get("n", 20)), 50)
-        rows = self._reader.get_context(session, n=500)
-        hits = [r for r in rows
-                if keyword and keyword in (r.content or "")]
-        if not hits:
-            return f"未找到包含 '{keyword}' 的消息"
-        return (f"找到 {len(hits)} 条（最近 {n} 条）:\n" + "\n".join(
-            f"{r.sender}: {(r.content or '')[:150]}" for r in hits[-n:]))
+        name = attrs.get("name", "")
+        if name == "memory":
+            return self._memory_tool().run(attrs, current_session="")
+        return f"未知工具: {name}"
+
+    def _memory_tool(self):
+        """懒加载 MemoryTool（避免 import 开销，仅首次调用时构造）。"""
+        if self._memory is None:
+            from ..memory import MemoryTool
+            self._memory = MemoryTool()
+        return self._memory
 
     # ---------------------------------------------------------------- 任务
     def _start_task(self, session: str, block):

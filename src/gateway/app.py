@@ -1009,9 +1009,9 @@ function loadConsole() {
       '<div class="dim" style="font-size:11px;text-transform:uppercase;' +
       'letter-spacing:.1em;margin:10px 0 6px">Agent 进程控制</div>' +
       '<div style="display:flex;gap:10px">' +
-      '<button class="btn" onclick="agentAction(\'start\')">启动</button>' +
-      '<button class="btn ghost" onclick="agentAction(\'stop\')">停止</button>' +
-      '<button class="btn ghost" onclick="agentAction(\'restart\')">重启</button>' +
+      '<button class="btn" onclick="agentAction(&quot;start&quot;)">启动</button>' +
+      '<button class="btn ghost" onclick="agentAction(&quot;stop&quot;)">停止</button>' +
+      '<button class="btn ghost" onclick="agentAction(&quot;restart&quot;)">重启</button>' +
       '</div>' +
       '<div class="dim" style="font-size:11px;text-transform:uppercase;' +
       'letter-spacing:.1em;margin:18px 0 6px">网关自身（不影响 agent）</div>' +
