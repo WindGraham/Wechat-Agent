@@ -205,6 +205,65 @@ def create_app(project_root=None, proxy=None, supervisor=None,
         return jsonify({"ok": False,
                         "error": "dir must be prompts|personas"}), 400
 
+    # ------------------------------------------------------------- 记忆文件
+    @app.route("/api/memory/files")
+    def api_memory_files():
+        """memory 文件列表（按 mtime 倒序：新增/更新的记忆自动冒顶）。
+        返回 [{path, name, kind(global/user/session), mtime, count}]。"""
+        mem_root = os.path.join(root, "workspace", "memory")
+        files = []
+        if os.path.isdir(mem_root):
+            for dirpath, _dirs, fnames in os.walk(mem_root):
+                for fn in fnames:
+                    if not fn.endswith(".json"):
+                        continue
+                    full = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(full, mem_root).replace(os.sep, "/")
+                    # kind 判断：global.json=全局；users/=用户；sessions/=会话
+                    if rel == "global.json":
+                        kind = "global"
+                    elif rel.startswith("users/"):
+                        kind = "user"
+                    elif rel.startswith("sessions/"):
+                        kind = "session"
+                    else:
+                        kind = "other"
+                    name = fn[:-5]  # 去掉 .json
+                    try:
+                        import json as _json
+                        with open(full, encoding="utf-8") as f:
+                            data = _json.load(f)
+                        count = len(data.get("facts", [])) if isinstance(
+                            data, dict) else 0
+                    except Exception:  # noqa: BLE001
+                        count = 0
+                    files.append({"path": rel, "name": name, "kind": kind,
+                                  "mtime": os.path.getmtime(full),
+                                  "count": count})
+        files.sort(key=lambda f: -f["mtime"])  # 最新修改在前
+        return jsonify({"ok": True, "files": files})
+
+    @app.route("/api/memory/file")
+    def api_memory_file():
+        """单个 memory 文件内容（含 facts 结构化展示）。"""
+        rel = request.args.get("path", "")
+        # 限定在 workspace/memory 内，防目录穿越
+        mem_root = os.path.join(root, "workspace", "memory")
+        full = os.path.realpath(os.path.join(mem_root, rel))
+        if not full.startswith(os.path.realpath(mem_root) + os.sep) \
+                and full != os.path.realpath(mem_root):
+            return jsonify({"ok": False, "error": "path not allowed"}), 403
+        if not os.path.isfile(full):
+            return jsonify({"ok": False, "error": "not found"}), 404
+        import json as _json
+        try:
+            with open(full, encoding="utf-8") as f:
+                data = _json.load(f)
+        except (OSError, ValueError):
+            return jsonify({"ok": False, "error": "parse failed"}), 500
+        return jsonify({"ok": True, "path": rel, "data": data,
+                        "mtime": os.path.getmtime(full)})
+
     # ------------------------------------------------------------- 文件读写
     @app.route("/api/file", methods=["GET", "PUT"])
     def api_file():
@@ -763,6 +822,37 @@ INDEX_HTML = """<!DOCTYPE html>
   .card { transition: border-color .2s; }
   .card:hover { border-color: var(--hairline); }
 
+  /* ---------- 双栏绑定布局（左列表 + 右详情，各自滚动） ---------- */
+  .split { display: flex; gap: 20px; height: 100%; min-height: 0; }
+  .split .col-list { width: 320px; min-width: 260px; display: flex;
+                     flex-direction: column; min-height: 0; }
+  .split .col-detail { flex: 1; min-width: 0; display: flex;
+                       flex-direction: column; min-height: 0; }
+  .split .scroll { flex: 1; overflow-y: auto; min-height: 0; }
+  .item-row { padding: 8px 10px; cursor: pointer; border-radius: var(--r-sm);
+              border-bottom: 1px solid var(--card-border); font-size: 13px;
+              display: flex; align-items: center; gap: 8px; }
+  .item-row:hover { background: var(--stone); }
+  .item-row.active { background: var(--pale-blue); }
+  .item-kind { font-size: 10px; color: #fff; border-radius: var(--r-pill);
+               padding: 1px 8px; white-space: nowrap; }
+  .kind-global { background: #6b7280; }
+  .kind-user { background: #3d7a6f; }
+  .kind-session { background: #8a5a9e; }
+  .item-meta { margin-left: auto; font-size: 11px; color: var(--muted);
+               white-space: nowrap; }
+  .event-type { font-family: ui-monospace, monospace; font-size: 11px;
+                color: var(--action-blue); min-width: 90px; }
+  .detail-pre { background: var(--stone); border-radius: var(--r-sm);
+                padding: 12px; font-size: 12px; overflow-wrap: break-word; }
+  .fact-card { background: var(--canvas); border: 1px solid var(--border-light);
+               border-radius: var(--r-sm); padding: 10px 12px; margin-bottom: 8px; }
+  .fact-card .fact-id { font-family: ui-monospace, monospace; font-size: 11px;
+                        color: var(--muted); }
+  .fact-card .fact-content { font-size: 13px; margin-top: 4px; }
+  .fact-card .fact-meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .fact-card.new { border-left: 3px solid var(--coral); }
+
   /* ---------- 侧边栏 agent 状态灯 ---------- */
   .agent-dot { display: inline-block; width: 8px; height: 8px;
                border-radius: 50%; margin-right: 6px; vertical-align: middle;
@@ -813,6 +903,9 @@ INDEX_HTML = """<!DOCTYPE html>
       <button class="nav-item" data-tab="live" onclick="showTab('live')">
         <span class="ico">◉</span>实况
       </button>
+      <button class="nav-item" data-tab="memory" onclick="showTab('memory')">
+        <span class="ico">🧠</span>记忆
+      </button>
       <button class="nav-item" data-tab="console" onclick="showTab('console')">
         <span class="ico">▶</span>控制台
       </button>
@@ -856,10 +949,29 @@ INDEX_HTML = """<!DOCTYPE html>
             <div class="scroll mid" id="live-queue"></div></div>
           <div class="card"><h2>首页红点</h2>
             <div class="scroll mid" id="live-home"></div></div>
-          <div class="card span2"><h2>Proxy 流水</h2>
-            <div class="scroll tall" id="live-events"></div></div>
+          <div class="card span2" style="height:56vh"><h2>Proxy 流水</h2>
+            <div class="split" style="flex:1">
+              <div class="col-list"><div class="scroll" id="live-events-list"></div></div>
+              <div class="col-detail"><div class="scroll" id="live-events-detail"></div></div>
+            </div>
+          </div>
           <div class="card span2"><h2>原子操作</h2>
             <div class="scroll tall" id="live-ops"></div></div>
+        </div>
+      </div>
+
+      <!-- 记忆：左文件列表 + 右内容详情 -->
+      <div class="pane" id="pane-memory">
+        <div class="card" style="height:100%">
+          <h2>长期记忆 <span class="badge coral" id="mem-count"></span></h2>
+          <div class="split" style="flex:1">
+            <div class="col-list">
+              <div class="scroll" id="mem-file-list"></div>
+            </div>
+            <div class="col-detail">
+              <div class="scroll" id="mem-file-detail"></div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -953,17 +1065,19 @@ window.onbeforeunload = () => dirty ? '有未保存的修改' : null;
 function showTab(name) {
   curTab = name;
   const editing = (name === 'prompts' || name === 'personas');
-  const titles = {live:'实况', console:'控制台', prompts:'Prompt 编辑',
-                  personas:'人格卡', groups:'群聊配置', runtime:'运行配置',
-                  env:'密钥', status:'状态'};
-  const subs = {live:'队列 · 红点 · 决策流水', console:'Agent 进程管理',
-                prompts:'输出协议 / 工具说明 / 模板', personas:'各会话态度卡',
-                groups:'每群热情度', runtime:'runtime.json 热生效',
-                env:'workspace/.env 脱敏', status:'队列 / 水位 / 任务台账'};
+  const titles = {live:'实况', memory:'记忆', console:'控制台',
+                  prompts:'Prompt 编辑', personas:'人格卡', groups:'群聊配置',
+                  runtime:'运行配置', env:'密钥', status:'状态'};
+  const subs = {live:'队列 · 红点 · 决策流水', memory:'长期记忆文件（新增自动冒顶）',
+                console:'Agent 进程管理', prompts:'输出协议 / 工具说明 / 模板',
+                personas:'各会话态度卡', groups:'每群热情度',
+                runtime:'runtime.json 热生效', env:'workspace/.env 脱敏',
+                status:'队列 / 水位 / 任务台账'};
   document.getElementById('page-title').textContent = titles[name] || name;
   document.getElementById('page-sub').textContent = subs[name] || '';
   // 所有 pane 隐藏，只显示当前
-  for (const p of ['live', 'console', 'groups', 'runtime', 'env', 'status'])
+  for (const p of ['live', 'memory', 'console', 'groups', 'runtime',
+                   'env', 'status'])
     document.getElementById('pane-' + p).classList.toggle('active',
                                                           p === name);
   // 编辑器页共用 pane-editor
@@ -973,12 +1087,88 @@ function showTab(name) {
     b.classList.toggle('active', b.dataset.tab === name);
   if (editing) loadFiles(name);
   if (name === 'live') loadLive();
+  if (name === 'memory') loadMemory();
   if (name === 'console') loadConsole();
   if (name === 'groups') loadGroups();
   if (name === 'runtime') loadRuntime();
   if (name === 'env') loadEnv();
   if (name === 'status') loadStatus();
 }
+
+// ------------------------------------------------------------- 记忆页（左列表+右详情）
+let MEM_CUR = null;   // 当前选中的 memory 文件 path
+let MEM_TIMER = null;
+function loadMemory() {
+  api('/api/memory/files').then(j => {
+    const files = j.files || [];
+    document.getElementById('mem-count').textContent =
+      files.length + ' 个文件 / ' + files.reduce((a, f) => a + (f.count || 0), 0) + ' 条';
+    const listEl = document.getElementById('mem-file-list');
+    if (!files.length) {
+      listEl.innerHTML = '<div class="empty">暂无记忆（agent 尚未写入）</div>';
+      document.getElementById('mem-file-detail').innerHTML =
+        '<div class="empty">选择左侧文件查看详情</div>';
+      return;
+    }
+    let h = '';
+    for (const f of files) {
+      const t = f.mtime ? new Date(f.mtime * 1000).toLocaleString() : '';
+      const kindLabel = {global:'全局', user:'用户', session:'会话'}[f.kind] || f.kind;
+      const cls = f.kind === 'global' ? 'kind-global'
+                : f.kind === 'user' ? 'kind-user' : 'kind-session';
+      h += '<div class="item-row' + (f.path === MEM_CUR ? ' active' : '') +
+           '" data-path="' + esc(f.path) + '" onclick="openMemFile(this.dataset.path)">' +
+           '<span class="item-kind ' + cls + '">' + kindLabel + '</span>' +
+           '<span>' + esc(f.name) + '</span>' +
+           '<span class="item-meta">' + (f.count || 0) + '条</span></div>';
+    }
+    listEl.innerHTML = h;
+    // 自动打开第一个（最新修改的）
+    if (!MEM_CUR || !files.some(f => f.path === MEM_CUR)) {
+      MEM_CUR = files[0].path;
+    }
+    loadMemDetail();
+  }).catch(e => toast(e.message, 'err'));
+}
+
+function openMemFile(path) {
+  MEM_CUR = path;
+  // 高亮刷新
+  document.querySelectorAll('#mem-file-list .item-row').forEach(el => {
+    el.classList.toggle('active', el.textContent.indexOf(
+      path.split('/').pop().slice(0, -5)) !== -1);
+  });
+  loadMemDetail();
+}
+
+function loadMemDetail() {
+  if (!MEM_CUR) return;
+  api('/api/memory/file?path=' + encodeURIComponent(MEM_CUR)).then(j => {
+    const el = document.getElementById('mem-file-detail');
+    const d = j.data || {};
+    const facts = d.facts || [];
+    const t = j.mtime ? new Date(j.mtime * 1000).toLocaleString() : '';
+    let h = '<div style="margin-bottom:10px"><b>' + esc(j.path) + '</b>' +
+            ' <span class="dim">更新于 ' + t + '</span></div>';
+    if (!facts.length) {
+      h += '<div class="empty">此文件暂无记忆条目</div>';
+    } else {
+      for (const f of facts) {
+        h += '<div class="fact-card">' +
+             '<span class="fact-id">' + esc(f.id || '') + '</span>' +
+             (f.key ? ' <span class="badge coral">' + esc(f.key) + '</span>' : '') +
+             '<div class="fact-content">' + esc(f.content || '') + '</div>' +
+             '<div class="fact-meta">scope=' + esc(f.scope || '') +
+             (f.source ? ' | 来源: ' + esc(f.source) : '') +
+             (f.updated_at ? ' | ' + new Date(f.updated_at * 1000).toLocaleString() : '') +
+             (f.confidence ? ' | 置信 ' + f.confidence : '') + '</div></div>';
+      }
+    }
+    el.innerHTML = h;
+  }).catch(e => toast(e.message, 'err'));
+}
+// 记忆页自动刷新（5s，新好友/新会话自动冒顶）
+setInterval(() => { if (curTab === 'memory') loadMemory(); }, 5000);
 
 // ------------------------------------------------------------- 控制台（agent 管理）
 let AGENT_TIMER = null;
@@ -1317,10 +1507,24 @@ function loadLive() {
     if (!scan || !scan.sessions || !scan.sessions.length)
       hEl.innerHTML = '<div class="empty">暂无数据（等待下一轮扫描）</div>';
     else hEl.innerHTML = renderHome(scan);
+    // Proxy 流水：左列表 + 右详情（双栏绑定）
     if (ev) {
-      document.getElementById('live-events').innerHTML =
-        ev.events && ev.events.length ? renderEvents(ev.events)
-                                      : '<div class="empty">暂无决策事件</div>';
+      const evs = ev.events || [];
+      const listEl = document.getElementById('live-events-list');
+      const detEl = document.getElementById('live-events-detail');
+      if (!evs.length) {
+        listEl.innerHTML = '<div class="empty">暂无决策事件</div>';
+        detEl.innerHTML = '<div class="empty">选择左侧事件查看详情</div>';
+      } else {
+        listEl.innerHTML = evs.map((e, i) =>
+          '<div class="item-row' + (i === EVENTS_SEL ? ' active' : '') +
+          '" onclick="selectEvent(' + i + ')">' +
+          '<span class="event-type">' + esc(e.type) + '</span>' +
+          '<span class="item-meta">' + esc(eventSummary(e)) + '</span></div>'
+        ).join('');
+        if (EVENTS_SEL === null || EVENTS_SEL >= evs.length) EVENTS_SEL = 0;
+        renderEventDetail(evs[EVENTS_SEL]);
+      }
     }
     if (ops) {
       document.getElementById('live-ops').innerHTML =
@@ -1328,6 +1532,39 @@ function loadLive() {
                                   : '<div class="empty">暂无原子操作</div>';
     }
   });
+}
+
+// Proxy 流水：选中事件下标 + 详情渲染
+let EVENTS_SEL = null;
+function selectEvent(i) {
+  EVENTS_SEL = i;
+  // 高亮刷新
+  document.querySelectorAll('#live-events-list .item-row').forEach(
+    (el, idx) => el.classList.toggle('active', idx === i));
+  api('/api/events?n=80').then(j => {
+    const evs = j.events || [];
+    if (i < evs.length) renderEventDetail(evs[i]);
+  }).catch(() => {});
+}
+function renderEventDetail(e) {
+  const el = document.getElementById('live-events-detail');
+  if (!e) { el.innerHTML = '<div class="empty">无事件</div>'; return; }
+  let h = '<div style="margin-bottom:10px"><span class="badge">' +
+          esc(e.type) + '</span> <span class="dim">' +
+          new Date(e.ts * 1000).toLocaleTimeString() + '</span>' +
+          (e.session ? ' · <b>' + esc(e.session) + '</b>' : '') + '</div>';
+  // 显示完整字段（prompt/llm_output 特殊展示）
+  if (e.type === 'prompt' || e.type === 'llm_output') {
+        const full = e.type === 'prompt'
+      ? '[system]' + String.fromCharCode(10) + (e.system || '') +
+        String.fromCharCode(10,10) + '[user]' + String.fromCharCode(10) + (e.user || '')
+      : (e.output || '');
+    h += '<pre class="detail-pre">' + esc(full) + '</pre>';
+  } else {
+    h += '<pre class="detail-pre">' +
+         esc(JSON.stringify(e, null, 2).replace(/\\n/g, String.fromCharCode(10))) + '</pre>';
+  }
+  el.innerHTML = h;
 }
 
 function renderHome(scan) {
