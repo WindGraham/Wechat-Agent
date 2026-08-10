@@ -98,6 +98,7 @@ TASK_BRIEF_PREAMBLE = """\
 # 事件类型
 EV_LOG_UPDATED = "log_updated"
 EV_TASK_DONE = "task_done"
+EV_MEMORY_WARM = "memory_warm"
 
 
 class Proxy:
@@ -172,6 +173,19 @@ class Proxy:
                           "session": task["session"], "ts": self._clock()})
         return True
 
+    def warm_memory(self, session: str, history_batch: list):
+        """冷启动记忆预热：喂一批聊天历史，让 agent 生成 memory（不回复）。
+
+        可多次调用（分批）：每批独立事件、独立处理，互不干扰
+        （同会话经会话锁串行，memory 去重保证不重复记）。
+        history_batch: 消息列表（Message 或含 sender/content 的对象）。
+        返回 True 表示已入队。"""
+        self._push_event({
+            "type": EV_MEMORY_WARM, "session": session,
+            "history_batch": list(history_batch), "ts": self._clock(),
+        })
+        return True
+
     def _push_event(self, ev: dict):
         with self._ev_lock:
             # 同会话同类事件合并（保留最新）
@@ -220,12 +234,53 @@ class Proxy:
             self._decide_session(ev["session"], mention_hint=ev.get("mention"))
         elif ev["type"] == EV_TASK_DONE:
             self._handle_task_done(ev["task_id"])
+        elif ev["type"] == EV_MEMORY_WARM:
+            self._warm_memory(ev["session"], ev.get("history_batch", []))
 
     # ================================================================== 决策
     def _session_lock(self, session: str) -> threading.Lock:
         with self._ev_lock:
             return self._session_locks.setdefault(
                 session, threading.Lock())
+
+    # ================================================================== 记忆预热
+    def _warm_memory(self, session: str, history_batch: list):
+        """冷启动记忆预热：从一批历史提取值得记的记忆（不回复）。
+
+        与正常决策的区别：
+          - 专用 prompt 强制"只输出 memory 操作，不回复"
+          - 解析后只执行 memory 工具（add/alias），忽略 reply/task
+          - 会话锁串行（同会话批之间互不干扰）+ memory 去重（不重复记）
+        """
+        if not history_batch:
+            log.warning("[%s] memory warm: 空批次，跳过", session)
+            return
+        with self._sem, self._session_lock(session):
+            t0 = time.monotonic()
+            _journal("memory_warm_start", session=session,
+                     batch=len(history_batch))
+            try:
+                messages = self._builder.build_warmup(session, history_batch)
+                out = self._provider.chat(messages)
+            except Exception as e:  # noqa: BLE001
+                log.warning("[%s] memory warm LLM 调用失败: %s: %s",
+                            session, type(e).__name__, e)
+                return
+            _journal("llm_output", session=session, round="warm",
+                     output=_clip(out))
+            # 只执行 memory 工具块；reply/task 忽略（不回复、不委派）
+            executed = 0
+            for b in extract_blocks(out):
+                if b.valid and b.tag == "tool":
+                    result = self._exec_tool(b, session)
+                    if not result.startswith("未知"):
+                        executed += 1
+                    log.info("[%s] memory warm: %s", session, result)
+            _journal("memory_warm_end", session=session,
+                     batch=len(history_batch), executed=executed,
+                     elapsed_ms=int((time.monotonic() - t0) * 1000))
+            log.info("[%s] memory warm 完成: %d 条历史, 执行 %d 个 memory 操作",
+                     session, len(history_batch), executed)
 
     def _decide_session(self, session: str, mention_hint: bool = False):
         """一个会话的一次决策（信号量 + 会话锁）。"""

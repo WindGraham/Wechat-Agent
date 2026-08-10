@@ -118,6 +118,47 @@ class ContextBuilder:
                 p for p in user_parts if p)},
         ]
 
+    def build_warmup(self, session: str, history_batch) -> list:
+        """冷启动记忆预热的专用 prompt。
+
+        与正常决策的区别：强制"只输出 memory 操作，不回复"——
+        系统只需从历史提取记忆，不需要 agent 回复用户。
+        history_batch: 消息列表（Message 或含 sender/content 的对象）。
+        """
+        # 渲染批次历史为文本行
+        lines = []
+        for m in history_batch:
+            sender = getattr(m, "sender", "?")
+            content = (getattr(m, "content", "") or "").replace("\n", " ")[:300]
+            if getattr(m, "is_mine", False):
+                sender = "我"
+            lines.append(f"{sender}: {content}")
+        batch_text = "\n".join(lines)
+
+        system = (
+            "# 记忆提取任务\n\n"
+            "你是微信人格 agent 的后台记忆整理模块。系统会把一批历史聊天记录"
+            "交给你，你要从中提取**值得长期记住**的信息，输出 memory 工具块。\n\n"
+            "## 硬性要求\n"
+            "1. **只输出 <tool name=\"memory\" .../> 块**，绝对不要输出 "
+            "<reply>/<task>/<silent/>——这是后台整理，不需要回复任何人\n"
+            "2. 提取准则：\n"
+            "   - 用户偏好/忌讳 → op=add scope=user（带 user 属性）\n"
+            "   - 群聊约定/固定梗 → op=add scope=session\n"
+            "   - 重要背景/关系/承诺 → op=add scope=global\n"
+            "   - 同一个人多个称呼 → op=alias（user=主称呼, alias=别的称呼）\n"
+            "3. **宁可少记，不记垃圾**：拿不准就不记；不确定是同一个人就别登记别名\n"
+            "4. 一次可输出多个 memory 块，按顺序执行"
+        )
+        user = (
+            f"【目标会话】{session}\n"
+            f"【这批聊天记录（{len(history_batch)} 条）】\n{batch_text}"
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
     def build_task_receipt(self, session: str, is_group: bool,
                            receipt: dict, history) -> list:
         """任务完成回调的 prompt：触发原因+新消息替换为【任务回执】。"""

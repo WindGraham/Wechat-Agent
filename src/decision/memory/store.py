@@ -254,8 +254,9 @@ class MemoryStore:
         for path in paths:
             for f in self._facts_of(path):
                 f = dict(f)
-                parent = os.path.basename(os.path.dirname(path))
-                f["_file"] = parent if parent != self._root else "global"
+                d = os.path.dirname(path)
+                f["_file"] = "global" if d == self._root \
+                    else os.path.basename(d)
                 hits.append(f)
         hits.sort(key=lambda f: -f.get("updated_at", 0))
         return hits[:limit]
@@ -276,8 +277,9 @@ class MemoryStore:
                     self._norm(f.get("key", ""))
                 if kw and kw in hay:
                     f = dict(f)
-                    f["_file"] = os.path.basename(os.path.dirname(path)) \
-                        if os.path.dirname(path) != self._root else "global"
+                    d = os.path.dirname(path)
+                    f["_file"] = "global" if d == self._root \
+                        else os.path.basename(d)
                     hits.append(f)
         hits.sort(key=lambda f: -f.get("updated_at", 0))
         return hits[:limit]
@@ -290,12 +292,16 @@ class MemoryStore:
             return [self._user_path(user)]
         if scope == "session":
             return [self._session_path(session)]
-        # all：global + 当前用户 + 当前会话（存在才查）
+        # all：global + 所有用户文件 + 所有会话文件（遍历目录）
         paths = [self._global_path()]
-        if user:
-            paths.append(self._user_path(user))
-        if session:
-            paths.append(self._session_path(session))
+        for sub in ("users", "sessions"):
+            base = os.path.join(self._root, sub)
+            try:
+                for fn in sorted(os.listdir(base)):
+                    if fn.endswith(".json"):
+                        paths.append(os.path.join(base, fn))
+            except OSError:
+                pass
         return paths
 
     def update(self, fact_id: str, content: str = None,
