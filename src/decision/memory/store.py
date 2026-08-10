@@ -189,6 +189,22 @@ class MemoryStore:
         facts = self._facts_of(path)
         return [f for f in facts if f.get("key") == key]
 
+    def list_scope(self, scope: str = "global", user: str = "",
+                   session: str = "", limit: int = 500) -> list:
+        """按 scope 全量取条目（注入器用，不按关键词过滤）。
+        scope: global / user / session / all。
+        返回带 _file 标注的条目列表（按 updated_at 倒序）。"""
+        paths = self._paths_for(scope, user, session)
+        hits = []
+        for path in paths:
+            for f in self._facts_of(path):
+                f = dict(f)
+                parent = os.path.basename(os.path.dirname(path))
+                f["_file"] = parent if parent != self._root else "global"
+                hits.append(f)
+        hits.sort(key=lambda f: -f.get("updated_at", 0))
+        return hits[:limit]
+
     def search(self, keyword: str, scope: str = "all", user: str = "",
                session: str = "", limit: int = 10) -> list:
         """按关键词模糊检索 content/key。

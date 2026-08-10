@@ -128,6 +128,7 @@ class Proxy:
             provider, writer=self._write_back,
             max_workers=self._rt("media_convert_concurrency", 2))
         self._memory = None            # 懒加载：MemoryTool（避免 import 开销）
+        self._memory_injector = None   # 懒加载：MemoryInjector（自动注入用）
         self._clock = clock
         self._watermarks_path = watermarks_path
 
@@ -294,11 +295,15 @@ class Proxy:
         tool_feedback = ""
         tool_calls = 0
         replied = False
+        # 记忆块：决策前自动拼接（L0 全局 + L2 当前会话 + L1 在场人）
+        # 每轮循环都带（工具反馈轮也保持记忆上下文）
+        memory_block = self._memory_block(session, is_group, history, new_msgs)
         for _round in range(MAX_TOOL_CALLS + 2):
             messages = self._builder.build(
                 session, is_group, trigger, history, new_msgs,
                 tool_feedback=tool_feedback,
-                running_tasks=self._ledger.running_for(session))
+                running_tasks=self._ledger.running_for(session),
+                memory_block=memory_block)
             _journal("prompt", session=session, round=_round,
                      system=_clip("\n\n".join(
                          m.get("content", "") for m in messages
@@ -329,7 +334,7 @@ class Proxy:
                 elif b.tag == "task":
                     task_blocks.append(b)
                 elif b.tag == "tool":
-                    tool_feedback += "\n[工具返回] " + self._exec_tool(b)
+                    tool_feedback += "\n[工具返回] " + self._exec_tool(b, session)
                 elif b.tag == "silent":
                     pass
 
@@ -404,17 +409,19 @@ class Proxy:
         return f"<{block.tag}{attrs}>{block.raw_inner}</{block.tag}>"
 
     # ---------------------------------------------------------------- 工具
-    def _exec_tool(self, block) -> str:
+    def _exec_tool(self, block, current_session: str = "") -> str:
         """执行 <tool> 块（决策层内联工具分发）。
 
         当前工具：
           - memory: 长期记忆读写（add/read/search/update/delete）
+        current_session: 当前决策会话（memory scope 缺省时按此推断，
+        对齐设计：缺省按当前会话记，不擅自跨会话）。
         扩展：websearch（本地+网络，异步）后续在此加分支。
         """
         attrs = parse_attrs(block.attrs)
         name = attrs.get("name", "")
         if name == "memory":
-            return self._memory_tool().run(attrs, current_session="")
+            return self._memory_tool().run(attrs, current_session=current_session)
         return f"未知工具: {name}"
 
     def _memory_tool(self):
@@ -423,6 +430,20 @@ class Proxy:
             from ..memory import MemoryTool
             self._memory = MemoryTool()
         return self._memory
+
+    def _memory_block(self, session, is_group, history, new_msgs) -> str:
+        """决策前自动拼接【记忆】块：L0 全局 + L2 当前会话 + L1 在场人。
+        任何异常降级为空串（记忆是增强，不是决策的硬依赖）。"""
+        try:
+            if self._memory_injector is None:
+                from ..memory import MemoryStore
+                from ..memory.injector import MemoryInjector
+                self._memory_injector = MemoryInjector(MemoryStore())
+            return self._memory_injector.build_memory_block(
+                session, is_group, history, new_msgs)
+        except Exception:  # noqa: BLE001
+            log.exception("memory 注入失败（降级空块）")
+        return ""
 
     # ---------------------------------------------------------------- 任务
     def _start_task(self, session: str, block):

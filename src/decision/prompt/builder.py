@@ -74,11 +74,13 @@ class ContextBuilder:
     # ---------------------------------------------------------------- 主构建
     def build(self, session: str, is_group: bool, trigger: str,
               history, new_messages, tool_feedback: str = "",
-              running_tasks=None) -> list:
+              running_tasks=None, memory_block: str = "") -> list:
         """返回 [{"role": "system", ...}, {"role": "user", ...}]。
 
         running_tasks: 该会话执行中的后台任务台账记录列表（实时板块，
-        防重复委派 + 让 LLM 知道"已经派人去办了"）。"""
+        防重复委派 + 让 LLM 知道"已经派人去办了"）。
+        memory_block: 自动注入的记忆块文本（proxy 用 MemoryInjector 拼好
+        传入；空串则不注入）。对应【记忆】块（L0全局+L2会话+L1在场人）。"""
         persona_text = self._personas.render(session)
         system_parts = self._lib.system_blocks(persona=persona_text)
         system = "\n\n".join(p for p in system_parts if p)
@@ -93,6 +95,9 @@ class ContextBuilder:
                 time=time.strftime("%Y-%m-%d %H:%M", lt),
                 weekday=f"周{weekday}", trigger=trigger),
         ]
+        # 记忆块在历史之前注入（LLM 先看到记忆背景，再看历史与新消息）
+        if memory_block:
+            user_parts.append(memory_block)
         if history:
             user_parts.append(self._lib.user_block(
                 "history", n=len(history),

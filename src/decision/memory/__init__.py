@@ -13,8 +13,9 @@
 """
 
 from .store import MemoryStore
+from .injector import MemoryInjector
 
-__all__ = ["MemoryTool", "MemoryStore"]
+__all__ = ["MemoryTool", "MemoryStore", "MemoryInjector"]
 
 
 class MemoryTool:
