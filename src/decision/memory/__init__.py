@@ -51,7 +51,8 @@ class MemoryTool:
 
     # ---------------------------------------------------------------- 操作
     def _scope(self, attrs: dict, current_session: str) -> str:
-        """scope 解析：显式指定优先；缺省时私聊按 user、群聊按 session。"""
+        """scope 解析：显式指定优先；缺省按当前会话（安全，不跨会话，
+        对齐 memory.md「scope 缺省按当前会话记，别擅自跨会话」）。"""
         scope = attrs.get("scope", "")
         if scope in ("global", "user", "session"):
             return scope
@@ -65,6 +66,15 @@ class MemoryTool:
         value = attrs.get("value", "") or attrs.get("content", "")
         if not value:
             return "memory add 缺 value/content 属性"
+        # 守卫：scope=user 必须带 user 属性——缺了会写进 users/unnamed.json
+        # （归属不明的记忆），违反 memory.md「scope=user 必带 user」硬规则
+        scope = self._scope(attrs, current_session)
+        if scope == "user" and not (attrs.get("user") or "").strip():
+            return "memory add: scope=user 必须带 user 属性（记忆归属谁）"
+        # 守卫：scope=session 且无任何会话可推断 → 拒绝（防写进 unnamed.json）
+        if scope == "session" and not (attrs.get("session") or "").strip() \
+                and not (current_session or "").strip():
+            return "memory add: scope=session 必须带 session 属性"
         # source 区分私聊/群聊：私聊记"私聊"，群聊记会话名——
         # 注入块据此标注 [来自私聊] vs [来自特高课]，LLM 能判断该不该说
         explicit = attrs.get("source", "")
@@ -77,7 +87,7 @@ class MemoryTool:
         entry = self._store.add(
             content=value,
             key=attrs.get("key", ""),
-            scope=self._scope(attrs, current_session),
+            scope=scope,
             user=attrs.get("user", ""),
             session=attrs.get("session", "") or current_session,
             source=src,

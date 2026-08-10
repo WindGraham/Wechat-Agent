@@ -51,9 +51,6 @@ def _load_index_html():
         return "<html><body>页面文件缺失: pages/index.html</body></html>"
 
 
-INDEX_HTML = _load_index_html()
-
-
 def create_app(project_root=None, proxy=None, supervisor=None,
                agent_callback_url=None, reloader=None):
     """Flask 应用工厂。project_root 指向仓库根（含 config/ 与 workspace/），

@@ -200,8 +200,17 @@ class MemoryStore:
                     self._write_json(path, data)
                     return f
 
-            # 新增
-            seq = len(facts) + 1
+            # 新增（id 取"现有最大序号+1"：删除后序号不回落，
+            # 否则新条目会复用已存在条目的 id，update/delete 会误伤
+            # ——2026-08-10 审查发现）
+            max_seq = 0
+            for f in facts:
+                fid = str(f.get("id", ""))
+                if fid.startswith(prefix + "_"):
+                    tail = fid.rsplit("_", 1)[-1]
+                    if tail.isdigit():
+                        max_seq = max(max_seq, int(tail))
+            seq = max_seq + 1
             entry = {
                 "id": f"{prefix}_{seq}",
                 "key": key or "general",

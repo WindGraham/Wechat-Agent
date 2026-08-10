@@ -154,7 +154,7 @@ class ContextBuilder:
             "3. **属性规则（违反会被丢弃）**：\n"
             "   - 内容一律放 **content 属性**（不要用 value，不要放标签体里）\n"
             "   - scope=user 时 **user 必填**；scope=session 时 **session 必填**；"
-            "scope 缺省视为 global\n"
+            "scope 缺省按当前会话记\n"
             "   - user/session 属性值是**对话里出现的准确称呼**，不要自己造\n"
             "4. 提取准则（scope 与粒度）：\n"
             "   - **某个人**的偏好/经历/身份 → op=add scope=user（content 里描述这个人）\n"

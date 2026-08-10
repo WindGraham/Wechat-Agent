@@ -97,7 +97,7 @@ TASK_BRIEF_PREAMBLE = """\
 
 # 事件类型（定义见 events.py）
 from .events import (EV_LOG_UPDATED, EV_TASK_DONE, EV_MEMORY_WARM,
-                     EV_SEARCH_DONE)  # noqa: E402,F401
+                     EV_SEARCH_DONE, same_event, sort_key)  # noqa: E402,F401
 
 
 class Proxy:
@@ -191,13 +191,9 @@ class Proxy:
         with self._ev_lock:
             # 同会话同类事件合并（保留最新）
             self._events = [e for e in self._events
-                            if not (e["type"] == ev["type"]
-                                    and e["session"] == ev["session"])]
+                            if not same_event(e, ev)]
             self._events.append(ev)
-            self._events.sort(key=lambda e: (
-                0 if e.get("owner") else 1 if e.get("mention")
-                else 2 if e["type"] == EV_TASK_DONE else 3,
-                e["ts"]))
+            self._events.sort(key=sort_key)
 
     # ================================================================== 主循环
     def run_forever(self, poll_s: float = 0.5):
@@ -270,10 +266,13 @@ class Proxy:
                 return
             _journal("llm_output", session=session, round="warm",
                      output=_clip(out))
-            # 只执行 memory 工具块；reply/task 忽略（不回复、不委派）
+            # 只执行 memory 工具块；reply/task 忽略（不回复、不委派）。
+            # 非 memory 工具（如 websearch）也跳过：预热是后台整理，绝不能
+            # 触发网络搜索 + 结果回灌再决策（那会真的回消息，2026-08-10 审查）
             executed = 0
             for b in extract_blocks(out):
-                if b.valid and b.tag == "tool":
+                if b.valid and b.tag == "tool" \
+                        and parse_attrs(b.attrs).get("name") == "memory":
                     result = self._exec_tool(b, session)
                     if not result.startswith("未知"):
                         executed += 1
@@ -500,12 +499,11 @@ class Proxy:
     def _websearch_tool(self):
         """懒加载 WebSearchTool（注入 memory_store/reader 供本地段）。"""
         if self._websearch is None:
-            from ..search import WebSearchTool
             from ..memory import MemoryStore
-            svc = WebSearchTool.__new__(WebSearchTool)
-            from ..search.backend import SearchService
-            svc._svc = SearchService(memory_store=MemoryStore(), reader=self._reader)
-            self._websearch = svc
+            from ..search import SearchService, WebSearchTool
+            self._websearch = WebSearchTool(
+                search_service=SearchService(memory_store=MemoryStore(),
+                                             reader=self._reader))
         return self._websearch
 
     def _exec_websearch(self, attrs: dict, session: str = "") -> str:

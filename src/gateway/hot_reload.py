@@ -188,7 +188,6 @@ class HotReloadServer:
                     "error": f"端口 {self._port} 重建失败"}
 
         self._snap = cur
-        self._snap = cur
         if not changed:
             return {"ok": True, "reloaded": True,
                     "error": None, "note": "代码无变更，已强制重载"}
@@ -332,13 +331,3 @@ class HotReloadServer:
             log.error("热重启：真实端口重建失败（网关可能不可用），"
                       "请检查端口占用或重启网关")
             self._fail_until = now + FAIL_BACKOFF_S
-
-    def _bind_server_with(self, srv):
-        """把已建好的 werkzeug server 投入使用（起 serve 线程）。"""
-        with self._lock:
-            self._server = srv
-        t = threading.Thread(target=srv.serve_forever, daemon=True,
-                             name="gateway-werkzeug")
-        t.start()
-        self._server_thread = t
-        log.info("gateway server 已热重启 (pid=%s)", os.getpid())
