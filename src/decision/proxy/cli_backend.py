@@ -25,7 +25,13 @@ ENV_PATH = os.path.join(PROJECT_ROOT, "workspace", ".env")
 def _task_env() -> dict:
     """任务子进程环境：os.environ + workspace/.env 的全部键值。
     树洞 token 等凭据配在 .env 里，不注入的话子进程环境变量是空的，
-    kimi 拿到空 Bearer 请求 401，还会误判成"密钥过期"（2026-08-09 实测）。"""
+    kimi 拿到空 Bearer 请求 401，还会误判成"密钥过期"（2026-08-09 实测）。
+
+    额外补 PATH：agent 由 systemd 网关拉起时，shell 的 .bashrc/.zshrc 不会
+    加载，PATH 只有系统默认目录（/usr/local/bin:/usr/bin），找不到 kimi
+    （装在 ~/.kimi-code/bin）→ 任务子进程 CLI 启动失败（2026-08-10 实测：
+    agent 回复"kimi 命令找不到"）。这里显式把常见 CLI bin 目录拼进 PATH，
+    不依赖父进程 PATH。"""
     env = dict(os.environ)
     try:
         with open(ENV_PATH, encoding="utf-8") as f:
@@ -37,6 +43,17 @@ def _task_env() -> dict:
                 env[k.strip()] = v.strip().strip('"').strip("'")
     except OSError:
         pass
+
+    # 常见 CLI 可执行目录（kimi-code / opencode 等），确保任务子进程能找到
+    _CLI_BIN_DIRS = (
+        os.path.expanduser("~/.kimi-code/bin"),
+        os.path.expanduser("~/.opencode/bin"),
+        os.path.expanduser("~/.local/bin"),
+    )
+    cur = env.get("PATH", "")
+    parts = [d for d in _CLI_BIN_DIRS if d and d not in cur]
+    if parts:
+        env["PATH"] = ":".join(parts + [cur]) if cur else ":".join(parts)
     return env
 
 

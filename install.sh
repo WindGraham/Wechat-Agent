@@ -28,6 +28,10 @@ PYTHON=~/.venvs/wechat-agent/bin/python
 SERVICE_NAME="wechat-agent-gateway"
 ROOT="$(pwd)"
 
+# 任务 CLI(kimi/opencode)所在目录，systemd 拉起时 shell PATH 不会带进来，
+# 必须显式注入，否则 agent 任务子进程找不到 kimi（2026-08-10 实测）
+CLI_BIN_DIR="$HOME/.kimi-code/bin:$HOME/.opencode/bin:$HOME/.local/bin"
+
 install_user() {
     echo "==> 安装 systemd user 服务: $SERVICE_NAME"
     mkdir -p ~/.config/systemd/user
@@ -42,6 +46,8 @@ WorkingDirectory=$ROOT
 ExecStart=$PYTHON -m src.gateway
 Restart=always
 RestartSec=3
+# 任务 CLI(kimi)目录：systemd 不加载 shell PATH，显式注入（2026-08-10 实测）
+Environment=PATH=$CLI_BIN_DIR:/usr/local/bin:/usr/bin
 # 只杀网关主进程，不连带 agent 子进程（agent 由网关控制台管理，独立存活）
 KillMode=process
 # 可选：网关鉴权 token（设置后网页需 Authorization）
@@ -72,6 +78,8 @@ WorkingDirectory=$ROOT
 ExecStart=$PYTHON -m src.gateway
 Restart=always
 RestartSec=3
+# 任务 CLI(kimi)目录：systemd 不加载 shell PATH，显式注入（2026-08-10 实测）
+Environment=PATH=$CLI_BIN_DIR:/usr/local/bin:/usr/bin
 KillMode=process
 # Environment=WECHAT_AGENT_GATEWAY_TOKEN=your_token_here
 
