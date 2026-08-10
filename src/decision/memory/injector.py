@@ -31,7 +31,9 @@ MAX_PER_SCOPE = 500         # 全局/会话记忆上限（防御性）
 
 
 def _senders_of(history, new_messages) -> list:
-    """从历史+新消息提取会话中出现的人（非"我"的 sender，去重保序）。"""
+    """从历史窗口（最近 N 条）+新消息提取会话中出现的人（非"我"的 sender，
+    去重保序）。history 即 proxy 传入的窗口内历史（默认 200 条），
+    所以这里召回的人物 = 该会话窗口内出现的人。"""
     seen = OrderedDict()
     for rows in (history or [], new_messages or []):
         for m in rows:
@@ -53,7 +55,7 @@ class MemoryInjector:
         """拼【记忆】块文本；无任何记忆时返回空串（调用方跳过该块）。
 
         session: 当前会话名（L2 会话记忆用）
-        history/new_messages: 当前决策的上下文（提取会话中出现的人）
+        history/new_messages: 当前决策的上下文（提取窗口内在场的人）
         """
         parts = []
 
@@ -72,16 +74,26 @@ class MemoryInjector:
                      for f in session_facts[:MAX_PER_SCOPE]]
             parts.append("【本会话记忆】\n" + "\n".join(lines))
 
-        # ---- L1 会话中出现的人的用户记忆
+        # ---- L1 窗口内出现的人的用户记忆（支持别名反查）
         senders = _senders_of(history, new_messages)
         user_lines = []
-        for user in senders[:MAX_USERS]:
-            facts = self._store.list_scope("user", user=user) \
+        for display in senders[:MAX_USERS]:
+            # 别名反查：显示昵称 → 主用户（图图 → 风图）
+            resolved = self._store.resolve_user(display) \
+                if hasattr(self._store, "resolve_user") else (None, None)
+            canonical, _path = resolved
+            user_key = canonical or display      # 有别名用主用户，否则原样
+            facts = self._store.list_scope("user", user=user_key) \
                 if hasattr(self._store, "list_scope") else []
+            if not facts:
+                continue
+            # 标注：显示昵称 + 主用户（若不同则注明别名归属）
+            label = display if display == user_key else f"{display}(即{user_key})"
             for f in facts[:MAX_PER_USER]:
                 src = f.get("source", "")
-                label = f"[{user}" + (f" 来自{src}" if src else "") + "]"
-                user_lines.append(f"- {label} {f.get('content', '')}")
+                user_lines.append(
+                    f"- [{label}" + (f" 来自{src}" if src else "") + "] "
+                    + f.get('content', ''))
         if user_lines:
             parts.append("【对在场人的了解】\n" + "\n".join(user_lines))
 

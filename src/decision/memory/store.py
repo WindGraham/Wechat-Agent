@@ -66,6 +66,61 @@ class MemoryStore:
     def _user_path(self, user: str) -> str:
         return os.path.join(self._root, "users", sanitize_name(user) + ".json")
 
+    # ---------------------------------------------------------------- 别名
+    def resolve_user(self, display_name: str):
+        """把"会话里出现的昵称"解析到用户（支持别名）。
+
+        返回 (canonical_name, path) 或 (None, None)：
+          1. 先查主昵称文件（users/<昵称>.json）
+          2. 查不到 → 扫描所有用户文件的 aliases 列表，匹配则返回其主用户
+        用于召回：会话里出现"图图"，若风图有别名"图图"，则召回风图的记忆。
+        """
+        name = (display_name or "").strip()
+        if not name:
+            return None, None
+        # 1. 主昵称直接命中
+        path = self._user_path(name)
+        data = self._read_json(path)
+        if data.get("facts") or data.get("aliases") is not None:
+            return name, path
+        # 2. 别名反查
+        users_dir = os.path.join(self._root, "users")
+        try:
+            for fn in os.listdir(users_dir):
+                if not fn.endswith(".json"):
+                    continue
+                p = os.path.join(users_dir, fn)
+                d = self._read_json(p)
+                aliases = d.get("aliases") or []
+                if any(self._norm(a) == self._norm(name) for a in aliases):
+                    canonical = d.get("user") or fn[:-5]
+                    return canonical, p
+        except OSError:
+            pass
+        return None, None
+
+    def add_alias(self, user: str, alias: str) -> bool:
+        """给用户加别名（昵称/别称标签）。写入用户文件 aliases 列表。"""
+        alias = (alias or "").strip()
+        user = (user or "").strip()
+        if not alias or not user:
+            return False
+        path = self._user_path(user)
+        with self._file_lock(path):
+            data = self._read_json(path)
+            data.setdefault("user", user)
+            aliases = data.setdefault("aliases", [])
+            if not any(self._norm(a) == self._norm(alias) for a in aliases):
+                aliases.append(alias)
+            data["updated_at"] = self._clock()
+            self._write_json(path, data)
+            return True
+
+    @staticmethod
+    def _norm(s: str) -> str:
+        """轻量归一化：去空白 + 小写（别名匹配用）。"""
+        return re.sub(r"\s+", "", s or "").lower()
+
     def _session_path(self, session: str) -> str:
         return os.path.join(self._root, "sessions",
                             sanitize_name(session) + ".json")

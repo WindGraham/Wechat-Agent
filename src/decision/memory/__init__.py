@@ -42,7 +42,9 @@ class MemoryTool:
                 return self._update(attrs)
             if op == "delete":
                 return self._delete(attrs)
-            return f"未知 memory 操作: {op}（可选 add/read/search/update/delete）"
+            if op == "alias":
+                return self._alias(attrs)
+            return f"未知 memory 操作: {op}（可选 add/read/search/update/delete/alias）"
         except Exception as e:  # noqa: BLE001
             return f"memory 操作失败: {type(e).__name__}: {e}"
 
@@ -115,3 +117,12 @@ class MemoryTool:
             return "memory delete 缺 id 属性"
         ok = self._store.delete(fid)
         return "已删除" if ok else f"未找到 id={fid}"
+
+    def _alias(self, attrs: dict) -> str:
+        """给用户加别名（昵称/别称）。user=主用户, alias=别名。"""
+        user = attrs.get("user", "")
+        alias = attrs.get("alias", "") or attrs.get("value", "")
+        if not user or not alias:
+            return "memory alias 需要 user(主用户) 和 alias(别名)"
+        ok = self._store.add_alias(user, alias)
+        return f"已给 {user} 加别名「{alias}」" if ok else "别名添加失败"
