@@ -3,6 +3,8 @@
 system/persona.md
 system/output_protocol.md
 system/tools.md
+system/tools/delegate_task.md
+system/tools/memory.md
 # user: 动态块（{占位符} 由 Proxy 填充）
 user/session_info.md
 user/history.md
