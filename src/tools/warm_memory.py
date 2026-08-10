@@ -138,7 +138,11 @@ def main(argv=None):
 
         runtime = RuntimeConfig(os.path.join(PROJECT_ROOT, "config",
                                              "runtime.json"))
-        provider = create_provider(prefer="kimi", model=args.model)
+        # prefer 决定 provider：deepseek → DeepSeekProvider(deepseek-chat)
+        # 其他(k3 等) → KimiProvider(用 --model 指定 k3/其他)
+        prefer = "deepseek" if args.model == "deepseek" else "kimi"
+        model = None if args.model in ("deepseek", "k3") else args.model
+        provider = create_provider(prefer=prefer, model=model)
         proxy = Proxy(provider=provider,
                       reader=None,      # 预热不需要 reader
                       submit_bundle=lambda s, x: None,

@@ -59,9 +59,10 @@ class MemoryTool:
         return "global"
 
     def _add(self, attrs: dict, current_session: str) -> str:
-        value = attrs.get("value", "")
+        # 兼容 value 与 content 两种属性名（LLM 输出习惯用 content）
+        value = attrs.get("value", "") or attrs.get("content", "")
         if not value:
-            return "memory add 缺 value 属性"
+            return "memory add 缺 value/content 属性"
         entry = self._store.add(
             content=value,
             key=attrs.get("key", ""),
