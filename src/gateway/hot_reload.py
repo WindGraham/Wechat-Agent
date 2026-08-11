@@ -40,17 +40,23 @@ def _gateway_dir():
 
 
 def _snapshot(gw_dir):
-    """返回 {绝对路径: mtime} 快照（只含 .py，排除 __pycache__）。"""
+    """返回 {绝对路径: mtime} 快照（.py，排除 __pycache__）。
+
+    递归扫 api/ 等子目录——蓝图拆文件后，改 api/agent.py 等必须
+    触发热重载（2026-08-10 修复：/api/aside 不生效的根因）。"""
     snap = {}
-    try:
-        for name in os.listdir(gw_dir):
-            if name.startswith("__") or name.endswith(".pyc"):
+    for root, dirs, files in os.walk(gw_dir):
+        dirs[:] = [d for d in dirs
+                   if d != "__pycache__" and not d.startswith("__")]
+        for name in files:
+            if not name.endswith(".py") or name.endswith(".pyc"):
                 continue
-            path = os.path.join(gw_dir, name)
-            if os.path.isfile(path) and name.endswith(".py"):
+            path = os.path.join(root, name)
+            try:
                 snap[path] = os.path.getmtime(path)
-    except OSError:
-        pass
+            except OSError:
+                pass
+    return snap
     return snap
 
 
@@ -62,7 +68,9 @@ def _reload_modules():
     """
     import src.gateway as pkg
     # reload 顺序：先子模块后包；app 是主要目标
-    for mod_name in ("src.gateway.group_config", "src.gateway.app",
+    for mod_name in ("src.gateway.group_config", "src.gateway.api.agent",
+                     "src.gateway.api.live", "src.gateway.api.memory",
+                     "src.gateway.api.config", "src.gateway.app",
                      "src.gateway"):
         try:
             mod = importlib.import_module(mod_name)
@@ -70,7 +78,7 @@ def _reload_modules():
         except Exception:  # noqa: BLE001
             log.exception("reload %s 失败", mod_name)
             raise
-    log.info("gateway 模块已 reload（app/group_config）")
+    log.info("gateway 模块已 reload（app/group_config/api.*）")
 
 
 class HotReloadServer:

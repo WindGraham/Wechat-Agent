@@ -48,6 +48,8 @@ Restart=always
 RestartSec=3
 # 任务 CLI(kimi)目录：systemd 不加载 shell PATH，显式注入（2026-08-10 实测）
 Environment=PATH=$CLI_BIN_DIR:/usr/local/bin:/usr/bin
+Environment=WECHAT_AGENT_GATEWAY_HOST=127.0.0.1
+Environment=WECHAT_AGENT_GATEWAY_PORT=13014
 # 只杀网关主进程，不连带 agent 子进程（agent 由网关控制台管理，独立存活）
 KillMode=process
 # 可选：网关鉴权 token（设置后网页需 Authorization）
@@ -80,6 +82,8 @@ Restart=always
 RestartSec=3
 # 任务 CLI(kimi)目录：systemd 不加载 shell PATH，显式注入（2026-08-10 实测）
 Environment=PATH=$CLI_BIN_DIR:/usr/local/bin:/usr/bin
+Environment=WECHAT_AGENT_GATEWAY_HOST=127.0.0.1
+Environment=WECHAT_AGENT_GATEWAY_PORT=13014
 KillMode=process
 # Environment=WECHAT_AGENT_GATEWAY_TOKEN=your_token_here
 

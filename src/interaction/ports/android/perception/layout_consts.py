@@ -93,6 +93,12 @@ BADGE_DOT_MIN_SIZE = 15         # 红点尺寸/面积窗口（过滤头像图里
 BADGE_DOT_MAX_SIZE = 32
 BADGE_DOT_MIN_AREA = 200
 BADGE_DOT_MAX_AREA = 700        # 红点 → unread = -1
+# 数字红圈上限：超出即头像里的红色内容，不是角标
+# （2026-08-10 摸鱼酱橙红帽头像 130x81/area3261 被误判为数字角标 → unread=-1
+#  幻影未读 → 盯屏死循环每 14s 一次空旅程）
+BADGE_NUM_MAX_W = 90            # 标定数字圈 w49-68，"99+" 胶囊更宽些
+BADGE_NUM_MAX_H = 60
+BADGE_NUM_MAX_AREA = 2600       # 标定 area 1700-2500
 MUTE_BELL_X0, MUTE_BELL_X1 = 940, 1065   # 免打扰铃铛窗口（预览行右端）
 
 # ---------------------------------------------------------------- 首页置顶 / 第一页

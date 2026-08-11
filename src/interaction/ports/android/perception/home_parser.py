@@ -138,6 +138,11 @@ def _item_badge(img, ocr_items, badges, y0):
             return -1, "dot"          # 小红点：有未读但未计数（免打扰）
         if barea <= LC.BADGE_DOT_MAX_AREA:
             continue                  # 太小的红色杂点（头像图里的红色），忽略
+        # 太大的红色块也不是角标——是头像内容（数字红圈最大也就 "99+" 胶囊）。
+        # 摸鱼酱橙红帽头像（130x81）曾在此漏过 → 幻影未读死循环（2026-08-10）
+        if bw > LC.BADGE_NUM_MAX_W or bh > LC.BADGE_NUM_MAX_H \
+                or barea > LC.BADGE_NUM_MAX_AREA:
+            continue
         digit = None
         for it in ocr_items:
             if it["text"].isdigit() and \

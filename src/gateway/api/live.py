@@ -13,18 +13,39 @@ from .common import list_tasks, read_json, read_jsonl_tail
 
 def create_bp(ctx: dict) -> Blueprint:
     root = ctx["root"]
+    agent_callback_url = ctx.get("agent_callback_url") or ""
     bp = Blueprint("live_api", __name__)
+
+    def _agent_current() -> dict:
+        """从 agent 回调端口拿当前执行条目（独立网关模式）。
+
+        失败返回 None——实况页降级为只显示队列快照（不显示"正在执行"）。"""
+        if not agent_callback_url:
+            return None
+        try:
+            import requests as _req
+            r = _req.get(agent_callback_url.rstrip("/") + "/status",
+                         timeout=3)
+            if r.status_code == 200:
+                return r.json()
+            return None
+        except Exception:  # noqa: BLE001
+            return None
 
     @bp.route("/api/status")
     def api_status():
         runtime_dir = os.path.join(root, "workspace", "runtime")
-        return jsonify({
+        data = {
             "ok": True,
             "queue": read_json(os.path.join(runtime_dir, "queue.json")),
             "watermarks": read_json(os.path.join(runtime_dir,
                                                  "watermarks.json")),
             "tasks": list_tasks(os.path.join(root, "workspace", "tasks")),
-        })
+        }
+        agent_st = _agent_current()
+        if agent_st and agent_st.get("current"):
+            data["current"] = agent_st["current"]
+        return jsonify(data)
 
     @bp.route("/api/events")
     def api_events():

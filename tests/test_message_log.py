@@ -168,6 +168,41 @@ class MessageLogTest(unittest.TestCase):
         # 重新打开本测试的标准连接，避免 tearDown 重复 close 报错
         self.conn = ml.connect(self.db)
 
+    # ---------------------------------------------------------- 锚定窗口（重复消息吞新消息）
+    def test_duplicate_old_message_does_not_swallow_new(self):
+        """2026-08-10 风图"你好呀"事故：同一发送人早先发过完全相同的消息，
+        屏底新消息会锚到旧副本上 → split 推到最后 → new=0 且无 gap，
+        消息被静默吞掉、水位永久停摆（交流一下？ seq 2032 卡死同源）。
+        修复：文本/divider 锚定只认日志尾最近 TEXT_ANCHOR_WINDOW 行。"""
+        sid = self._session()
+        # 历史：30+ 条消息，其中早期有一条"你好呀"
+        history = [Entry("张三", "你好呀")]
+        history += [Entry("李四", f"中间消息{i}") for i in range(30)]
+        r = ml.append_incremental(self.conn, sid, history)
+        self.assertEqual(r["inserted"], 31)
+
+        # 新屏幕：末尾几条旧消息 + 张三又发了一句一模一样的"你好呀"
+        screen = [Entry("李四", "中间消息28"), Entry("李四", "中间消息29"),
+                  Entry("张三", "你好呀")]
+        r = ml.append_incremental(self.conn, sid, screen)
+        self.assertFalse(r["gap"])
+        self.assertEqual(r["inserted"], 1)   # 新的"你好呀"必须入库
+        rows = ml.get_new_since(self.conn, sid, 31)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["content"], "你好呀")
+
+    def test_anchor_window_keeps_normal_incremental(self):
+        """窗口不破坏正常增量：屏底旧消息锚在日志尾（窗口内），其后为新。"""
+        sid = self._session()
+        entries = [Entry("张三", f"消息{i}") for i in range(1, 6)]
+        ml.append_incremental(self.conn, sid, entries)
+        screen = [Entry("张三", "消息4"), Entry("张三", "消息5"),
+                  Entry("张三", "消息6")]
+        r = ml.append_incremental(self.conn, sid, screen)
+        self.assertFalse(r["gap"])
+        self.assertEqual(r["inserted"], 1)
+        self.assertEqual(r["new"][0].content, "消息6")
+
 
 if __name__ == "__main__":
     unittest.main()

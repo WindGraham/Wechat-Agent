@@ -77,7 +77,10 @@ def archive_multimedia(img, session, is_group, messages,
     ordered = sorted(messages, key=lambda m: m["y"])
 
     for i, msg in enumerate(ordered):
-        if msg.get("content_type") != "multimedia":
+        # multimedia 正文，或 quote 消息的正文段含媒体（引用+图片/视频）
+        if msg.get("content_type") != "multimedia" \
+                and not (msg.get("content_type") == "quote"
+                         and msg.get("media_present")):
             continue
         x0, y0, x1, y1 = _crop_band(ordered, i)
         media_id = media_id_of(msg)

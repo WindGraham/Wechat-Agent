@@ -14,8 +14,11 @@
 
 from .store import MemoryStore
 from .injector import MemoryInjector
+from .vector_store import VectorStore
+from .extractor import MemoryExtractor
 
-__all__ = ["MemoryTool", "MemoryStore", "MemoryInjector"]
+__all__ = ["MemoryTool", "MemoryStore", "MemoryInjector",
+           "VectorStore", "MemoryExtractor"]
 
 
 class MemoryTool:
@@ -127,7 +130,7 @@ class MemoryTool:
         fid = attrs.get("id", "")
         if not fid:
             return "memory update 缺 id 属性"
-        value = attrs.get("value")
+        value = attrs.get("value") or attrs.get("content")
         conf = attrs.get("confidence")
         ok = self._store.update(fid, content=value,
                                 confidence=float(conf) if conf else None)

@@ -18,6 +18,7 @@ if __name__ == "__main__":
     raise SystemExit(1)
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -67,6 +68,10 @@ class WeChatTools:
         self.dev = DeviceCtl()
         # 每个会话见过的消息集合 {(sender, content)}，用于标 "(新)"
         self._seen_msgs = {}
+        # 手机操作互斥锁：proxy 线程和交互层线程共用同一台手机，
+        # 所有对外操作需持有此锁（防并发抢手机 —— 2026-08-11 朋友圈接线）
+        # 使用 RLock：post_text_moments 持锁期间内部也会调 WeChatTools 方法
+        self._phone_lock = threading.RLock()
 
     # ---------------------------------------------------------- 截图 + 解析
     def _snap(self, retry_low_conf=True):
@@ -183,28 +188,30 @@ class WeChatTools:
     # ---------------------------------------------------------- 工具 1
     def open_wechat(self):
         """打开微信（已在前台则直接用），返回当前页面描述。"""
-        log.info("tool call: open_wechat()")
-        try:
-            act = self.dev.get_current_activity()
-            if not act.startswith("com.tencent.mm"):
-                self.dev.open_wechat()
-                self.dev.wait_random(800, 1500)
-            state = self._snap()
-        except Exception as e:
-            return self._fail(f"打开微信失败: {e}")
-        r = self._result(state)
-        log.info("open_wechat -> %s", r.summary())
-        return r
+        with self._phone_lock:
+            log.info("tool call: open_wechat()")
+            try:
+                act = self.dev.get_current_activity()
+                if not act.startswith("com.tencent.mm"):
+                    self.dev.open_wechat()
+                    self.dev.wait_random(800, 1500)
+                state = self._snap()
+            except Exception as e:
+                return self._fail(f"打开微信失败: {e}")
+            r = self._result(state)
+            log.info("open_wechat -> %s", r.summary())
+            return r
 
     # ---------------------------------------------------------- 工具 2
     def enter_session(self, name):
         """进入指定会话：列表当前屏 -> 下翻最多 5 屏 -> 搜索 fallback。"""
-        log.info("tool call: enter_session(%r)", name)
-        try:
-            return self._enter_session(name)
-        except Exception as e:
-            log.exception("enter_session exception")
-            return self._fail(f"进入会话异常: {e}")
+        with self._phone_lock:
+            log.info("tool call: enter_session(%r)", name)
+            try:
+                return self._enter_session(name)
+            except Exception as e:
+                log.exception("enter_session exception")
+                return self._fail(f"进入会话异常: {e}")
 
     def _enter_session(self, name):
         state = self._snap()
@@ -306,26 +313,27 @@ class WeChatTools:
     def back(self):
         """返回上一页。输入框聚焦态下第一次 back 只取消聚焦（收起 IME 细条，
         页面不退出，2026-08-04 真机实测），此时页面未变化则补按一次。"""
-        log.info("tool call: back()")
-        try:
-            before = self.dev.get_current_activity()
-            before_state = self._snap()
-            before_page = (before_state["page"].get("type"),
-                           before_state["page"].get("title"))
-            self.dev.back()
-            self.dev.wait_random(800, 1500)
-            state = self._snap()
-            cur_page = (state["page"].get("type"), state["page"].get("title"))
-            if cur_page == before_page and before_page[0] == "wechat_chat":
-                log.info("back only unfocused input bar, press back again")
+        with self._phone_lock:
+            log.info("tool call: back()")
+            try:
+                before = self.dev.get_current_activity()
+                before_state = self._snap()
+                before_page = (before_state["page"].get("type"),
+                               before_state["page"].get("title"))
                 self.dev.back()
                 self.dev.wait_random(800, 1500)
                 state = self._snap()
-            r = self._result(state)
-        except Exception as e:
-            return self._fail(f"back 失败: {e}")
-        log.info("back -> %s (was %s)", r.summary(), before)
-        return r
+                cur_page = (state["page"].get("type"), state["page"].get("title"))
+                if cur_page == before_page and before_page[0] == "wechat_chat":
+                    log.info("back only unfocused input bar, press back again")
+                    self.dev.back()
+                    self.dev.wait_random(800, 1500)
+                    state = self._snap()
+                r = self._result(state)
+            except Exception as e:
+                return self._fail(f"back 失败: {e}")
+            log.info("back -> %s (was %s)", r.summary(), before)
+            return r
 
     # ---------------------------------------------------------- 工具 4/5
     def scroll_up(self):

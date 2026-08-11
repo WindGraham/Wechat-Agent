@@ -578,25 +578,36 @@ def merge_stack(conn, session_id, entries, source="backfill",
 
 
 # ---------------------------------------------------------------- 增量 append
+# 文本/divider 锚定窗口：只认日志尾最近 N 行。
+# 根因（2026-08-10 风图"你好呀"复现）：同一发送人发过内容完全相同的消息时，
+# 屏底的新消息会锚到几十行前的旧副本上——split 被推到屏内最后一条，
+# new=0 且不报 gap（有锚点），消息被静默吞掉且水位永久停摆
+# （交流一下？ seq 2032 卡死同源）。媒体匹配已有 last-3 窗口（下方），
+# 文本/divider 同样需要：底部增量读到的一定锚在末尾几行，窗口不影响正常锚定。
+TEXT_ANCHOR_WINDOW = 10
+
+
 def _entry_in_tail(entry, tail):
     """栈条目是否已在日志尾（L2 模糊判定）。divider 用归一化精确等值。
 
     多媒体匹配只认尾部最后 3 行（2026-08-09 JY君 新表情被吞修复）：
     媒体条目内容无法区分（转换后是描述、未转换是占位符），同发送人的
     新表情包会被误判命中 10 行前的旧媒体行 → 被当"已记录"丢弃。
+    文本/divider 匹配只认尾部最后 TEXT_ANCHOR_WINDOW 行（见上方注释）。
     底部增量读到的一定是末尾几行，限制窗口不影响锚定。"""
+    n = len(tail)
     if getattr(entry, "kind", "msg") == "divider":
         return any(row["content_type"] == "time_divider"
                    and normalize(entry.content) == normalize(row["content"])
-                   for row in tail)
+                   for row in tail[-TEXT_ANCHOR_WINDOW:])
     sender = _entry_sender(entry)
-    n = len(tail)
     for i, row in enumerate(tail):
         if row["content_type"] == "time_divider":
             continue
         if i >= n - 3 and _media_eq(entry, row):
             return True
-        if fuzzy_eq(sender, entry.content, row["sender"], row["content"]):
+        if i >= n - TEXT_ANCHOR_WINDOW and \
+                fuzzy_eq(sender, entry.content, row["sender"], row["content"]):
             return True
     return False
 

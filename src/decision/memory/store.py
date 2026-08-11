@@ -31,6 +31,7 @@ log = logging.getLogger("decision.memory.store")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 DEFAULT_MEMORY_ROOT = os.path.join(PROJECT_ROOT, "workspace", "memory")
+DEFAULT_VECTOR_ROOT = os.path.join(DEFAULT_MEMORY_ROOT, "vectors")
 
 # 目录/上限常量（定稿 §七）
 GLOBAL_LIMIT = 500          # 全局条目上限
@@ -48,12 +49,15 @@ class MemoryStore:
     """长期记忆存取。所有方法线程安全；写入用 tmp+replace 原子替换。"""
 
     def __init__(self, root: str = DEFAULT_MEMORY_ROOT,
-                 clock=time.time, lock_factory=threading.Lock):
+                 clock=time.time, lock_factory=threading.Lock,
+                 vector_store=None):
         self._root = root
         self._clock = clock
         # 每文件一个锁：不同文件可并发，同文件串行
         self._locks = {}
         self._locks_guard = threading.Lock()
+        # 向量存储（可选；未注入则不启用语义检索）
+        self._vs = vector_store
 
     # ---------------------------------------------------------------- 路径
     def _file_lock(self, path: str) -> threading.Lock:
@@ -189,8 +193,10 @@ class MemoryStore:
 
             # 去重：同 key + 内容相似 → 更新
             norm = self._norm(content)
+            # key 归一化：空 key → "general"（与写入逻辑一致）
+            cmp_key = key or "general"
             for f in facts:
-                if f.get("key") == key and norm and \
+                if f.get("key") == cmp_key and norm and \
                         self._norm(f.get("content", "")) == norm:
                     f["content"] = content
                     f["updated_at"] = now
@@ -198,6 +204,12 @@ class MemoryStore:
                                           confidence)
                     data["updated_at"] = now
                     self._write_json(path, data)
+                    # 同步向量存储（去重更新路径）
+                    if self._vs:
+                        self._vs.upsert(f["id"], f["content"],
+                                        {"scope": f.get("scope", ""),
+                                         "key": f.get("key", ""),
+                                         "user": user, "session": session})
                     return f
 
             # 新增（id 取"现有最大序号+1"：删除后序号不回落，
@@ -233,6 +245,12 @@ class MemoryStore:
                 facts.pop(idx)
             data["updated_at"] = now
             self._write_json(path, data)
+            # 同步向量存储
+            if self._vs:
+                self._vs.upsert(entry["id"], entry["content"],
+                                {"scope": entry["scope"],
+                                 "key": entry.get("key", ""),
+                                 "user": user, "session": session})
             return entry
 
     @staticmethod
@@ -263,9 +281,12 @@ class MemoryStore:
         for path in paths:
             for f in self._facts_of(path):
                 f = dict(f)
+                # _file = 文件名去 .json（用于区分不同用户/会话）
                 d = os.path.dirname(path)
-                f["_file"] = "global" if d == self._root \
-                    else os.path.basename(d)
+                if d == self._root:
+                    f["_file"] = "global"
+                else:
+                    f["_file"] = os.path.basename(path).rsplit(".json", 1)[0]
                 hits.append(f)
         hits.sort(key=lambda f: -f.get("updated_at", 0))
         return hits[:limit]
@@ -273,10 +294,34 @@ class MemoryStore:
     def search(self, keyword: str, scope: str = "all", user: str = "",
                session: str = "", limit: int = 10) -> list:
         """按关键词模糊检索 content/key。
-        scope=all 时跨 global+users+sessions 检索，带来源标注。"""
+        scope=all 时跨 global+users+sessions 检索，带来源标注。
+
+        优先走向量语义检索（需注入 vector_store）；回退到子串匹配。
+        """
         keyword = (keyword or "").strip()
         if not keyword:
             return []
+
+        # 优先语义检索
+        if self._vs:
+            scope_filter = None if scope == "all" else scope
+            ids = self._vs.search(keyword, n=limit,
+                                  scope_filter=scope_filter)
+            if ids:
+                hits = []
+                for fid in ids:
+                    for path in self._paths_for(scope, user, session):
+                        for f in self._facts_of(path):
+                            if f.get("id") == fid:
+                                f = dict(f)
+                                d = os.path.dirname(path)
+                                f["_file"] = "global" if d == self._root \
+                                    else os.path.basename(d)
+                                hits.append(f)
+                                break
+                return hits[:limit]
+
+        # 回退子串匹配
         kw = self._norm(keyword)
         hits = []
         paths = self._paths_for(scope, user, session)
@@ -330,6 +375,13 @@ class MemoryStore:
                     f["updated_at"] = self._clock()
                     data["updated_at"] = self._clock()
                     self._write_json(path, data)
+                    # 同步向量存储
+                    if self._vs:
+                        self._vs.upsert(fact_id, f.get("content", ""),
+                                        {"scope": f.get("scope", ""),
+                                         "key": f.get("key", ""),
+                                         "user": f.get("source", ""),
+                                         "session": f.get("source", "")})
                     return True
         return False
 
@@ -347,6 +399,9 @@ class MemoryStore:
             data["facts"] = new
             data["updated_at"] = self._clock()
             self._write_json(path, data)
+            # 同步向量存储
+            if self._vs:
+                self._vs.delete(fact_id)
             return True
 
     def _find_by_id(self, fact_id: str):
@@ -370,3 +425,33 @@ class MemoryStore:
             except OSError:
                 return None
         return None
+
+    # ---------------------------------------------------------------- 提取上下文
+    def get_context_for_extraction(self, session: str,
+                                   user_names: list) -> dict:
+        """为后置记忆提取提供「已有记忆上下文」。
+
+        返回 dict:
+          - session_memories: 当前会话的已有记忆列表
+          - user_memories: {user_name: [fact, ...]} 每个用户的已有记忆
+          - global_memories: 全局记忆列表
+
+        提取 LLM 据此判断：merge（update 已有 id）vs. add（新增）。
+        """
+        result = {
+            "session_memories": self._facts_of(self._session_path(session)),
+            "user_memories": {},
+            "global_memories": self._facts_of(self._global_path()),
+        }
+        for name in (user_names or []):
+            canonical, path = self.resolve_user(name)
+            if path:
+                result["user_memories"][canonical or name] = \
+                    self._facts_of(path)
+            else:
+                # 未解析到已有用户：查 users/ 目录下是否有该名称的文件
+                upath = self._user_path(name)
+                facts = self._facts_of(upath)
+                if facts:
+                    result["user_memories"][name] = facts
+        return result

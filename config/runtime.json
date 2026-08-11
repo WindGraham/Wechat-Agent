@@ -27,5 +27,21 @@
   "tool_model_text": "deepseek/v4-pro",
   "friend_auto_accept": true,
   "friend_check_interval": 1800,
-  "friend_max_accept": 30
+  "friend_max_accept": 30,
+  "decision_provider": "kimi",
+  "decision_model": "k3",
+  "decision_token_floor": 512,
+  "decision_token_ceiling": 0,
+  "extract_provider": "deepseek",
+  "extract_model": null,
+  "special_prompts": {
+    "memory_consolidation": {
+      "enabled": true,
+      "rate_per_day": 0.5
+    },
+    "cat_diary": {
+      "enabled": true,
+      "rate_per_day": 1.0
+    }
+  }
 }

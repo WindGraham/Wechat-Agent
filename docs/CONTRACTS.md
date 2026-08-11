@@ -123,6 +123,14 @@ QueueEntry:
 | `action_max_attempts` | 2 | 行动条目尝试上限 |
 | `task_retention_days` | 14 | tasks/ 目录保留天数 |
 | `tool_model` | `kimi-code/k3` | 工具层 subprocess 钉住的模型（kimi -m） |
+| `decision_provider` | `kimi` | 决策层 LLM 供应商（kimi/deepseek；网关热切换） |
+| `decision_model` | `k3` | 决策层模型名（如 deepseek-v4-flash/v4-pro，1M 上下文） |
+| `decision_token_floor` | 0 | 决策 max_tokens 下限（0=provider 默认，思考型 256） |
+| `decision_token_ceiling` | 0 | 决策 max_tokens 上限（0=不封顶） |
+
+`decision_*` 四个字段由网关「控制台 → 决策模型」面板维护：保存即持久化
+并转发 agent 回调端口 `/decision_model` 热切换（不重启 agent）；
+agent 不在线时只落盘，下次启动生效。
 
 ## 六、@我 判定规则（Policy 用）
 

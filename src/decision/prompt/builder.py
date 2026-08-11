@@ -15,6 +15,18 @@ log = logging.getLogger("decision.prompt.builder")
 
 _WEEKDAYS = "一二三四五六日"
 
+# 记忆提取清单：告诉 LLM 具体该关注什么类型的信息
+_EXTRACTION_CHECKLIST = (
+    "  - 【偏好与忌讳】用户明确说的喜欢/不喜欢、习惯（如\"我不吃辣\"\"别发表情包\"）\n"
+    "  - 【身份与背景】职业、学校、所在地、正在做的事（如考研、找工作、学车）\n"
+    "  - 【人际关系】谁是谁的谁（如\"他是我哥\"\"我俩是室友\"），谁和谁关系好/不好\n"
+    "  - 【承诺与约定】答应过的事、约定的时间（如\"下周给你答复\"\"周末去爬山\"）\n"
+    "  - 【群内文化】本群特有的梗、约定、氛围（如\"本群爱复读\"\"大家叫 X 为 Y\"）\n"
+    "  - 【技能与能力】谁会什么、在做什么项目、擅长什么\n"
+    "  - 【近期关注】某人最近在追的事、在讨论的话题、在纠结的问题\n"
+    "  - 【外号与别称】同一个人在不同场合被叫不同的名字 → 用 alias 登记"
+)
+
 
 class ContextBuilder:
     """组装决策 prompt。所有输入都是纯数据（契约类型），不依赖交互层实现。"""
@@ -29,11 +41,26 @@ class ContextBuilder:
 
     # ---------------------------------------------------------------- 渲染辅助
     @staticmethod
+    def _render_content(m) -> str:
+        """消息内容 → 决策层可见文本。quote 消息把被引用段与正文段
+        用明确标记拆开（入库格式：第一段=引用块文字，其余=本条正文）。"""
+        content = (getattr(m, "content", "") or "").strip()
+        ctype = getattr(m, "content_type", "text")
+        if ctype != "quote" or not content:
+            return content.replace("\n", " ")[:300]
+        parts = content.split("\n")
+        quoted = parts[0].strip()
+        body = " ".join(p.strip() for p in parts[1:] if p.strip())
+        if not body:
+            return f"[引用「{quoted}」]（本条只有引用，无正文）"
+        return f"[引用「{quoted}」] {body}"
+
+    @staticmethod
     def render_history(rows) -> str:
         """消息历史 → 文本行（[我]=自己，[@我]=@我的，divider 成时间行）。"""
         lines = []
         for m in rows:
-            content = (getattr(m, "content", "") or "").replace("\n", " ")[:300]
+            content = ContextBuilder._render_content(m)
             ctype = getattr(m, "content_type", "text")
             if ctype == "time_divider":
                 lines.append(f"—— {content} ——")
@@ -52,9 +79,15 @@ class ContextBuilder:
         lines = []
         for i, m in enumerate(new_messages, 1):
             sender = getattr(m, "sender", "?")
-            content = (getattr(m, "content", "") or "").replace("\n", " ")[:300]
+            content = ContextBuilder._render_content(m)
             lines.append(f"m{i} {sender}: {content}")
         return "\n".join(lines)
+
+    @staticmethod
+    def render_known_sessions(pairs) -> str:
+        """已知会话名单 → 文本行（[(name, is_group)]）。"""
+        return "\n".join(f"- {name}（{'群聊' if g else '私聊'}）"
+                         for name, g in pairs)
 
     @staticmethod
     def render_running_tasks(running_tasks) -> str:
@@ -74,13 +107,16 @@ class ContextBuilder:
     # ---------------------------------------------------------------- 主构建
     def build(self, session: str, is_group: bool, trigger: str,
               history, new_messages, tool_feedback: str = "",
-              running_tasks=None, memory_block: str = "") -> list:
+              running_tasks=None, memory_block: str = "",
+              known_sessions=None) -> list:
         """返回 [{"role": "system", ...}, {"role": "user", ...}]。
 
         running_tasks: 该会话执行中的后台任务台账记录列表（实时板块，
         防重复委派 + 让 LLM 知道"已经派人去办了"）。
         memory_block: 自动注入的记忆块文本（proxy 用 MemoryInjector 拼好
-        传入；空串则不注入）。对应【记忆】块（L0全局+L2会话+L1在场人）。"""
+        传入；空串则不注入）。对应【记忆】块（L0全局+L2会话+L1在场人）。
+        known_sessions: [(name, is_group)] 已知会话名单（跨会话投递时
+        提供准确会话名；空/None 则不注入）。"""
         persona_text = self._personas.render(session)
         system_parts = self._lib.system_blocks(persona=persona_text)
         system = "\n\n".join(p for p in system_parts if p)
@@ -98,6 +134,11 @@ class ContextBuilder:
         # 记忆块在历史之前注入（LLM 先看到记忆背景，再看历史与新消息）
         if memory_block:
             user_parts.append(memory_block)
+        # 已知会话名单：跨会话投递（<reply session="X">）时提供准确名称
+        if known_sessions:
+            user_parts.append(self._lib.user_block(
+                "known_sessions",
+                lines=self.render_known_sessions(known_sessions)))
         if history:
             user_parts.append(self._lib.user_block(
                 "history", n=len(history),
@@ -161,8 +202,11 @@ class ContextBuilder:
             "   - 群聊的约定/氛围/固定梗 → op=add scope=session\n"
             "   - 跨会话通用的事实/重要背景 → op=add scope=global\n"
             "   - 同一个人多个称呼 → op=alias（user=主称呼, alias=别的称呼）\n"
-            "5. **宁可少记，不记垃圾**：拿不准就不记；不确定是同一个人就别登记别名\n"
-            "6. 一次可输出多个 memory 块，按顺序执行"
+            "5. **宁可多记，不遗漏**：记错了可以 update/delete，漏了就没了。"
+            "每次提取至少输出 3-5 条记忆（除非对话真的毫无信息量）。\n"
+            "6. 一次可输出多个 memory 块，按顺序执行\n\n"
+            "## 具体该关注什么（逐类检查，每类都扫一遍）\n\n"
+            + _EXTRACTION_CHECKLIST
         )
         user = (
             f"【目标会话】{session}\n"
@@ -206,4 +250,37 @@ class ContextBuilder:
             {"role": "system", "content": system},
             {"role": "user", "content": "\n\n".join(
                 p for p in user_parts if p)},
+        ]
+
+    # ---------------------------------------------------------------- special
+    def build_special(self, prompt_name: str, context: dict) -> list:
+        """组装特殊 prompt 的 messages。"""
+        spec = self._lib.load_special(prompt_name)
+        if spec is None:
+            return []
+
+        system = spec["system"]
+        for k, v in (context or {}).items():
+            system = system.replace("{" + k + "}", str(v))
+
+        user_lines = []
+        for k, v in (context or {}).items():
+            if k in ("time", "prompt_name"):
+                continue
+            if isinstance(v, list) and v:
+                user_lines.append(f"## {k}")
+                for item in v[:50]:
+                    if isinstance(item, dict):
+                        user_lines.append(
+                            f"- [{item.get('source', '?')}] "
+                            f"{item.get('content', str(item))}")
+                    else:
+                        user_lines.append(f"- {item}")
+            elif isinstance(v, str) and v.strip():
+                user_lines.append(f"## {k}\n{v}")
+        user = "\n".join(user_lines) if user_lines else "(无额外上下文)"
+
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ]

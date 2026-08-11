@@ -154,8 +154,9 @@ class InjectorTest(_TmpStoreMixin, unittest.TestCase):
         inj = MemoryInjector(self.store)
         out = inj.build_memory_block("特高课", True,
                                      [self._msg("风图", "hi")], [])
-        self.assertIn("全局记忆", out)
-        self.assertIn("对在场人的了解", out)
+        self.assertIn("你是谁", out)                   # L0 全局块
+        self.assertIn("主人喜欢短消息", out)
+        self.assertIn("当前所在群", out)               # L1+L2 块
         self.assertIn("风图爱爬山", out)
         self.assertIn("来自", out)                     # 来源标注生效
 

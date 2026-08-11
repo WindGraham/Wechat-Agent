@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """decision/memory/injector.py — 记忆自动拼接（决策前注入）。
 
-在设计上对应【相关记忆】块的自动注入（DESIGN_DECISION_TOOL_ARCHITECTURE.md §五）：
-决策前把三层记忆拼进 prompt：
+决策前把记忆拼进 prompt，分四个区：
 
-  L0 全局记忆（global.json）        → 跨会话通用（agent 本体/主人/通用事实）
-  L2 当前会话记忆（sessions/）.     → 本会话特有（群梗/本群约定）
-  L1 目标会话出现的人的用户记忆     → 按"会话里出现的人"注入（用户的方案：
-                                     目标会话出现的人都倒入，上下文够大）
+  【你是谁】     L0 全局记忆（全量）— agent 核心身份、主人、能力边界
+  【当前所在群】  L2 当前会话 + L1 在场人的完整记忆（全量）
+  【你的世界】    所有群/人的轻量概览 — 让 agent 知道"外面还有谁"
+                 只列群名+一句话摘要、不在场人的名字，不展开完整事实
 
-注入规则（当前方案，按用户决策）：
-  - 会话中出现的人 = history + new_messages 里的非"我" sender
-  - 对每个人：拉其 users/<昵称>.json 的记忆（全部，量小）
-  - 上下文够大（1M），暂不担心超出 → 全量注入，不截断
-  - 只注入"当前会话出现的人"的记忆，不注入"没出现在这个会话的人"
-    （防泄露：没在这个会话说话的人，其记忆不进这个会话的 prompt）
+注入哲学：
+  - 相关上下文（当前群+在场人）→ 全量注入，不丢失细节
+  - 世界认知（其他群/人）→ 轻量概览，知道存在即可
+  - 需要深挖时 → agent 主动调 memory 工具搜索
 
-渲染成【记忆】块，带来源标注（source），LLM 可判断该不该提。
+渲染成【记忆】块，带来源标注。
 """
 
 import logging
@@ -24,16 +21,14 @@ from collections import OrderedDict
 
 log = logging.getLogger("decision.memory.injector")
 
-# 注入上限（防御性，防极端情况；正常全量注入）
-MAX_USERS = 50              # 最多注入多少个用户的记忆
-MAX_PER_USER = 100          # 每用户最多注入多少条
+# 注入上限（防御性）
+MAX_PER_USER = 15           # 每用户最多注入多少条（按 updated_at 倒序取最新）
 MAX_PER_SCOPE = 500         # 全局/会话记忆上限（防御性）
+SUMMARY_LEN = 40            # 世界概览中每条摘要截断长度
 
 
-def _senders_of(history, new_messages) -> list:
-    """从历史窗口（最近 N 条）+新消息提取会话中出现的人（非"我"的 sender，
-    去重保序）。history 即 proxy 传入的窗口内历史（默认 200 条），
-    所以这里召回的人物 = 该会话窗口内出现的人。"""
+def _senders_of(history, new_messages) -> set:
+    """从历史窗口 + 新消息提取会话中出现的人（非"我"的 sender）。"""
     seen = OrderedDict()
     for rows in (history or [], new_messages or []):
         for m in rows:
@@ -41,61 +36,120 @@ def _senders_of(history, new_messages) -> list:
             if not sender or sender in ("我", "self", "system"):
                 continue
             seen.setdefault(sender, True)
-    return list(seen.keys())
+    return set(seen.keys())
 
 
 class MemoryInjector:
-    """把 MemoryStore 的记忆拼成 prompt 块文本。使用 store 的公开检索接口。"""
+    """把 MemoryStore 的记忆拼成 prompt 块文本。"""
 
     def __init__(self, store):
         self._store = store
 
     def build_memory_block(self, session: str, is_group: bool,
                            history, new_messages) -> str:
-        """拼【记忆】块文本；无任何记忆时返回空串（调用方跳过该块）。
+        """拼【记忆】块文本：你是谁 + 当前所在群 + 你的世界。
 
-        session: 当前会话名（L2 会话记忆用）
-        history/new_messages: 当前决策的上下文（提取窗口内在场的人）
+        session: 当前会话名（标注"本群"）
+        history/new_messages: 提取"在场的人"
         """
         parts = []
 
-        # ---- L0 全局记忆（scope=global 全量）
-        globals_ = self._store.list_scope("global") \
+        all_facts = self._store.list_scope("all") \
             if hasattr(self._store, "list_scope") else []
+
+        # ---- 按 scope 分组
+        globals_ = [f for f in all_facts if f.get("scope") == "global"]
+        session_facts = [f for f in all_facts if f.get("scope") == "session"]
+        user_facts = [f for f in all_facts if f.get("scope") == "user"]
+
+        # 按用户分组
+        by_user = {}
+        for f in user_facts:
+            uname = f.get("_file", "unknown")
+            by_user.setdefault(uname, []).append(f)
+
+        # 当前窗口内在场的人
+        present = _senders_of(history, new_messages)
+
+        # ============================================================
+        # 1. 【你是谁】— 全局记忆，全量（agent 核心身份）
+        # ============================================================
         if globals_:
-            lines = [f"- [全局] {f.get('content', '')}" for f in globals_[:MAX_PER_SCOPE]]
-            parts.append("【全局记忆】\n" + "\n".join(lines))
+            lines = [f"- {f.get('content', '')}" for f in globals_[:MAX_PER_SCOPE]]
+            parts.append("【你是谁】\n" + "\n".join(lines))
 
-        # ---- L2 当前会话记忆（scope=session）
-        session_facts = self._store.list_scope("session", session=session) \
-            if hasattr(self._store, "list_scope") else []
-        if session_facts:
-            lines = [f"- [本会话] {f.get('content', '')}"
-                     for f in session_facts[:MAX_PER_SCOPE]]
-            parts.append("【本会话记忆】\n" + "\n".join(lines))
+        # ============================================================
+        # 2. 【当前所在群】— 本群记忆 + 在场人的完整记忆
+        # ============================================================
+        current_lines = []
 
-        # ---- L1 窗口内出现的人的用户记忆（支持别名反查）
-        senders = _senders_of(history, new_messages)
-        user_lines = []
-        for display in senders[:MAX_USERS]:
-            # 别名反查：显示昵称 → 主用户（图图 → 风图）
+        # 2a. 本群会话记忆
+        cur_session = [f for f in session_facts
+                       if f.get("_file") == session]
+        for f in cur_session:
+            current_lines.append(f"- [本群] {f.get('content', '')}")
+
+        # 2b. 在场人的完整记忆（支持别名反查）
+        for display in sorted(present):
             resolved = self._store.resolve_user(display) \
                 if hasattr(self._store, "resolve_user") else (None, None)
             canonical, _path = resolved
-            user_key = canonical or display      # 有别名用主用户，否则原样
-            facts = self._store.list_scope("user", user=user_key) \
-                if hasattr(self._store, "list_scope") else []
+            user_key = canonical or display
+            facts = by_user.get(user_key, [])
             if not facts:
                 continue
-            # 标注：显示昵称 + 主用户（若不同则注明别名归属）
+            # 按 updated_at 倒序取最新 MAX_PER_USER 条
+            facts = sorted(facts, key=lambda f: -f.get("updated_at", 0))
+            facts = facts[:MAX_PER_USER]
             label = display if display == user_key else f"{display}(即{user_key})"
             for f in facts[:MAX_PER_USER]:
                 src = f.get("source", "")
-                user_lines.append(
+                current_lines.append(
                     f"- [{label}" + (f" 来自{src}" if src else "") + "] "
                     + f.get('content', ''))
-        if user_lines:
-            parts.append("【对在场人的了解】\n" + "\n".join(user_lines))
+        if current_lines:
+            parts.append("【当前所在群】\n" + "\n".join(current_lines))
+
+        # ============================================================
+        # 3. 【你的世界】— 所有群/人的轻量概览
+        #    其他群：群名 + 最新一条记忆摘要
+        #    不在场的人：只列名字
+        # ============================================================
+        world_lines = []
+
+        # 3a. 其他群的概览
+        by_session = {}
+        for f in session_facts:
+            sname = f.get("_file", "?")
+            by_session.setdefault(sname, []).append(f)
+
+        if len(by_session) > 1 or (len(by_session) == 1
+                                    and session not in by_session):
+            world_lines.append("你参与的群：")
+            for sname in sorted(by_session, key=lambda s:
+                                (s != session, s)):
+                marker = "★" if sname == session else " "
+                facts = by_session[sname]
+                # 取最近一条作为摘要
+                latest = max(facts, key=lambda f: f.get("updated_at", 0))
+                summary = latest.get("content", "")
+                if len(summary) > SUMMARY_LEN:
+                    summary = summary[:SUMMARY_LEN] + "…"
+                n = len(facts)
+                extra = f" ({n}条记忆)" if n > 1 else ""
+                world_lines.append(f"  {marker} {sname} — {summary}{extra}")
+
+        # 3b. 不在场的人（只列名字）
+        known_users = set(by_user.keys())
+        others = known_users - present
+        # 也处理别名：如果 display 通过别名反查找到了用户，display 也算"在场"
+        # 这里简单处理：不在场的人中排除已注入的
+        if others:
+            names = sorted(others)
+            world_lines.append(f"你认识但不在场的人：{', '.join(names)}")
+
+        if world_lines:
+            parts.append("【你的世界】\n" + "\n".join(world_lines))
 
         if not parts:
             return ""

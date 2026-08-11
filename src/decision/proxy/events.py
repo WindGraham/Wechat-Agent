@@ -9,13 +9,18 @@
 EV_LOG_UPDATED = "log_updated"
 EV_TASK_DONE = "task_done"
 EV_MEMORY_WARM = "memory_warm"
+EV_MEMORY_EXTRACT = "memory_extract"
 EV_SEARCH_DONE = "search_done"
+EV_ASIDE = "aside"
+EV_SPECIAL_RUN = "special_run"      # 特殊 prompt 触发（scheduler 投硬币）
 
-# 优先级：0=主人 1=@我 2=任务回执 3=普通
+# 优先级：0=主人 1=@我 2=任务回执 3=普通 4=特殊prompt（最低）
 _PRIORITY = {
     "owner": 0,
     "mention": 1,
     EV_TASK_DONE: 2,
+    EV_ASIDE: 0,          # 旁注 = 直接对 proxy 的输入，最高优先级
+    EV_SPECIAL_RUN: 4,    # 低于主人/@我/任务回执/普通消息
 }
 
 
@@ -29,7 +34,10 @@ def priority_of(ev: dict) -> int:
 
 
 def same_event(a: dict, b: dict) -> bool:
-    """同会话同类事件判定（合并用：保留最新）。"""
+    """同会话同类事件判定（合并用：保留最新）。
+    EV_SPECIAL_RUN 不合并：每次触发是独立决策。"""
+    if a.get("type") == EV_SPECIAL_RUN or b.get("type") == EV_SPECIAL_RUN:
+        return False
     return a.get("type") == b.get("type") \
         and a.get("session") == b.get("session")
 

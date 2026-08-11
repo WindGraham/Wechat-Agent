@@ -18,7 +18,8 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.interaction.loop.unified_queue import UnifiedQueue
-from src.interaction.loop.journey import JourneyManager, SYNC_MAX_RETRIES
+from src.interaction.loop.journey import (
+    JourneyManager, SYNC_MAX_RETRIES, SCROLL_RESYNC_ROUNDS)
 from src.interaction.loop.run_loop import InteractionLoop
 
 
@@ -28,6 +29,7 @@ class FakeNav:
         self.enter_ok = enter_ok
         self.entered = []
         self.back_home_count = 0
+        self.scroll_down_count = 0
 
     def enter_session(self, session):
         self.entered.append(session)
@@ -36,6 +38,9 @@ class FakeNav:
 
     def back_to_home(self):
         self.back_home_count += 1
+
+    def scroll_down(self):
+        self.scroll_down_count += 1
 
 
 class FakeReader:
@@ -223,6 +228,114 @@ class TestActions(unittest.TestCase):
         self.assertEqual(len(sender.submitted),
                          1 + journey_mod.ABSORB_FUSE_ROUNDS)
         self.assertEqual(len(updates), 1)   # 铁律：退出前仍回传
+
+
+# ------------------------------------------------------------------ 水位兜底（F2）
+class FakeReaderWithCount(FakeReader):
+    """带 last_new_count 的 reader：模拟"通知有 @我 但同步为空"的场景。
+
+    new_counts[i] = 第 i+1 次 sync_session 后 last_new_count 的返回值；
+    超出列表长度时沿用最后一个值。"""
+
+    def __init__(self, new_counts=(0,), **kw):
+        super().__init__(**kw)
+        self._new_counts = list(new_counts)
+
+    def last_new_count(self, session):
+        idx = min(self.calls - 1, len(self._new_counts) - 1)
+        return self._new_counts[max(idx, 0)]
+
+
+class TestWatermarkBackstop(unittest.TestCase):
+    """2026-08-10 交流一下？事故：@我 通知但 sync 读 0 → 循环滚底重同步。
+    见 docs/BUGREPORT_TIMING_RACE_20260810.md §5.3。"""
+
+    def test_mention_empty_sync_triggers_scroll_resync(self):
+        """始终读不到新消息：滚满上限轮数后告警收尾（不空转死循环）。"""
+        reader = FakeReaderWithCount(new_counts=[0])
+        jm, q, reader, sender, nav, updates = make_journey(reader=reader)
+        q.push_notify("A", mention=True)
+        jm.process_entry(q.pop_next())
+        self.assertEqual(nav.scroll_down_count, SCROLL_RESYNC_ROUNDS)
+        self.assertEqual(reader.calls,
+                         1 + SCROLL_RESYNC_ROUNDS + 1)  # 初+滚+末
+        self.assertEqual(len(updates), 1)   # 铁律回传不受影响
+
+    def test_scroll_resync_recovers_messages(self):
+        """滚底重同步读到消息后，水位兜底静默收尾（不再告警）。"""
+        reader = FakeReaderWithCount(new_counts=[0, 3])
+        jm, q, reader, sender, nav, updates = make_journey(reader=reader)
+        q.push_notify("A", mention=True)
+        jm.process_entry(q.pop_next())
+        self.assertEqual(nav.scroll_down_count, 1)
+        self.assertEqual(reader.calls, 3)
+
+    def test_scroll_resync_loops_until_bottom_reached(self):
+        """2026-08-10 深夜复发：积压数小时、新消息在下方多屏深处时，
+        滚一屏不够——必须循环滚底+重同步直到读到新消息。"""
+        reader = FakeReaderWithCount(new_counts=[0, 0, 0, 5])
+        jm, q, reader, sender, nav, updates = make_journey(reader=reader)
+        q.push_notify("A", mention=True)
+        jm.process_entry(q.pop_next())
+        self.assertEqual(nav.scroll_down_count, 3)   # 第 3 屏读到，提前停
+        self.assertEqual(reader.calls, 1 + 3 + 1)
+
+    def test_no_scroll_when_sync_has_new(self):
+        reader = FakeReaderWithCount(new_counts=[2])
+        jm, q, reader, sender, nav, updates = make_journey(reader=reader)
+        q.push_notify("A", mention=True)
+        jm.process_entry(q.pop_next())
+        self.assertEqual(nav.scroll_down_count, 0)
+        self.assertEqual(reader.calls, 2)   # 初次 + 末次
+
+    def test_no_scroll_without_mention(self):
+        """无 @我 证据的普通通知不触发（通知栏可能残留旧通知，避免空滚）。"""
+        reader = FakeReaderWithCount(new_counts=[0])
+        jm, q, reader, sender, nav, updates = make_journey(reader=reader)
+        q.push_notify("A")
+        jm.process_entry(q.pop_next())
+        self.assertEqual(nav.scroll_down_count, 0)
+        self.assertEqual(reader.calls, 2)
+
+
+# ------------------------------------------------------------------ 在途条目（F3）
+class TestInFlightEntry(unittest.TestCase):
+    """SIGTERM 兜底：payload 未落地的条目登记在 current_entry，
+    落地/重排后立即解除（2026-08-10 怨憎会/交流一下？行动重启丢失事故）。"""
+
+    def test_current_entry_set_during_action_cleared_after(self):
+        jm, q, reader, sender, nav, updates = make_journey()
+        seen = []
+        orig = sender.submit_bundle
+
+        def spy(session, payload):
+            seen.append(jm.current_entry)
+            return orig(session, payload)
+
+        sender.submit_bundle = spy
+        q.push_action("A", "<b/>")
+        entry = q.pop_next()
+        jm.process_entry(entry)
+        self.assertEqual(seen, [entry])       # 执行期间在途登记指向该条目
+        self.assertIsNone(jm.current_entry)   # 落地后解除（不重复发送）
+
+    def test_current_entry_none_after_notify_journey(self):
+        jm, q, reader, sender, nav, updates = make_journey()
+        q.push_notify("A")
+        jm.process_entry(q.pop_next())
+        self.assertIsNone(jm.current_entry)
+
+    def test_reinsert_restores_inflight_action(self):
+        """main._install_sigterm_guard 的核心语义：在途条目 reinsert 后
+        仍在队列中，payload 不丢。"""
+        jm, q, reader, sender, nav, updates = make_journey()
+        q.push_action("A", "<b/>")
+        entry = q.pop_next()                  # 旅程 pop 出队（在途）
+        q.reinsert(entry)                     # SIGTERM 兜底重排
+        self.assertIn("A", q)
+        e = q.pop_next()
+        self.assertEqual(e.payload, "<b/>")
+        self.assertEqual(e.attempts, 0)       # reinsert 不碰 attempts/ts
 
 
 # ------------------------------------------------------------------ 暂停不丢行动（run_loop）

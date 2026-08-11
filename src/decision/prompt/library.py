@@ -3,12 +3,17 @@
 
 import logging
 import os
+import re
 
 log = logging.getLogger("decision.prompt.library")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 PROMPTS_DIR = os.path.join(PROJECT_ROOT, "config", "prompts")
+SPECIAL_DIR = os.path.join(PROMPTS_DIR, "special")
+
+# 简易 YAML frontmatter 解析（不依赖 pyyaml：够用即可）
+_FRONT_RE = re.compile(r'^---\s*\n(.*?)\n---\s*\n', re.DOTALL)
 
 
 class PromptLibrary:
@@ -61,3 +66,67 @@ class PromptLibrary:
         """取单个 user 块（如 'session_info'/'history'/'new_messages'/
         'task_receipt'）。"""
         return self.render(f"user/{name}.md", **slots)
+
+    # ---------------------------------------------------------------- special
+    def load_special(self, name: str) -> dict:
+        """加载 config/prompts/special/<name>.md。
+
+        返回 {"meta": {...}, "system": "..."}。
+        meta 从 YAML frontmatter 解析，system 是 body 部分。
+        文件不存在或格式错误时返回 None。
+        """
+        path = os.path.join(SPECIAL_DIR, f"{name}.md")
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = f.read()
+        except OSError:
+            log.warning("special prompt 文件缺失: %s", path)
+            return None
+
+        # 解析 frontmatter
+        m = _FRONT_RE.match(raw)
+        if not m:
+            log.warning("special prompt 缺少 YAML frontmatter: %s", path)
+            return None
+
+        meta = self._parse_frontmatter(m.group(1))
+        system = raw[m.end():].strip()
+        return {"meta": meta, "system": system}
+
+    @staticmethod
+    def _parse_frontmatter(yaml_text: str) -> dict:
+        """最简 YAML 解析：只支持 key: value（字符串/数字/布尔）。"""
+        meta = {}
+        for line in yaml_text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            # 布尔
+            if val.lower() in ("true", "yes"):
+                val = True
+            elif val.lower() in ("false", "no"):
+                val = False
+            # 数字
+            else:
+                try:
+                    val = float(val)
+                    if val == int(val):
+                        val = int(val)
+                except ValueError:
+                    pass
+            meta[key] = val
+        return meta
+
+    def list_specials(self) -> list:
+        """列出所有可用的 special prompt 名称。"""
+        names = []
+        if os.path.isdir(SPECIAL_DIR):
+            for fn in sorted(os.listdir(SPECIAL_DIR)):
+                if fn.endswith(".md"):
+                    names.append(fn[:-3])
+        return names

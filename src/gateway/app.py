@@ -34,6 +34,10 @@ _RUNTIME_FIELDS = {
     "owner": str,
     "owner_nick": str,
     "tool_model": str,
+    "decision_provider": str,
+    "decision_model": str,
+    "decision_token_floor": int,
+    "decision_token_ceiling": int,
 }
 _RUNTIME_INTERVAL_FIELDS = ("sweep_interval", "notify_interval")
 

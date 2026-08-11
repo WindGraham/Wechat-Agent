@@ -29,6 +29,7 @@ log = logging.getLogger("interaction.journey")
 
 SYNC_MAX_RETRIES = 2             # 日志同步失败后的重试次数
 ABSORB_FUSE_ROUNDS = 20          # 行动吸收防死循环保险丝（非驻留上限，见模块 docstring）
+SCROLL_RESYNC_ROUNDS = 6         # 水位兜底：滚底+重同步轮数上限（≈6 屏，覆盖数小时积压）
 
 
 class JourneyManager:
@@ -57,6 +58,10 @@ class JourneyManager:
         self._friend_ops = friend_ops
 
         self._dirty: set = set()   # 同步失败的会话：下轮循环优先补同步
+        # 正在执行的队列条目（其 payload 尚未落地）：SIGTERM 优雅退出时
+        # 兜底 reinsert 回队列（2026-08-10 怨憎会/交流一下？行动重启丢失事故，
+        # 见 docs/BUGREPORT_TIMING_RACE_20260810.md）
+        self._current_entry: Optional[QueueEntry] = None
 
         # 可注入（测试用）
         self._sleep = time.sleep
@@ -71,6 +76,11 @@ class JourneyManager:
         """端口导航器（供 run_loop 乱逛等场景使用）。"""
         return self._nav
 
+    @property
+    def current_entry(self):
+        """payload 尚未落地的在途条目；无则 None（SIGTERM 兜底重排用）。"""
+        return self._current_entry
+
     def take_dirty_sessions(self) -> list:
         """取出并清空 dirty 会话集合（run_loop 每轮开头调用，优先补同步）。"""
         dirty = sorted(self._dirty)
@@ -79,6 +89,14 @@ class JourneyManager:
 
     # ------------------------------------------------------------------ 旅程入口
     def process_entry(self, entry: QueueEntry) -> bool:
+        """处理一个队列条目（包装：登记在途条目，SIGTERM 时兜底重排）。"""
+        self._current_entry = entry
+        try:
+            return self._process_entry(entry)
+        finally:
+            self._current_entry = None
+
+    def _process_entry(self, entry: QueueEntry) -> bool:
         """处理一个队列条目：完整的进入→同步→行动→退出旅程。
 
         返回 True 表示有发送动作。
@@ -122,6 +140,32 @@ class JourneyManager:
             return False
         self._dirty.discard(session)
 
+        # 水位兜底（2026-08-10 交流一下？永久失明事故）：条目带 @我 证据
+        # 但同步 0 条——屏幕多半停在会话中段/懒加载未渲染/过渡帧，
+        # 新消息在屏外。循环滚向新消息一侧 + 重同步，直到读到新消息或
+        # 轮数耗尽；仍空则响亮告警，下轮通知还会再触发（绝不静默放过）。
+        # 循环理由（2026-08-10 深夜复发）：进会话落在"最早未读"位置时，
+        # 积压数小时的新消息在下方 N 屏深处，滚一屏根本够不到（实测
+        # 交流一下？3 小时积压 60 条 ≈ 6 屏，单屏滚动后 sync 依旧 new=0）。
+        if entry.mention and self._last_new_count(session) == 0:
+            log.warning("[%s] @我 通知但同步为空，循环滚底重同步", session)
+            for rd in range(SCROLL_RESYNC_ROUNDS):
+                try:
+                    self._nav.scroll_down()
+                except Exception:  # noqa: BLE001
+                    log.exception("[%s] 滚底失败", session)
+                    break
+                self._sleep(self._rand(0.6, 1.2))
+                retry_updated = self._reader.sync_session(session, is_group)
+                if retry_updated is not None:
+                    updated = retry_updated
+                if self._last_new_count(session):
+                    log.info("[%s] 滚底第 %d 屏读到新消息", session, rd + 1)
+                    break
+            else:
+                log.warning("[%s] 滚底重同步 %d 屏仍为空（疑似漏读，待下轮通知）",
+                            session, SCROLL_RESYNC_ROUNDS)
+
         sent = False
 
         # 3. 执行行动（如果有）
@@ -141,6 +185,7 @@ class JourneyManager:
             if followup is None or followup.kind != "action":
                 break
             log.info("[%s] follow-up round %d", session, round_i + 1)
+            self._current_entry = followup   # 在途登记：吸收的后续行动
 
             # 再次同步（有新消息可能在处理期间到达）；失败不阻塞行动执行
             if self._reader.sync_session(session, is_group) is None:
@@ -175,6 +220,16 @@ class JourneyManager:
         return sent
 
     # ------------------------------------------------------------------ 内部
+    def _last_new_count(self, session):
+        """最近一次 sync 的新增条数（reader 不支持时返回 None → 跳过兜底）。"""
+        getter = getattr(self._reader, "last_new_count", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(session)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _on_friend_page(self) -> bool:
         """当前是否停留在好友申请相关页（新的朋友列表/通过朋友验证）。"""
         try:
@@ -255,6 +310,10 @@ class JourneyManager:
             return False
 
         result = self._sender.submit_bundle(session, entry.payload)
+        # payload 已落地（成功/已重排/不可重试丢弃）→ 解除在途登记，
+        # 此后 SIGTERM 兜底不再重排本条目（避免重启后重复发送）
+        if self._current_entry is entry:
+            self._current_entry = None
         if result.ok:
             return True
 

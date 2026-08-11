@@ -153,13 +153,33 @@ def assemble(workspace_root, config_path, with_device=True):
                 entry = queue.push_action(session, xml)
                 return ActionResult(ok=entry is not None)
 
-            provider = create_provider()
+            provider = create_provider(
+                prefer=runtime.get("decision_provider", "kimi"),
+                model=runtime.get("decision_model") or None)
+            # token 上下限（网关可热调；0 = 用 provider 默认）
+            provider.set_token_limits(
+                runtime.get("decision_token_floor", 0),
+                runtime.get("decision_token_ceiling", 0))
             proxy = Proxy(
                 provider=provider,
                 reader=comp["session_reader"],
                 submit_bundle=submit_bundle,
                 runtime=runtime,
+                wechat_tools=comp.get("tools"),  # 朋友圈发帖等直接操作微信
             )
+            # 记忆提取用便宜模型（独立于主决策 provider，后台异步跑不占主模型配额）
+            extract_prefer = runtime.get("extract_provider", "deepseek")
+            extract_model = runtime.get("extract_model") or None
+            try:
+                extract_provider = create_provider(
+                    prefer=extract_prefer, model=extract_model)
+                proxy.set_extract_provider(extract_provider)
+                manifest.append(
+                    f"decision: 提取 provider={extract_provider.model}")
+            except Exception as e:
+                log.warning("提取 provider 创建失败，回退到主决策 provider: %s", e)
+                manifest.append(
+                    f"decision: 提取 provider 不可用，回退主模型")
             proxy_thread = threading.Thread(
                 target=proxy.run_forever, daemon=True, name="decision-proxy")
             proxy_thread.start()
@@ -267,6 +287,34 @@ def _bridge_notify_queue(notify_queue, unified_queue, stop_ev):
 TASK_DONE_CALLBACK_PORT = 13015
 
 
+def _install_sigterm_guard(comp):
+    """SIGTERM 优雅退出兜底：在途行动重排回队列 + 快照最终落盘。
+
+    网关 supervisor 的 stop() 先 SIGTERM 给 grace 期再 SIGKILL
+    （src/gateway/supervisor.py）。旅程条目 pop 出队后不在快照里，
+    进程一死行动就丢（2026-08-10 怨憎会/交流一下？行动重启丢失、
+    canglang 行动重发事故，见 docs/BUGREPORT_TIMING_RACE_20260810.md）。
+    """
+    import signal
+
+    def _handler(signum, frame):
+        try:
+            journey = comp.get("journey")
+            queue = comp.get("queue")
+            entry = getattr(journey, "current_entry", None) if journey else None
+            if entry is not None and queue is not None:
+                log.info("SIGTERM: 在途条目重排 %s (kind=%s)",
+                         entry.session, entry.kind)
+                queue.reinsert(entry)
+            if queue is not None:
+                queue.flush()
+        except Exception:  # noqa: BLE001
+            log.exception("SIGTERM 兜底处理失败")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handler)
+
+
 def _start_task_done_callback(comp):
     """启动极薄的本地 HTTP 回调：网关 /api/task_done 转发到这里，
     注入 proxy.inject_task_done（进程外任务完成回执，2026-08-09 用户要求）。
@@ -286,6 +334,68 @@ def _start_task_done_callback(comp):
         if not task_id:
             return jsonify({"ok": False, "error": "缺 task_id"}), 400
         return jsonify({"ok": bool(proxy.inject_task_done(task_id))})
+
+    @cb_app.route("/aside", methods=["POST"])
+    def _aside():
+        body = request.get_json(silent=True) or {}
+        session = (body.get("session") or "").strip()
+        text = (body.get("text") or "").strip()
+        if not session or not text:
+            return jsonify({"ok": False, "error": "缺 session/text"}), 400
+        ok = proxy.inject_aside(
+            session, text, sender=body.get("sender") or None)
+        return jsonify({"ok": bool(ok)})
+
+    @cb_app.route("/status", methods=["GET"])
+    def _status():
+        """当前执行条目 + 队列快照（网关实况页"正在执行的时序"用）。
+
+        原子操作联动：前端拿当前条目的 started_ts（queue.json 的 ts），
+        按时间窗查 /api/ops 即可——ops 流不含会话上下文，只能按时间关联。
+        """
+        journey = comp.get("journey")
+        queue = comp.get("queue")
+        entry = getattr(journey, "current_entry", None) if journey else None
+        cur = None
+        if entry is not None:
+            cur = {
+                "session": entry.session,
+                "kind": entry.kind,
+                "mention": bool(getattr(entry, "mention", False)),
+                "ts": getattr(entry, "ts", 0.0),
+                "payload": getattr(entry, "payload", "") or "",
+                "attempts": int(getattr(entry, "attempts", 0)),
+                "sources": sorted(getattr(entry, "sources", set())),
+            }
+        q = []
+        if queue is not None:
+            try:
+                q = queue.snapshot()
+            except Exception:  # noqa: BLE001
+                q = []
+        return jsonify({"ok": True, "current": cur, "queue": q})
+
+    @cb_app.route("/decision_model", methods=["GET", "POST"])
+    def _decision_model():
+        """决策模型热切换（2026-08-11 用户要求）：网关 /api/decision_model
+        转发到这里。GET 返回实况；POST 重建 provider 并热替换（不重启 agent）。
+        token 上下限随 body 一并热调（0 = 保留当前值）。"""
+        if request.method == "GET":
+            return jsonify({"ok": True, "provider": proxy.provider_info()})
+        body = request.get_json(silent=True) or {}
+        prefer = (body.get("provider") or "").strip() or "kimi"
+        model = (body.get("model") or "").strip() or None
+        try:
+            from .decision import create_provider
+            p = create_provider(prefer=prefer, model=model)
+            p.set_token_limits(body.get("token_floor", 0),
+                               body.get("token_ceiling", 0))
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": False,
+                            "error": f"provider 创建失败: "
+                                     f"{type(e).__name__}: {e}"}), 400
+        proxy.set_provider(p)
+        return jsonify({"ok": True, "provider": proxy.provider_info()})
 
     port = int(os.environ.get("WECHAT_AGENT_CALLBACK_PORT",
                               TASK_DONE_CALLBACK_PORT))
@@ -340,6 +450,7 @@ def main(argv=None):
         return 0
 
     comp["bridge"].start()
+    _install_sigterm_guard(comp)
 
     # agent 侧 task_done 回调端口（独立网关模式：网关 /api/task_done 转发至此）
     _start_task_done_callback(comp)

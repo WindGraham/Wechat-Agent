@@ -148,6 +148,11 @@ def main(argv=None):
                       submit_bundle=lambda s, x: None,
                       runtime=runtime)
 
+        # 确保 warm_memory 使用带向量存储的 MemoryStore
+        # （让预热生成的记忆直接支持语义检索）
+        _store = proxy._memory_store()  # 触发懒加载 + 向量存储初始化
+        log.info("向量存储: %d 条已有记忆", _store._vs.count() if _store._vs else 0)
+
         # 逐批注入（每次 warm_memory 入队后，直接 run_once 处理该批，
         # 保证批次间串行、互不干扰）
         done = 0

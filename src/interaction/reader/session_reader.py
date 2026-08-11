@@ -39,6 +39,7 @@ class SessionReader:
         self._media_dir = media_dir or ""
         self._owner_nick = owner_nick or ""
         self._gap_fail: dict = {}       # session -> 连续 gap 次数
+        self._last_new: dict = {}       # session -> 最近 sync 新增条数（水位兜底用）
         self._on_log_updated = None     # 回调：决策层的 LogUpdated 处理器
 
     # ------------------------------------------------------------------ 决策层接口
@@ -58,6 +59,31 @@ class SessionReader:
             return bool(row["is_group"]) if row else None
         except Exception:  # noqa: BLE001
             return None
+
+    def last_new_count(self, session: str):
+        """最近一次 sync_session 的新增条数；未同步过返回 None。
+
+        水位兜底用（2026-08-10 交流一下？事故）：通知/@我 证据显示有新
+        消息但 sync 读到 0 时，旅程据此触发滚底重同步。"""
+        return self._last_new.get(session)
+
+    def known_sessions(self, limit: int = 15) -> list:
+        """已知会话名单（决策层 prompt 用）：[(name, is_group)] 按最近活跃排序。
+
+        跨会话投递时 LLM 需要准确会话名（2026-08-10 路由发错群事故：
+        主人让"去交流一下群发言"，LLM 不知道确切群名，把话留在了当前群）。
+        只列有消息记录的会话并按最近消息排序——OCR 噪声会话
+        （结巴名/垃圾尾巴名）消息少且旧，自然沉底出榜。"""
+        try:
+            rows = self._conn.execute(
+                "SELECT s.name, s.is_group, MAX(m.ts_captured) AS last_ts "
+                "FROM sessions s "
+                "JOIN messages m ON m.session_id = s.session_id "
+                "GROUP BY s.session_id "
+                "ORDER BY last_ts DESC LIMIT ?", (limit,)).fetchall()
+            return [(r["name"], bool(r["is_group"])) for r in rows]
+        except Exception:  # noqa: BLE001
+            return []
 
     def get_context(self, session: str, n: int = 200) -> list:
         """按量拉取历史：返回尾部 n 条 Message，seq 升序（最新在尾）。"""
@@ -101,6 +127,7 @@ class SessionReader:
 
         # 2. 增量写库（gap 自愈）
         new_entries = self._append_gap_aware(sid, session, entries)
+        self._last_new[session] = len(new_entries)
 
         # 3. 多媒体打标（非文字泡 → 占位符 + 裁图路径）
         if new_entries:

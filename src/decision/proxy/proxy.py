@@ -97,7 +97,9 @@ TASK_BRIEF_PREAMBLE = """\
 
 # 事件类型（定义见 events.py）
 from .events import (EV_LOG_UPDATED, EV_TASK_DONE, EV_MEMORY_WARM,
-                     EV_SEARCH_DONE, same_event, sort_key)  # noqa: E402,F401
+                     EV_MEMORY_EXTRACT, EV_SPECIAL_RUN,
+                     EV_SEARCH_DONE, EV_ASIDE,
+                     same_event, sort_key)  # noqa: E402,F401
 
 
 class Proxy:
@@ -112,11 +114,13 @@ class Proxy:
     def __init__(self, provider, reader, submit_bundle, runtime,
                  builder: ContextBuilder = None, policy: Policy = None,
                  cli_backend=None, clock=time.time,
-                 watermarks_path=WATERMARKS_PATH, tasks_root=None):
+                 watermarks_path=WATERMARKS_PATH, tasks_root=None,
+                 wechat_tools=None):
         self._provider = provider
         self._reader = reader
         self._submit_bundle = submit_bundle
         self._runtime = runtime
+        self._wechat_tools = wechat_tools  # 朋友圈发帖等需要直接操作微信
         self._builder = builder or ContextBuilder(
             owner=getattr(runtime, "get", lambda k, d=None: d)("owner", ""))
         self._policy = policy or Policy(
@@ -129,10 +133,19 @@ class Proxy:
             max_workers=self._rt("media_convert_concurrency", 2))
         self._memory = None            # 懒加载：MemoryTool（避免 import 开销）
         self._memory_injector = None   # 懒加载：MemoryInjector（自动注入用）
+        self._memory_extractor = None  # 懒加载：MemoryExtractor（后置提取）
+        self._extract_provider = None  # 提取用便宜模型（独立于主决策 provider）
         self._websearch = None         # 懒加载：WebSearchTool
         self._search_feedback = {}     # session -> 待回灌的搜索结果文本
         self._clock = clock
         self._watermarks_path = watermarks_path
+
+        # Special Scheduler：特殊 prompt 投硬币器
+        from .special_scheduler import SpecialScheduler
+        self._special_scheduler = SpecialScheduler(
+            push_fn=self._push_event,
+            configs=self._rt("special_prompts", {}),
+            clock=self._clock)
 
         # 并发结构
         self._events = []                    # 事件队列（优先级排序）
@@ -146,6 +159,41 @@ class Proxy:
     def _rt(self, key, default=None):
         get = getattr(self._runtime, "get", None)
         return get(key, default) if get else default
+
+    # ---------------------------------------------------------------- provider 热切换
+    def set_provider(self, provider):
+        """热替换决策 LLM provider（网关模型切换，2026-08-11 用户要求）。
+
+        只换决策对话用的 provider；媒体转换器（MediaConverter）仍持有
+        启动时的 provider 引用——切换成无图像能力的模型（如 deepseek v4）
+        时，图片识别反而因此不受影响。
+        """
+        old = getattr(self._provider, "model", "?")
+        self._provider = provider
+        log.info("决策 provider 热切换: %s -> %s",
+                 old, getattr(provider, "model", "?"))
+
+    def set_extract_provider(self, provider):
+        """设置记忆提取专用 provider（通常用便宜模型，如 deepseek）。
+
+        不设置则回退到主决策 provider。
+        """
+        self._extract_provider = provider
+        # 重置 extractor（下次懒加载用新 provider）
+        self._memory_extractor = None
+        log.info("提取 provider 已设置: %s", getattr(provider, "model", "?"))
+
+    def _get_extract_provider(self):
+        """取提取用 provider：专用 > 主决策 provider。"""
+        return self._extract_provider or self._provider
+
+    def provider_info(self) -> dict:
+        """当前决策 provider 实况（网关展示用）。"""
+        p = self._provider
+        return {"model": getattr(p, "model", "?"),
+                "url": getattr(p, "_url", ""),
+                "token_floor": getattr(p, "_token_floor", 0),
+                "token_ceiling": getattr(p, "_token_ceiling", 0)}
 
     # ================================================================== 入向
     def notify_log_updated(self, ev: LogUpdated):
@@ -174,6 +222,22 @@ class Proxy:
                           "session": task["session"], "ts": self._clock()})
         return True
 
+    def inject_aside(self, session: str, text: str,
+                     sender: str = None) -> bool:
+        """旁注：网关直接对 proxy 输入一条消息（2026-08-10 用户要求）。
+
+        等价于在目标会话里以指定发送者身份"说了"一句话，触发一次
+        带该消息的决策。缺省发送者用 owner（主人），优先级最高。
+        """
+        if not text or not text.strip():
+            log.warning("inject_aside: 空文本，忽略")
+            return False
+        sender = sender or self._rt("owner", "")
+        self._push_event({"type": EV_ASIDE, "session": session,
+                          "text": text.strip(), "sender": sender,
+                          "ts": self._clock()})
+        return True
+
     def warm_memory(self, session: str, history_batch: list):
         """冷启动记忆预热：喂一批聊天历史，让 agent 生成 memory（不回复）。
 
@@ -198,10 +262,16 @@ class Proxy:
     # ================================================================== 主循环
     def run_forever(self, poll_s: float = 0.5):
         """事件循环（阻塞；入口以线程方式运行）。"""
+        last_tick = 0.0
         while not self._stop.is_set():
             ev = self._pop_event()
             if ev is None:
                 self._stop.wait(poll_s)
+                # 每分钟 tick 一次 scheduler
+                now = self._clock()
+                if now - last_tick >= 60.0:
+                    self._special_scheduler.tick(now)
+                    last_tick = now
                 continue
             try:
                 self._handle(ev)
@@ -259,13 +329,17 @@ class Proxy:
                      batch=len(history_batch))
             try:
                 messages = self._builder.build_warmup(session, history_batch)
-                out = self._provider.chat(messages)
+                if hasattr(self._provider, "chat_full"):
+                    out, thinking = self._provider.chat_full(messages)
+                else:
+                    out, thinking = self._provider.chat(messages), ""
             except Exception as e:  # noqa: BLE001
                 log.warning("[%s] memory warm LLM 调用失败: %s: %s",
                             session, type(e).__name__, e)
                 return
             _journal("llm_output", session=session, round="warm",
-                     output=_clip(out))
+                     output=_clip(out),
+                     thinking=_clip(thinking) if thinking else "")
             # 只执行 memory 工具块；reply/task 忽略（不回复、不委派）。
             # 非 memory 工具（如 websearch）也跳过：预热是后台整理，绝不能
             # 触发网络搜索 + 结果回灌再决策（那会真的回消息，2026-08-10 审查）
@@ -284,8 +358,11 @@ class Proxy:
                      session, len(history_batch), executed)
 
     def _decide_session(self, session: str, mention_hint: bool = False,
-                       force: bool = False):
-        """一个会话的一次决策（信号量 + 会话锁）。"""
+                       force: bool = False, extra_msgs: list = None):
+        """一个会话的一次决策（信号量 + 会话锁）。
+
+        extra_msgs: 外部注入的消息（旁注），附加到本次决策的新消息列表
+        尾部，让 LLM 在同一轮里看到。"""
         with self._sem, self._session_lock(session):
             is_group = self._reader.last_is_group(session)
             if is_group is None:
@@ -303,6 +380,9 @@ class Proxy:
                         if not getattr(m, "is_mine", False)
                         and getattr(m, "content_type", "text")
                         not in ("time_divider", "system")]
+            # 旁注附加：作为额外的"新消息"参与本轮决策
+            if extra_msgs:
+                new_msgs = new_msgs + list(extra_msgs)
 
             # @我 逐条必回（Policy）
             unreplied = self._policy.unreplied_mentions(session, new_msgs)
@@ -347,6 +427,12 @@ class Proxy:
                      replied=bool(reply_sent),
                      elapsed_ms=int((time.monotonic() - t0) * 1000))
 
+            # 后置记忆提取：agent 回复后异步提取本轮对话中的记忆
+            # （不占用决策轮次，用便宜模型，merge 已有记忆）
+            if reply_sent and new_msgs:
+                self._schedule_memory_extraction(
+                    session, history, new_msgs)
+
     def _llm_loop(self, session, is_group, trigger, history, new_msgs) -> bool:
         """LLM 调用循环：生成 → 解析 → 路由；tool 块回灌续生成。
         返回是否发出了回复。"""
@@ -360,12 +446,15 @@ class Proxy:
         # 记忆块：决策前自动拼接（L0 全局 + L2 当前会话 + L1 在场人）
         # 每轮循环都带（工具反馈轮也保持记忆上下文）
         memory_block = self._memory_block(session, is_group, history, new_msgs)
+        # 已知会话名单：跨会话投递的准确目标名（2026-08-10 发错群事故）
+        known_sessions = self._known_sessions()
         for _round in range(MAX_TOOL_CALLS + 2):
             messages = self._builder.build(
                 session, is_group, trigger, history, new_msgs,
                 tool_feedback=tool_feedback,
                 running_tasks=self._ledger.running_for(session),
-                memory_block=memory_block)
+                memory_block=memory_block,
+                known_sessions=known_sessions)
             _journal("prompt", session=session, round=_round,
                      system=_clip("\n\n".join(
                          m.get("content", "") for m in messages
@@ -374,14 +463,18 @@ class Proxy:
                          m.get("content", "") for m in messages
                          if m.get("role") == "user")))
             try:
-                out = self._provider.chat(messages)
+                if hasattr(self._provider, "chat_full"):
+                    out, thinking = self._provider.chat_full(messages)
+                else:
+                    out, thinking = self._provider.chat(messages), ""
             except Exception as e:  # noqa: BLE001
                 # LLM 调用失败（网络/限额/超时）：本轮放弃，不影响其他事件
                 log.warning("[%s] LLM 调用失败: %s: %s",
                             session, type(e).__name__, e)
                 return replied
             _journal("llm_output", session=session, round=_round,
-                     output=_clip(out))
+                     output=_clip(out),
+                     thinking=_clip(thinking) if thinking else "")
             blocks = [b for b in extract_blocks(out) if b.valid]
             if not blocks:
                 log.warning("[%s] 输出无合法块，重试一次", session)
@@ -411,8 +504,11 @@ class Proxy:
             for b in reply_blocks[:MAX_REPLY_BLOCKS]:
                 self._inject_quote_for_at(b, ref_map)
                 xml = self._block_to_xml(b, session)
-                ok = self._submit_bundle(session, xml).ok
-                deliveries.append({"session": session, "ok": bool(ok)})
+                # 跨会话投递：块内 session 属性优先（"从A群获取→发到B群"），
+                # 缺省回落到当前决策会话
+                target = parse_attrs(b.attrs).get("session") or session
+                ok = self._submit_bundle(target, xml).ok
+                deliveries.append({"session": target, "ok": bool(ok)})
                 if ok:
                     replied = True
             for b in task_blocks[:MAX_TASK_BLOCKS]:
@@ -478,9 +574,13 @@ class Proxy:
           - memory: 长期记忆读写（add/read/search/update/delete）
           - websearch: 查资料/搜索（本地段同步 + 网络段异步）
         current_session: 当前决策会话（memory scope 缺省时按此推断）。
+        工具调用与结果均记 journal（网关"工具"三竖列展示，2026-08-11）。
         """
         attrs = parse_attrs(block.attrs)
         name = attrs.get("name", "")
+        op = attrs.get("op", attrs.get("query", ""))
+        t0 = time.time()
+        result = ""
         if name == "memory":
             # is_group 用于 source 区分私聊/群聊（隐私边界：私聊内容绝不外泄）
             is_group = None
@@ -489,11 +589,18 @@ class Proxy:
                     is_group = self._reader.last_is_group(current_session)
             except Exception:  # noqa: BLE001
                 is_group = None
-            return self._memory_tool().run(
+            result = self._memory_tool().run(
                 attrs, current_session=current_session, is_group=is_group)
-        if name == "websearch":
-            return self._exec_websearch(attrs, current_session)
-        return f"未知工具: {name}"
+        elif name == "websearch":
+            result = self._exec_websearch(attrs, current_session)
+        else:
+            result = f"未知工具: {name}"
+        _journal("tool_call", session=current_session,
+                 tool=name, op=op[:60], attrs={k: str(v)[:120]
+                                               for k, v in attrs.items()},
+                 result=_clip(str(result)), elapsed_ms=int(
+                     (time.time() - t0) * 1000))
+        return result
 
     # ---------------------------------------------------------------- websearch
     def _websearch_tool(self):
@@ -554,17 +661,34 @@ class Proxy:
         else:
             feedback = (f"\n[工具返回] websearch('{query}') 结果:\n"
                         + SearchService.format_results(results or []))
+        _journal("tool_result", session=session, tool="websearch",
+                 op=query[:60], ok=not bool(error), error=error or "",
+                 result=_clip(feedback))
         self._search_feedback[session] = feedback
         log.info("[%s] websearch 结果回灌: query=%s", session, query)
         # 触发该会话再决策一轮（带上搜索结果）——force: 无新消息也进
         # （否则"无新消息跳过"会让搜索结果永远不被消费，2026-08-10 实测）
         self._decide_session(session, mention_hint=False, force=True)
 
+    def _memory_store(self):
+        """懒加载 MemoryStore（共享实例，带向量存储）。
+
+        injector / tool / extractor 共用同一个 store，避免向量存储不一致。
+        """
+        if not hasattr(self, "_memory_store_inst") or \
+                self._memory_store_inst is None:
+            from ..memory import MemoryStore, VectorStore
+            from ..memory.store import DEFAULT_MEMORY_ROOT, DEFAULT_VECTOR_ROOT
+            vs = VectorStore(DEFAULT_VECTOR_ROOT)
+            self._memory_store_inst = MemoryStore(
+                root=DEFAULT_MEMORY_ROOT, vector_store=vs)
+        return self._memory_store_inst
+
     def _memory_tool(self):
         """懒加载 MemoryTool（避免 import 开销，仅首次调用时构造）。"""
         if self._memory is None:
             from ..memory import MemoryTool
-            self._memory = MemoryTool()
+            self._memory = MemoryTool(store=self._memory_store())
         return self._memory
 
     def _memory_block(self, session, is_group, history, new_msgs) -> str:
@@ -572,14 +696,264 @@ class Proxy:
         任何异常降级为空串（记忆是增强，不是决策的硬依赖）。"""
         try:
             if self._memory_injector is None:
-                from ..memory import MemoryStore
                 from ..memory.injector import MemoryInjector
-                self._memory_injector = MemoryInjector(MemoryStore())
+                self._memory_injector = MemoryInjector(self._memory_store())
             return self._memory_injector.build_memory_block(
                 session, is_group, history, new_msgs)
         except Exception:  # noqa: BLE001
             log.exception("memory 注入失败（降级空块）")
         return ""
+
+    # ---------------------------------------------------------------- 后置记忆提取
+    def _schedule_memory_extraction(self, session: str, history,
+                                    new_msgs: list):
+        """调度后置记忆提取事件（不阻塞当前决策）。
+
+        把本轮对话文本 + 参与人列表打包成事件，由独立 handler 异步处理。
+        """
+        # 构建对话文本片段
+        lines = []
+        # 取最近 10 条历史 + 所有新消息
+        context = (list(history[-10:]) if history else []) + list(new_msgs)
+        for m in context:
+            sender = getattr(m, "sender", "?")
+            content = (getattr(m, "content", "") or "").replace("\n", " ")[:300]
+            if getattr(m, "is_mine", False):
+                sender = "我"
+            lines.append(f"{sender}: {content}")
+
+        # 提取参与人（非"我"的 sender）
+        user_names = list(set(
+            getattr(m, "sender", "") for m in context
+            if getattr(m, "sender", "") and getattr(m, "sender", "") != "我"
+            and not getattr(m, "is_mine", False)
+        ))
+
+        self._push_event({
+            "type": EV_MEMORY_EXTRACT,
+            "session": session,
+            "conversation_text": "\n".join(lines),
+            "user_names": user_names,
+            "ts": self._clock(),
+        })
+
+    def _extract_memory(self, session: str, conversation_text: str,
+                        user_names: list):
+        """执行后置记忆提取（由 handler 调用）。
+
+        从对话中提取记忆，与已有记忆合并（merge vs. add）。
+        同时触发定期 consolidation 检查。
+        """
+        extractor = self._get_memory_extractor()
+        if extractor is None:
+            return
+        try:
+            n = extractor.extract_from_conversation(
+                session, conversation_text, user_names)
+            if n:
+                log.info("[%s] 后置记忆提取: %d 条", session, n)
+        except Exception:
+            log.exception("[%s] 后置记忆提取失败", session)
+
+        # 检查是否需要定期整合
+        try:
+            extractor.maybe_consolidate(self._clock())
+        except Exception:
+            log.exception("记忆整合检查失败")
+
+    def _get_memory_extractor(self):
+        """懒加载 MemoryExtractor（用提取专用/主 provider）。"""
+        if self._memory_extractor is None:
+            from ..memory import MemoryExtractor
+            self._memory_extractor = MemoryExtractor(
+                store=self._memory_store(),
+                provider=self._get_extract_provider())
+        return self._memory_extractor
+
+    # ---------------------------------------------------------------- 特殊 prompt
+    def _run_special(self, prompt_name: str, session: str):
+        """执行一个特殊 prompt（由 SpecialRunHandler 调用）。
+
+        根据 output_mode 分流：
+          - memory: 记忆整合
+          - task: LLM 生成 <task> → 委派 CLI
+          - text: LLM 生成文本 → 保存文件
+        """
+        spec = self._builder._lib.load_special(prompt_name)
+        if spec is None:
+            log.warning("[%s] special prompt 加载失败", prompt_name)
+            return
+
+        meta = spec["meta"]
+        mode = meta.get("output_mode", "memory")
+
+        # 收集上下文
+        ctx = self._collect_special_context(prompt_name, meta)
+        ctx["time"] = time.strftime("%Y-%m-%d %H:%M %A",
+                                    time.localtime(self._clock()))
+
+        # 构建 messages
+        messages = self._builder.build_special(prompt_name, ctx)
+        if not messages:
+            return
+
+        # 调 LLM
+        try:
+            provider = self._get_extract_provider()  # 特殊 prompt 走便宜模型
+            if hasattr(provider, "chat_full"):
+                out, thinking = provider.chat_full(messages)
+            else:
+                out, thinking = provider.chat(messages), ""
+        except Exception as e:
+            log.warning("[%s] special LLM 调用失败: %s", prompt_name, e)
+            return
+
+        _journal("special_run", prompt=prompt_name, mode=mode,
+                 output=_clip(out))
+
+        # 按模式执行
+        if mode == "memory":
+            self._exec_special_memory(out, session)
+        elif mode == "task":
+            self._exec_special_task(out, session, meta)
+        elif mode == "text":
+            self._exec_special_text(out, prompt_name, meta)
+
+    def _collect_special_context(self, prompt_name: str,
+                                 meta: dict) -> dict:
+        """收集特殊 prompt 需要的上下文数据。"""
+        ctx = {}
+        # 近期记忆
+        mems = self._memory_store().list_scope("all", limit=30)
+        if mems:
+            ctx["memories"] = [
+                {"source": m.get("_file", "?"),
+                 "content": m.get("content", "")[:120]}
+                for m in mems[:20]
+            ]
+        return ctx
+
+    def _exec_special_memory(self, llm_output: str, session: str):
+        """memory 模式：只执行记忆工具块。"""
+        from ..memory.extractor import MemoryExtractor
+        extractor = self._get_memory_extractor()
+        n = extractor._execute_memory_blocks(llm_output, session)
+        log.info("[special] memory 模式: 执行 %d 个操作", n)
+
+    def _exec_special_task(self, llm_output: str, session: str,
+                           meta: dict):
+        """task 模式：先保存生成内容，再委派 task。"""
+        from ...shared.xml_blocks import extract_blocks, parse_attrs
+
+        # 提取 <task> 块
+        blocks = [b for b in extract_blocks(llm_output)
+                  if b.valid and b.tag == "task"]
+        if not blocks:
+            log.warning("[special] task 模式: 无 <task> 块")
+            return
+
+        for b in blocks:
+            attrs = parse_attrs(b.attrs)
+            desc = attrs.get("desc", "special task")
+            target = meta.get("target", "")
+
+            if target == "moments":
+                self._exec_moments_task(b, desc, session)
+            else:
+                # 通用 task：交给 CLI backend
+                self._start_task(session, b)
+
+    def _exec_moments_task(self, block, desc: str, session: str):
+        """执行朋友圈发布 task。
+
+        从 task body 中提取日记文本，先保存本地，再调 post_text_moments 真发。
+        """
+        body = (block.raw_inner or "").strip()
+        if not body:
+            log.warning("[special] moments task body 为空")
+            return
+
+        # 提取日记文本（在 "发布文字动态：" 之后的部分）
+        diary_text = body
+        for marker in ("发布文字动态：", "发布文字动态:\n", "发布纯文字："):
+            if marker in body:
+                diary_text = body.split(marker, 1)[1].strip()
+                break
+        # 去掉可能的引号包裹
+        diary_text = diary_text.strip().strip('"').strip("'").strip()
+
+        if not diary_text:
+            log.warning("[special] moments: 未提取到日记文本")
+            return
+
+        # 保存日记到文件
+        from ..memory.store import DEFAULT_MEMORY_ROOT
+        diary_dir = os.path.join(DEFAULT_MEMORY_ROOT, "cat_diary")
+        os.makedirs(diary_dir, exist_ok=True)
+        date_str = time.strftime("%Y-%m-%d", time.localtime(self._clock()))
+        diary_path = os.path.join(diary_dir, f"{date_str}.md")
+        with open(diary_path, "a", encoding="utf-8") as f:
+            f.write(f"\n---\n{diary_text}\n")
+        log.info("[special] 日记已保存: %s", diary_path)
+
+        # 真发朋友圈（持手机锁整段执行，防交互层插队）
+        if self._wechat_tools is None:
+            log.warning("[special] wechat_tools 未注入，跳过发朋友圈")
+        else:
+            lock = getattr(self._wechat_tools, "_phone_lock", None)
+            acquired = lock.acquire(timeout=120) if lock else True
+            if not acquired:
+                log.warning("[special] 手机锁超时（交互层忙碌），跳过发朋友圈")
+            else:
+                try:
+                    from ...interaction.ports.android.action.moments_poster \
+                        import post_text_moments
+                    log.info("[special] 开始发朋友圈...")
+                    result = post_text_moments(self._wechat_tools, diary_text)
+                    ok = result.get("ok") and result.get("posted")
+                    log.info("[special] 朋友圈发布: %s (posted=%s)",
+                             "成功" if ok else "失败",
+                             result.get("posted", False))
+                except Exception as e:
+                    log.exception("[special] 朋友圈发布异常: %s", e)
+                finally:
+                    if lock and acquired:
+                        lock.release()
+
+        # 保存为 global memory（先于发朋友圈：即使发圈失败也不丢日记）
+        ts_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(self._clock()))
+        try:
+            self._memory_store().add(
+                content=f"[{ts_str}] 猫娘日记：{diary_text}",
+                key="猫娘日记",
+                scope="global",
+                source="cat_diary",
+                confidence=1.0)
+        except Exception:
+            log.debug("日记 memory 写入失败", exc_info=True)
+
+    def _exec_special_text(self, llm_output: str, prompt_name: str,
+                           meta: dict):
+        """text 模式：保存文本到文件。"""
+        save_dir = os.path.join(
+            PROJECT_ROOT, "workspace", "memory", prompt_name)
+        os.makedirs(save_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S",
+                           time.localtime(self._clock()))
+        path = os.path.join(save_dir, f"{ts}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(llm_output.strip())
+        log.info("[special] text 模式: 已保存 %s", path)
+
+    def _known_sessions(self) -> list:
+        """已知会话名单（[(name, is_group)]）：跨会话投递的准确目标名。
+        reader 不支持/查询失败时降级空列表（增强项，不是硬依赖）。"""
+        try:
+            fn = getattr(self._reader, "known_sessions", None)
+            return fn() if callable(fn) else []
+        except Exception:  # noqa: BLE001
+            log.exception("known_sessions 查询失败（降级空名单）")
+            return []
 
     # ---------------------------------------------------------------- 任务
     def _start_task(self, session: str, block):
@@ -681,15 +1055,22 @@ class Proxy:
                      user=_clip("\n\n".join(
                          m.get("content", "") for m in messages
                          if m.get("role") == "user")))
-            out = self._provider.chat(messages)
+            if hasattr(self._provider, "chat_full"):
+                out, thinking = self._provider.chat_full(messages)
+            else:
+                out, thinking = self._provider.chat(messages), ""
             _journal("llm_output", session=session, round="receipt",
-                     output=_clip(out))
+                     output=_clip(out),
+                     thinking=_clip(thinking) if thinking else "")
             delivered = []
             for b in extract_blocks(out):
                 if b.valid and b.tag == "reply":
-                    ok = self._submit_bundle(
-                        session, self._block_to_xml(b, session)).ok
-                    delivered.append({"session": session, "ok": bool(ok)})
+                    # 跨会话投递：块内 session 属性优先（回执也可能带文件
+                    # 发给别的会话，如"简历发到 canglang"），缺省回落当前
+                    xml = self._block_to_xml(b, session)
+                    target = parse_attrs(b.attrs).get("session") or session
+                    ok = self._submit_bundle(target, xml).ok
+                    delivered.append({"session": target, "ok": bool(ok)})
             _journal("route", session=session, blocks=["receipt_reply"],
                      deliveries=delivered)
 

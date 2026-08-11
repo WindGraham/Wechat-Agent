@@ -46,12 +46,28 @@ class Reader:
         self._conn = conn if conn is not None else msg_log.connect(db_path)
 
     # ---------------------------------------------------------- 当前屏
+    # 过渡帧重试上限：搜索/列表进聊天页有 1~2s 转场动画，capture 可能截到
+    # 搜索页/列表页帧（2026-08-10 交流一下？sync new=0 永久失明事故，
+    # 见 docs/BUGREPORT_TIMING_RACE_20260810.md §3.1）
+    READ_PAGE_RETRIES = 2
+
     def read_current(self):
         """读取当前屏（不滑动）。返回 (entries 早→晚, state)。
 
         聊天页优先走 chat_slicer（头像顶切段：昵称/multimedia/partial 标记），
         失败降级旧的 elements 转换。"""
         state = self.frame_bus.capture()
+        # 过渡帧兜底：本方法只在旅程已进入会话后调用，页面理应是聊天页；
+        # 截到非聊天页帧 = 转场动画未结束，等它稳定后重截，最多
+        # READ_PAGE_RETRIES 次（仍非聊天页则按原样返回，不阻塞流程）。
+        for retry in range(self.READ_PAGE_RETRIES):
+            if state.get("page", {}).get("type") == "wechat_chat":
+                break
+            log.warning("read_current: 截到非聊天页帧(%s)，等待稳定重截 (%d/%d)",
+                        state.get("page", {}).get("type"),
+                        retry + 1, self.READ_PAGE_RETRIES)
+            self.dev.wait_random(600, 1000)
+            state = self.frame_bus.capture()
         entries = self._slice_entries(state)
         if entries is None:
             entries = self._state_to_entries(state)
@@ -83,6 +99,10 @@ class Reader:
         返回 None 表示不适用（非聊天页/无图/失败），调用方降级。"""
         try:
             if state.get("page", {}).get("type") != "wechat_chat":
+                # 不许静默：过渡帧/卡页时返回 None 会让 sync 读到空且
+                # 无任何痕迹（2026-08-10 交流一下？事故根因之一）
+                log.warning("_slice_entries: 非聊天页(%s)，跳过切段解析",
+                            state.get("page", {}).get("type"))
                 return None
             img = self.frame_bus.latest_raw()
             if img is None:
@@ -101,8 +121,12 @@ class Reader:
             ocr_items = run_ocr(img)
             sliced = slice_chat(img, ocr_items, is_group=is_group, title=title)
             msgs = sliced.get("messages", [])
-            # 多媒体归档（WP7）：裁图存会话专目录 + media_id 标注
-            if any(m.get("content_type") == "multimedia" for m in msgs):
+            # 多媒体归档（WP7）：裁图存会话专目录 + media_id 标注。
+            # quote 消息正文段可能是图片/视频（引用+媒体），一并归档
+            if any(m.get("content_type") == "multimedia"
+                   or (m.get("content_type") == "quote"
+                       and m.get("media_present"))
+                   for m in msgs):
                 try:
                     from .media_archive import archive_multimedia
                     msgs = archive_multimedia(img, title, is_group, msgs)

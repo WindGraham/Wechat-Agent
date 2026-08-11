@@ -16,6 +16,7 @@ proxy 的 _handle 只需查 _HANDLERS 分发。
 from .registry import EventHandler, get_handler, register_handler, _HANDLERS
 
 # 导入各处理器模块（触发注册）
-from . import log_updated, task_done, memory_warm, search_done  # noqa: F401
+from . import (log_updated, task_done, memory_warm, memory_extract,
+               special_run, search_done, aside)  # noqa: F401
 
 __all__ = ["EventHandler", "get_handler", "register_handler", "_HANDLERS"]

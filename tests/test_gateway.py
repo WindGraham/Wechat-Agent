@@ -190,6 +190,55 @@ class RuntimeApiTest(GatewayTestBase):
         self.assertEqual(r.status_code, 400)
 
 
+class DecisionModelApiTest(GatewayTestBase):
+    """决策模型切换 API（2026-08-11）：持久化 runtime.json + 转发 agent
+    热切换。测试环境无 agent_callback_url → 只持久化、applied=False。"""
+
+    def test_get_default(self):
+        r = self.client.get("/api/decision_model")
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertFalse(j["agent_online"])       # 测试环境无 agent
+        self.assertIsNone(j["live"])
+
+    def test_post_persists_without_agent(self):
+        r = self.client.post("/api/decision_model", json={
+            "provider": "deepseek", "model": "deepseek-v4-flash",
+            "token_floor": 256, "token_ceiling": 4096})
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertTrue(j["ok"])
+        self.assertFalse(j["applied"])            # agent 不在线：只落盘
+        self.assertIn("重启后", j["note"])
+        cfg = json.loads(self._r("config/runtime.json"))
+        self.assertEqual(cfg["decision_provider"], "deepseek")
+        self.assertEqual(cfg["decision_model"], "deepseek-v4-flash")
+        self.assertEqual(cfg["decision_token_floor"], 256)
+        self.assertEqual(cfg["decision_token_ceiling"], 4096)
+        # GET 能读回持久配置
+        j2 = self.client.get("/api/decision_model").get_json()
+        self.assertEqual(j2["config"]["decision_model"], "deepseek-v4-flash")
+
+    def test_post_validation(self):
+        # 非法 provider
+        r = self.client.post("/api/decision_model", json={
+            "provider": "openai", "model": "gpt"})
+        self.assertEqual(r.status_code, 400)
+        # 缺 model
+        r = self.client.post("/api/decision_model", json={
+            "provider": "kimi"})
+        self.assertEqual(r.status_code, 400)
+        # 上限 < 下限
+        r = self.client.post("/api/decision_model", json={
+            "provider": "kimi", "model": "k3",
+            "token_floor": 1024, "token_ceiling": 256})
+        self.assertEqual(r.status_code, 400)
+        # 校验失败不落盘
+        cfg = json.loads(self._r("config/runtime.json"))
+        self.assertNotIn("decision_model", cfg)
+
+
 class EnvApiTest(GatewayTestBase):
     def test_get_env_missing_file(self):
         r = self.client.get("/api/env")

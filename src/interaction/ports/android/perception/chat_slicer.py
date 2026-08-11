@@ -28,7 +28,7 @@ import numpy as np
 from . import layout_consts as LC
 from . import bubble_model
 from .chat_parser import normalize_text
-from .img_utils import comps_from_mask, estimate_bg, rect_contains
+from .img_utils import comps_from_mask, estimate_bg, rect_contains, x_overlap
 from .ocr_engine import recognize_line, ocr_region, fill_missing_lines
 
 # ---------------------------------------------------------------- 标定常量
@@ -229,10 +229,12 @@ def _has_tail(mask, comp, side):
 
 
 def _find_text_bubble(side, seg_y0, seg_y1, gray_comps, green_comps,
-                      bubble_mask, green_mask):
+                      bubble_mask, green_mask, quote_rects=None):
     """段内文字泡检索（§2.10 强制顺序：先做文字泡检测）。
     other 段找左缘 x>=140 的灰泡，self 段找右缘 x1>=700 的绿泡，
-    均需朝向头像侧的尾巴凸角。返回 (comp, kind, mask) 或 None。"""
+    均需朝向头像侧的尾巴凸角。返回 (comp, kind, mask) 或 None。
+    quote_rects: 引用块矩形列表——引用块灰度落在灰泡区间内，
+    必须排除，否则会被误当成文字泡（自己配自己）。"""
     if side == "other":
         cands = [(c, "gray", bubble_mask) for c in gray_comps
                  if BUBBLE_L_X0_MIN <= c[0] <= 400 and c[2] <= BUBBLE_MAX_W]
@@ -245,6 +247,11 @@ def _find_text_bubble(side, seg_y0, seg_y1, gray_comps, green_comps,
         cy = c[1] + c[3] / 2
         if not (seg_y0 - 10 <= cy < seg_y1):
             continue
+        if quote_rects and any(
+                rect_contains((q[0] - 2, q[1] - 2, q[2] + 4, q[3] + 4),
+                              c[0] + c[2] / 2, c[1] + c[3] / 2)
+                for q in quote_rects):
+            continue            # 引用块不是文字泡
         if _has_tail(mask, c, tail_side):
             hits.append((c, kind, mask))
     if not hits:
@@ -350,6 +357,38 @@ def _extract_center_msgs(ocr_items, consumed, gray, seg_y0, seg_y1,
     return msgs
 
 
+def _match_quote(quotes, used_quotes, ocr_items, consumed,
+                 ref_rect, ref_y0, ref_y1):
+    """引用块配对（自 chat_parser L459-470 平移）：在 quotes 中找与参考
+    矩形（文字泡 rect 或段条带）垂直相邻 + 水平重叠的引用块。
+
+    返回 (quote_text, matched_qi)；无配对返回 (None, None)。
+    ref_rect: 参考矩形（用于水平重叠判定）；ref_y0/ref_y1: 参考物垂直
+    范围（引用块在上方 gap_above，或罕见在下方 gap_below）。"""
+    for qi, (qc, _qv) in enumerate(quotes):
+        if qi in used_quotes:
+            continue
+        qx, qy, qw, qh = qc[:4]
+        gap_above = ref_y0 - (qy + qh)
+        gap_below = qy - ref_y1
+        if not ((-8 <= gap_above <= 115 or -8 <= gap_below <= 60)
+                and x_overlap(qc, ref_rect) >= qw * 0.35):
+            continue
+        q_hits = sorted(
+            (i for i, it in enumerate(ocr_items)
+             if not consumed[i]
+             and rect_contains((qx - 2, qy - 2, qw + 4, qh + 4),
+                               it["cx"], it["cy"])),
+            key=lambda i: (ocr_items[i]["box"][1],
+                           ocr_items[i]["box"][0]))
+        for i in q_hits:
+            consumed[i] = True
+        quote_text = "\n".join(ocr_items[i]["text"] for i in q_hits)
+        used_quotes.add(qi)
+        return quote_text, qi
+    return None, None
+
+
 def _base_msg(content_type, lines, partial_top, y):
     return {
         "side": None, "nickname": None, "content_type": content_type,
@@ -402,6 +441,25 @@ def slice_chat(img, ocr_items, is_group, title):
     green_comps = comps_from_mask(green_mask, min_area=LC.GREEN_MIN_AREA,
                                   close_ksize=9, min_w=LC.BUBBLE_MIN_W,
                                   min_h=LC.BUBBLE_MIN_H)
+
+    # ---- 引用块检测（自 chat_parser L396-410 平移）：深灰小块（引用预览）
+    # 引用消息的气泡上方会有一个深色小块，内含"昵称：被引用内容"。
+    # 全宽细条（置顶条/引用预览条）已由上面 carve 挖掉，这里按灰度+高度
+    # 从剩余 gray_comps 中挑出真正的引用块；末尾剩的孤儿引用块单独输出。
+    quotes = []                 # (rect, mean_val)
+    for c in gray_comps:
+        x, y, w, h, area = c
+        if w > BUBBLE_MAX_W and h < 170:
+            continue            # 全宽细条（置顶/引用预览条），非消息引用块
+        if y + h / 2 > LC.INPUT_BAR_Y0 - 60:
+            continue            # 输入栏附近的深色块（麦克风/加号面板）不是引用
+        sub = bubble_mask[y:y + h, x:x + w]
+        mean_val = float(gray[y:y + h, x:x + w][sub > 0].mean()) \
+            if area else LC.BUBBLE_GRAY
+        if mean_val < 40 and h < 150:
+            quotes.append((c, mean_val))
+    used_quotes = set()
+
     # 家具区：无尾巴的大灰块（加号面板会与输入栏并成整宽连通域）及其标签带，
     # 居中灰小字摘出要避开（面板标签"拍摄"等会伪装成居中小字）
     furniture_spans = []
@@ -455,10 +513,13 @@ def slice_chat(img, ocr_items, is_group, title):
         if avatar is not None:
             side = "other" if avatar["side"] == "L" else "self"
             low_confidence = avatar["low_confidence"]
+            media_present = False       # quote 消息正文是否含媒体（需归档）
 
             # ---- 文字泡优先（§2.10 强制顺序）
             found = _find_text_bubble(side, seg_y0, seg_y1, gray_comps,
-                                      green_comps, bubble_mask, green_mask)
+                                      green_comps, bubble_mask, green_mask,
+                                      quote_rects=[qc[:4] for qc, _qv in
+                                                   quotes])
             bubble_rect = None
             bubble_outline = None
             lines, content = [], ""
@@ -506,6 +567,19 @@ def slice_chat(img, ocr_items, is_group, title):
                     content_type = "text"               # OCR 彻底失败：占位
                     content, _c, _l = bubble_model.infer_unknown(w, h)
                     lines, low_confidence = [], True
+
+                # ---- 引用块配对（自 chat_parser L459-470 平移）
+                # 引用块通常在气泡上方（gap_above）或罕见在下方（gap_below），
+                # 水平重叠 >= 引用块宽的 35% 即视为同一消息的引用预览。
+                quote_text = None
+                if content_type == "text" and content.strip():
+                    quote_text, _qi = _match_quote(
+                        quotes, used_quotes, ocr_items, consumed,
+                        comp, y, y + h)
+                if quote_text:
+                    content_type = "quote"
+                    content = (quote_text + "\n" + content).strip()
+                    lines = content.split("\n")
             if content_type == "multimedia":
                 # OCR 提取段内一切可读文字，显式标注 multimedia（§2.10）
                 # 排除输入栏区域（cy >= 聚焦态栏顶 2015）：输入框里未发送的
@@ -528,11 +602,37 @@ def slice_chat(img, ocr_items, is_group, title):
                               if not (ocr_items[i]["h"] <= 50
                                       and ocr_items[i]["box"][0] >= CENTER_X0_MIN
                                       and 400 <= ocr_items[i]["cx"] <= 680)]
+                # 群聊段：昵称行在头像右侧条带内，rest 会把它并进内容
+                # （修复前靠 strip_nickname_line 剥首行；引用块配对后昵称
+                # 行变成第二行剥不掉）——直接从 rest 排除昵称条带
+                # （NICK_DY0..DY1 × 头像右缘起，cx 判定留 OCR 框抖动容差）
+                if is_group and side == "other" and avatar is not None:
+                    nick_x0 = avatar["x"] + avatar["w"] + NICK_DX0 - 15
+                    rest_items = [
+                        it for it in rest_items
+                        if not (it["cy"] >= avatar["y"] + NICK_DY0
+                                and it["cy"] <= avatar["y"] + NICK_DY1
+                                and it["cx"] >= nick_x0)]
                 lines = [it["text"] for it in rest_items]
                 content = "\n".join(lines)
                 confs = [it.get("conf") for it in rest_items]
                 if confs and all(c is not None for c in confs):
                     ocr_conf = round(sum(confs) / len(confs), 4)
+
+                # ---- 引用块配对（引用+图片/视频：正文无文字泡）
+                # 引用块在段上方（gap_above）或罕见在下方；水平重叠用段条带
+                # 与引用块 x 范围判定（段条带 x=0..SCREEN_W 全宽，等价于
+                # 引用块中心在内容区且不与头像列重叠）。
+                quote_text = None
+                seg_rect = (0, seg_y0, LC.SCREEN_W, seg_y1 - seg_y0)
+                quote_text, _qi = _match_quote(
+                    quotes, used_quotes, ocr_items, consumed,
+                    seg_rect, seg_y0, seg_y1)
+                if quote_text:
+                    content_type = "quote"
+                    content = (quote_text + "\n" + content).strip()
+                    lines = content.split("\n")
+                    media_present = True    # 引用+图片/视频：正文段需归档
 
             # ---- 昵称（仅群聊 other 段）
             nickname = None
@@ -564,6 +664,8 @@ def slice_chat(img, ocr_items, is_group, title):
                 "ocr_conf": ocr_conf,
                 "y": int(seg_y0),
             }
+            if content_type == "quote" and media_present:
+                msg["media_present"] = True     # 引用+图片/视频：正文需归档
             messages.append((seg_y0, msg))
             if avatar["rescued"]:
                 msg["low_confidence"] = True
@@ -572,6 +674,35 @@ def slice_chat(img, ocr_items, is_group, title):
         messages.extend(_extract_center_msgs(
             ocr_items, consumed, gray, seg_y0, seg_y1, occupied,
             capsule_rects, furniture_spans, partial_top_seg))
+
+    # ---- 孤儿引用块（正文滚出屏幕，无气泡可配对）：单独输出（自 chat_parser）
+    for qi, (qc, _qv) in enumerate(quotes):
+        if qi in used_quotes:
+            continue
+        qx, qy, qw, qh = qc[:4]
+        q_hits = sorted(
+            (i for i, it in enumerate(ocr_items)
+             if not consumed[i]
+             and rect_contains((qx - 2, qy - 2, qw + 4, qh + 4),
+                               it["cx"], it["cy"])),
+            key=lambda i: (ocr_items[i]["box"][1],
+                           ocr_items[i]["box"][0]))
+        for i in q_hits:
+            consumed[i] = True
+        text = "\n".join(ocr_items[i]["text"] for i in q_hits)
+        if not text.strip():
+            text = ocr_region(img, qc, pad=4, scale=1.5)   # 引用块小字兜底
+        if text.strip():
+            messages.append((qy, {
+                "side": None, "nickname": None,
+                "content_type": "quote", "lines": text.split("\n"),
+                "content": text, "content_norm": normalize_text(text),
+                "partial_top": qy <= LC.CONTENT_Y0 + 2,
+                "partial_bottom": False,
+                "avatar": None, "bubble_rect": list(qc[:4]),
+                "outline": None, "low_confidence": False,
+                "ocr_conf": None, "y": int(qy),
+            }))
 
     messages.sort(key=lambda t: t[0])
     return {"messages": [m for _, m in messages],

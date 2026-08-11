@@ -113,8 +113,15 @@ class UnifiedQueue:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self._snapshot_path)
-        except OSError:
+        except Exception:  # noqa: BLE001
+            # 快照丢失 = 重启后行动丢失/重发（2026-08-10 怨憎会行动丢失、
+            # canglang 行动重发事故）。绝不许静默，也绝不许打断队列操作。
             log.exception("queue snapshot 写入失败")
+
+    def flush(self):
+        """显式落盘一次当前队列状态（SIGTERM 优雅退出兜底用）。"""
+        with self._lock:
+            self._persist()
 
     def restore(self):
         """启动时从快照恢复队列（崩溃/重启不丢待办行动）。"""
