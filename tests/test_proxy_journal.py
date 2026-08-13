@@ -51,28 +51,42 @@ class JournalTest(unittest.TestCase):
         proxy_mod._journal("tick")
         self.assertTrue(os.path.isfile(self.path))
 
-    def test_journal_truncates_oversized_file(self):
-        # 造一个超限文件（垃圾内容 + 一条完整旧记录）
+    def test_journal_rotates_oversized_file(self):
+        # 造一个超限文件（垃圾内容 + 一条完整旧记录）→ 归档轮转，旧数据不丢
         old_rec = json.dumps({"ts": 1, "type": "old"},
                              ensure_ascii=False) + "\n"
         with open(self.path, "w", encoding="utf-8") as f:
             f.write("x" * proxy_mod.EVENTS_MAX_BYTES)
             f.write(old_rec)
         proxy_mod._journal("route", session="s")
-        self.assertLess(os.path.getsize(self.path),
-                        proxy_mod.EVENTS_MAX_BYTES + len(old_rec) + 200)
-        # 尾部完整行可解析；垃圾半行已被丢弃
+        # 新文件从头写，只有新记录
         recs = [json.loads(ln) for ln in self._lines()]
+        self.assertEqual(len(recs), 1)
         self.assertEqual(recs[-1]["type"], "route")
+        # 旧文件被完整归档（垃圾 + 旧记录都在），没有丢数据
+        archives = sorted(f for f in os.listdir(self.tmp)
+                          if f.startswith("proxy_events.jsonl."))
+        self.assertEqual(len(archives), 1)
+        with open(os.path.join(self.tmp, archives[0]), encoding="utf-8") as f:
+            data = f.read()
+        self.assertIn(old_rec, data)
+        self.assertTrue(data.startswith("x" * proxy_mod.EVENTS_MAX_BYTES))
 
-    def test_journal_truncates_garbage_only_file(self):
-        # 超限且完全没有换行：截断后清空，新行从头写
+    def test_journal_rotates_garbage_only_file(self):
+        # 超限且完全没有换行：归档旧文件，新行从头写
         with open(self.path, "w", encoding="utf-8") as f:
             f.write("x" * (proxy_mod.EVENTS_MAX_BYTES + 10))
         proxy_mod._journal("tick", n=1)
         lines = self._lines()
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0])["type"], "tick")
+        # 垃圾文件同样被归档留存
+        archives = [f for f in os.listdir(self.tmp)
+                    if f.startswith("proxy_events.jsonl.")]
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(
+            os.path.getsize(os.path.join(self.tmp, archives[0])),
+            proxy_mod.EVENTS_MAX_BYTES + 10)
 
     def test_clip_marks_truncation(self):
         text = "a" * (proxy_mod.PROMPT_JOURNAL_LIMIT + 100)

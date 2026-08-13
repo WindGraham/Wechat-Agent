@@ -116,6 +116,42 @@ def list_tasks(tasks_dir):
     return tasks
 
 
+def list_sessions(root):
+    """chatlog.db sessions 表里的会话名（去重排序）。失败返回空列表。"""
+    sessions = set()
+    try:
+        import sqlite3
+        db = os.path.join(root, "workspace", "chatlogs", "chatlog.db")
+        if os.path.exists(db):
+            conn = sqlite3.connect(db)
+            try:
+                for r in conn.execute("SELECT name FROM sessions"):
+                    sessions.add(r[0])
+            finally:
+                conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return sorted(sessions)
+
+
+def list_group_sessions(root):
+    """会话名 = chatlog.db sessions + personas 卡（排除默认/工具卡）。
+
+    /api/groups 与 /api/session_config 的历史实现各复制了一遍 SQLite
+    查询，这里统一；personas 卡也代表一个「被配置过热度的群」。
+    """
+    sessions = set(list_sessions(root))
+    personas_dir = os.path.join(root, "config", "personas")
+    try:
+        for f in os.listdir(personas_dir):
+            if f.endswith(".yaml") and f not in ("default.yaml",
+                                                 "tool_group.yaml"):
+                sessions.add(f[:-5])
+    except OSError:
+        pass
+    return sorted(sessions)
+
+
 def parse_env(path):
     """解析 KEY=VALUE 行（忽略注释与空行），保持出现顺序。"""
     pairs = {}

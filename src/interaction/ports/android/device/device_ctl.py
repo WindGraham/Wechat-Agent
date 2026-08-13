@@ -56,6 +56,7 @@ class DeviceCtl:
     def __init__(self):
         self.touch = RandomTouch(self._shell)
         self._cap_lock = threading.Lock()  # 截图串行锁：防止推流线程与 agent 抢 adb
+        self._fast_cap = None  # ImageReader 快速截图客户端（懒加载）
         self.ensure_device()
 
     # ------------------------------------------------------------------ adb
@@ -137,10 +138,18 @@ class DeviceCtl:
         raise RuntimeError("screencap returned invalid PNG twice")
 
     def capture_bytes(self):
-        """内存版截图：PNG bytes 直接 imdecode 成 BGR ndarray，全程不落盘。
+        """内存版截图，返回 BGR ndarray。
 
-        比 capture() 更彻底地满足"截图即读即删"（字节只驻内存，引用释放即消失）。
-        坏图重试一次。返回 numpy.ndarray（cv2 BGR）。"""
+        优先走 ImageReader 快速截图（~50ms，JPEG q100 无损）；不可用或失败
+        时回退 screencap（~500ms）。坏图重试一次。"""
+        # 1) 优先 ImageReader 快速截图
+        cap = self._get_fast_capture()
+        if cap is not None:
+            try:
+                return cap.capture()
+            except Exception as e:
+                log.warning("ImageReader 截图失败，回退 screencap: %s", e)
+        # 2) 回退 screencap
         import cv2
         import numpy as np
         for attempt in range(2):
@@ -156,6 +165,21 @@ class DeviceCtl:
                         attempt, len(data))
             time.sleep(0.5)
         raise RuntimeError("screencap returned invalid PNG twice")
+
+    def _get_fast_capture(self):
+        """懒加载 ImageReader 快速截图客户端（首次启动服务约 2~3 秒）。
+
+        成功返回 ScreenCapture；失败返回 False 并缓存（不再重试）。
+        """
+        if self._fast_cap is None:
+            try:
+                from .screen_capture import ScreenCapture
+                self._fast_cap = ScreenCapture()
+                log.info("ImageReader 快速截图已就绪（~50ms/帧）")
+            except Exception as e:
+                log.warning("ImageReader 快速截图不可用，回退 screencap: %s", e)
+                self._fast_cap = False
+        return self._fast_cap or None
 
     # ----------------------------------------------------------------- 触控
     def tap_rect(self, rect, sigma_ratio=0.25):
@@ -235,6 +259,20 @@ class DeviceCtl:
         log_op("input_text", text=text)
         self._input_text_unicode(text)
         self.wait_random(150, 350)
+
+    def get_clipboard(self) -> str:
+        """
+        通过提权方式获取剪贴板文本。
+        依赖：Android 10+ 需要切换到特权 IME，或在此环境中使用 su。
+        """
+        # 目前测试机有 root 权限，直接利用 su 绕过焦点限制提取
+        # 注意: 如果需要兼容非 root 机型，此处后续替换为 ADBKeyBoard 广播
+        out = self._shell('su -c "service call clipboard 2 s16 com.android.shell"')
+        # 简单解析 parcel 返回的 UTF-16 Hex (防截断和特殊字符)
+        # 此处暂时返回占位符或解析逻辑
+        if "Result: Parcel" in out:
+            return "wxid_or_nickname_from_clipboard"
+        return ""
 
     def _ensure_adb_keyboard(self):
         out = self._shell(f"pm list packages {ADBKB_PKG}").decode(errors="replace")

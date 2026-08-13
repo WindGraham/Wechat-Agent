@@ -2,30 +2,37 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>Wechat-Agent 网关</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wechat-Agent 网关控制台</title>
 <style>
   /* ============ Cohere design system (DESIGN.md) ============ */
   :root {
-    --primary: #17171c;        /* cohere near-black */
-    --ink: #212121;
-    --canvas: #ffffff;
-    --stone: #eeece7;          /* soft warm neutral */
-    --pale-green: #edfce9;
-    --pale-blue: #f1f5ff;
-    --hairline: #d9d9dd;
-    --border-light: #e5e7eb;
-    --card-border: #f2f2f2;
-    --muted: #93939f;
-    --slate: #75758a;
-    --body-muted: #616161;
-    --action-blue: #1863dc;
-    --focus-blue: #4c6ee6;
-    --coral: #ff7759;
-    --coral-soft: #ffad9b;
-    --deep-green: #003c33;
-    --form-focus: #9b60aa;
-    --error: #b30000;
-    --r-xs: 4px; --r-sm: 8px; --r-md: 16px; --r-lg: 22px; --r-pill: 32px;
+    --primary: #4c8dff;         /* 品牌蓝（强调/按钮/active） */
+    --ink: #d7dce4;             /* 主文字 */
+    --canvas: #0d1017;          /* 页面背景 */
+    --stone: #1a2030;           /* 次级底 */
+    --pale-green: #14251c;      /* 绿浅底 */
+    --pale-blue: #12253a;       /* 蓝浅底 */
+    --hairline: #2a3140;        /* 细边框 */
+    --border-light: #232a37;    /* 边框 */
+    --card-border: #1c2230;     /* 卡片内分隔 */
+    --muted: #8b93a3;           /* 次级文字 */
+    --slate: #6b7484;           /* 弱文字 */
+    --body-muted: #9aa3b2;      /* 正文次级 */
+    --action-blue: #4c8dff;     /* 链接蓝 */
+    --focus-blue: #4c8dff;
+    --coral: #ff6b5e;           /* 强调橙红 */
+    --coral-soft: #3a201d;      /* 橙红浅底 */
+    --deep-green: #3fb950;      /* 绿 */
+    --form-focus: #4c8dff;
+    --error: #f85149;
+    --r-xs: 3px; --r-sm: 6px; --r-md: 8px; --r-lg: 10px; --r-pill: 16px;
+    --bg-panel: #141a24;        /* 卡片/面板底 */
+    --bg-elev: #1a2230;         /* 悬浮/次级面板 */
+    --bg-sidebar: #0b0e14;      /* 侧边栏底 */
+    --ink-soft: #b6bdc9;        /* 次级文字 */
+    --pale-yellow: #2a2413;     /* 黄浅底（原文高亮） */
+    --card: #141a24;            /* 卡片/悬浮窗底（=bg-panel） */
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -223,6 +230,9 @@
   .badge.stopped { background: var(--stone); color: var(--body-muted); }
   .badge.crashed { background: #fdecec; color: var(--error); }
   .badge.coral { background: var(--coral-soft); color: #5a1f10; }
+  .badge.green { background: var(--pale-green); color: var(--deep-green); }
+  .badge.blue { background: var(--pale-blue); color: var(--action-blue); }
+  .badge.dark { background: var(--primary); color: #fff; }
 
   /* ---------- 事件流 / 日志 ---------- */
   pre { margin: 0; font-family: 'SF Mono', ui-monospace, Menlo, Consolas,
@@ -559,6 +569,120 @@
              border-top-color: var(--primary); border-radius: 50%;
              animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---------- 控制台页（Agent 管理） ---------- */
+  #sub-config-console { gap: 16px; }
+  /* .card 自带 min-height:0（配合内部 scroll），在 flex column 里会被压缩到
+     内容溢出、卡片互相重叠——这里显式 flex-shrink:0 撑开到内容高度 */
+  #sub-config-console > * { flex-shrink: 0; }
+  .console-hero { padding-bottom: 14px; }
+  .console-hero .chip-row { margin-bottom: 14px; }
+  .console-hero .hero-crash {
+    border: 1px solid #f0c4c4; background: #fdf0f0; border-radius: var(--r-sm);
+    padding: 10px 14px; margin-bottom: 12px; font-size: 13px; color: #8a1f1f;
+  }
+  .hero-controls { display: flex; gap: 36px; flex-wrap: wrap; }
+  .hero-group { min-width: 220px; }
+  .hero-label {
+    font-size: 11px; font-weight: 700; color: var(--slate);
+    text-transform: uppercase; letter-spacing: .1em; margin-bottom: 8px;
+  }
+  .hero-btns { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .console-logbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .console-logbar .log-title {
+    font-size: 11px; font-weight: 700; color: var(--slate);
+    text-transform: uppercase; letter-spacing: .14em;
+  }
+  .console-logbar select { width: 240px; }
+  .console-logbar .log-hint { margin-left: auto; font-size: 12px; }
+  .console-logcard .scroll { max-height: 42vh; min-height: 160px; }
+  .console-forms { align-items: start; }
+  .console-forms .card { margin: 0; }
+  .form-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .form-row > label { font-size: 12px; color: var(--slate); min-width: 76px; }
+  .form-row .ipt { flex: 1; min-width: 120px; }
+  .form-row input[type=number] { max-width: 130px; }
+
+  /* ================= 暗色紧凑主题（覆盖层，置于最后） ================= */
+  body { background: var(--canvas); color: var(--ink); font-size: 14px; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #333b49; }
+  ::-webkit-scrollbar-thumb:hover { background: #434d5e; }
+
+  /* 侧边栏：深色，品牌蓝只用于 active 高亮条 */
+  .sidebar { background: var(--bg-sidebar); padding: 12px 8px;
+             border-right: 1px solid var(--border-light); }
+  .brand { padding: 4px 10px 14px; border-bottom: 1px solid rgba(255,255,255,.06); }
+  .brand .logo { font-size: 14px; }
+  .nav { padding: 10px 0; }
+  .nav-item { padding: 7px 10px; margin-bottom: 2px; font-size: 13px; }
+  .nav-item.active { background: rgba(76,141,255,.16); color: #dbe7ff;
+                     font-weight: 600; box-shadow: inset 2px 0 0 var(--primary); }
+  .nav-foot { padding: 10px; border-top: 1px solid rgba(255,255,255,.06); }
+
+  /* 卡片：面板底 + 紧凑 */
+  .card { background: var(--bg-panel); border: 1px solid var(--border-light);
+          border-radius: var(--r-md); padding: 12px 14px; }
+  .card:hover { border-color: var(--hairline); }
+  .card > h2 { font-size: 11px; color: var(--slate); margin: 0 0 10px; }
+
+  /* 顶栏 */
+  .topbar { background: var(--bg-panel); border-bottom: 1px solid var(--border-light);
+            padding: 10px 20px; }
+  .topbar h1 { font-size: 15px; color: var(--ink); }
+
+  /* pane 内容间距 */
+  .pane { padding: 14px 16px; }
+
+  /* 表格 */
+  th { background: var(--bg-elev); color: var(--slate); }
+  td { border-bottom: 1px solid var(--card-border); }
+  tbody tr:hover td { background: rgba(76,141,255,.06); }
+
+  /* 日志深色底 */
+  .log-pre { background: #0b0e14; color: #c9d1d9; border: 1px solid var(--border-light); }
+
+  /* 输入控件 hover */
+  input:hover, select:hover, textarea:hover { border-color: #3a4356; }
+
+  /* 按钮紧凑 */
+  .btn { font-size: 12.5px; padding: 6px 14px; }
+  .btn.ghost { color: var(--primary); }
+  .btn.ghost:hover { background: rgba(76,141,255,.12); opacity: 1; }
+  .btn.danger { background: transparent; color: var(--error); border-color: var(--error); }
+
+  /* 徽章紧凑 */
+  .badge { padding: 2px 8px; font-size: 11px; }
+
+  /* 子标签紧凑 */
+  .subtab { border-bottom: 1px solid var(--border-light); padding: 8px 2px 10px; }
+  .subtab-btn { padding: 5px 12px; font-size: 12px; background: transparent; }
+  .subtab-btn.active { background: var(--primary); color: #fff; }
+
+  /* stat-chip */
+  .stat-chip { background: var(--bg-elev); color: var(--body-muted); }
+
+  /* 编辑器 / 文件列表面板底 */
+  .filelist, .editor { background: var(--bg-panel); }
+  .editor .bar { border-bottom: 1px solid var(--border-light); }
+  .editor textarea { background: var(--bg-panel); color: var(--ink); }
+  .filelist .f { border-bottom: 1px solid var(--card-border); }
+
+  /* 事件详情 / raw / think-box 面板底 */
+  .ev { border-bottom: 1px solid var(--card-border); }
+  .ev pre, .raw-pre, .detail-pre, details.think-box .think-body {
+    background: var(--bg-elev); color: var(--ink); }
+  tr.action td { background: rgba(255,107,94,.08); }
+
+  /* 顶栏右侧全局 agent 状态 + 快捷入口 */
+  .topbar-left { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+  .topbar-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .top-agent-state { font-size: 12px; color: var(--body-muted); font-weight: 500; }
+  .top-agent-model { font-size: 11px; color: var(--slate);
+                     font-family: ui-monospace, Menlo, monospace; }
 </style>
 </head>
 <body>
@@ -570,14 +694,20 @@
       <div class="sub">控制面（Control Plane）</div>
     </div>
     <nav class="nav" id="nav">
+      <button class="nav-item" data-tab="console" onclick="showTab('console')">
+        <span class="ico">▣</span>总览
+      </button>
       <button class="nav-item" data-tab="live" onclick="showTab('live')">
-        <span class="ico">◉</span>运行实况
+        <span class="ico">◉</span>实况
       </button>
       <button class="nav-item" data-tab="prompts" onclick="showTab('prompts')">
         <span class="ico">✎</span>内容
       </button>
       <button class="nav-item" data-tab="groups" onclick="showTab('groups')">
         <span class="ico">⚙</span>配置
+      </button>
+      <button class="nav-item" data-tab="emojis" onclick="showTab('emojis')">
+        <span class="ico">🧰</span>工具
       </button>
     </nav>
     <div class="nav-foot">
@@ -589,8 +719,16 @@
   <!-- 右侧主内容区 -->
   <div class="main">
     <div class="topbar">
-      <h1 id="page-title">实况</h1>
-      <div class="page" id="page-sub"></div>
+      <div class="topbar-left">
+        <h1 id="page-title">实况</h1>
+        <div class="page" id="page-sub"></div>
+      </div>
+      <div class="topbar-actions">
+        <span class="agent-dot" id="top-agent-dot"></span>
+        <span class="top-agent-state" id="top-agent-state">—</span>
+        <span class="top-agent-model" id="top-agent-model"></span>
+        <button class="btn sm" onclick="showTab('console')">总览</button>
+      </div>
     </div>
     <div class="content">
 
@@ -607,7 +745,8 @@
               <div class="scroll mid" id="live-wm"></div>
             </div>
             <div class="card span2" style="height:38vh">
-              <h2>Proxy 流水 <span class="badge coral" id="live-evcount"></span></h2>
+              <h2>Proxy 流水 <span class="badge coral" id="live-evcount"></span>
+                <span class="badge" id="live-cache">缓存 -</span></h2>
               <div class="grid-flow" id="live-flow"></div>
             </div>
             <div class="card span2">
@@ -685,53 +824,90 @@
       <div class="pane" id="pane-config">
         <div class="subtab">
           <button class="subtab-btn active" data-sub="groups" onclick="showSub('config','groups')">群聊配置</button>
+          <button class="subtab-btn" data-sub="sessionmodel" onclick="showSub('config','sessionmodel')">会话模型</button>
           <button class="subtab-btn" data-sub="runtime" onclick="showSub('config','runtime')">运行配置</button>
           <button class="subtab-btn" data-sub="env" onclick="showSub('config','env')">密钥</button>
           <button class="subtab-btn" data-sub="console" onclick="showSub('config','console')">控制台</button>
           <button class="subtab-btn" data-sub="files" onclick="showSub('config','files')">文件</button>
         </div>
         <div class="subtab-body" id="sub-config-groups" style="display:none"></div>
+        <div class="subtab-body" id="sub-config-sessionmodel" style="display:none">
+          <div class="card" style="flex:1">
+            <h2>每会话决策模型 <span class="badge coral">session_config.json 热生效</span></h2>
+            <div class="dim" style="font-size:13px;margin-bottom:10px">
+              给指定会话选专用决策模型与 prompt 携带选项；留空 = 跟随全局。
+              「带记忆」关闭可减少无用记忆注入（省 token、提升专注）；
+              「带历史」关闭则本轮只带新消息；goal 注入【本群目标】块让模型按目标工作。
+            </div>
+            <div class="scroll" id="sessionmodel-list" style="flex:1"></div>
+          </div>
+        </div>
         <div class="subtab-body" id="sub-config-runtime" style="display:none"></div>
         <div class="subtab-body" id="sub-config-env" style="display:none"></div>
         <div class="subtab-body" id="sub-config-console" style="display:none">
-          <div class="grid2">
-            <div class="card"><h2>Agent 控制</h2>
-              <div id="console-status"></div></div>
-            <div class="card"><h2>Agent 日志 <span class="badge coral">尾部 200 行</span></h2>
-              <div class="scroll tall" id="console-log"></div></div>
+          <!-- Agent 状态与控制 -->
+          <div class="card console-hero">
+            <div id="console-status"></div>
           </div>
-          <div class="card" style="margin-top:14px">
-            <h2>旁注（直接对 Proxy 输入）</h2>
-            <div class="aside-form">
-              <input id="aside-session" class="ipt" placeholder="目标会话（如：交流一下？）" list="aside-sessions"/>
-              <datalist id="aside-sessions"></datalist>
-              <input id="aside-sender" class="ipt" placeholder="发送者昵称（默认主人）" />
-              <textarea id="aside-text" class="ipt" rows="3"
-                        placeholder="要注入的消息内容……"></textarea>
-              <button class="btn" onclick="sendAside()">注入旁注</button>
-              <span id="aside-result" class="aside-result"></span>
+          <!-- 正在执行 + 时序队列 -->
+          <div class="grid2 console-now">
+            <div class="card">
+              <h2>正在执行</h2>
+              <div class="scroll mid" id="console-current"></div>
+            </div>
+            <div class="card">
+              <h2>时序队列 <span class="badge" id="console-queue-n"></span></h2>
+              <div class="scroll mid" id="console-queue"></div>
             </div>
           </div>
-          <div class="card" style="margin-top:14px">
-            <h2>决策模型 <span class="badge coral">热切换，不重启</span></h2>
-            <div id="dm-live" class="dim" style="margin-bottom:10px"></div>
-            <div class="aside-form">
-              <select id="dm-provider" class="ipt" onchange="updateDmModels()">
-                <option value="kimi">kimi（k3 等）</option>
-                <option value="deepseek">deepseek（v4 系列，1M 上下文）</option>
-              </select>
-              <input id="dm-model" class="ipt" list="dm-models"
-                     placeholder="模型名（下拉选或手填）"/>
-              <datalist id="dm-models"></datalist>
-              <div>
-                max_tokens 下限
-                <input id="dm-floor" type="number" class="ipt" style="width:110px" placeholder="256"/>
-                上限
-                <input id="dm-ceiling" type="number" class="ipt" style="width:110px" placeholder="0=不封顶"/>
-                <span class="dim">（留空/0 = 保留模型默认；思考型模型下限建议 ≥256）</span>
+          <!-- Agent 日志 -->
+          <div class="card console-logcard">
+            <div class="console-logbar">
+              <span class="log-title">Agent 日志</span>
+              <span class="badge coral">尾部 200 行</span>
+              <select id="log-file" class="ipt" onchange="switchLogFile(this.value)"></select>
+              <span class="dim log-hint">运行中每 3s 自动刷新 · 可切换历史轮转日志</span>
+            </div>
+            <div class="scroll" id="console-log"></div>
+          </div>
+          <!-- 旁注 + 决策模型 -->
+          <div class="grid2 console-forms">
+            <div class="card">
+              <h2>旁注</h2>
+              <div class="dim" style="font-size:12px;margin-bottom:10px">
+                向指定会话注入一条消息并触发一次决策，agent 可能因此真的回复 / 发送消息。仅用于手动驱动或调试。
               </div>
-              <button class="btn" onclick="saveDecisionModel()">保存并热切换</button>
-              <span id="dm-result" class="aside-result"></span>
+              <div class="aside-form">
+                <input id="aside-session" class="ipt" placeholder="目标会话（如：交流一下？）" list="aside-sessions"/>
+                <datalist id="aside-sessions"></datalist>
+                <input id="aside-sender" class="ipt" placeholder="发送者昵称（默认主人）" />
+                <textarea id="aside-text" class="ipt" rows="3" placeholder="要注入的消息内容……"></textarea>
+                <button class="btn" onclick="sendAside()">注入旁注</button>
+                <span id="aside-result" class="aside-result"></span>
+              </div>
+            </div>
+            <div class="card">
+              <h2>决策模型 <span class="badge coral">热切换 · 不重启</span></h2>
+              <div id="dm-live" class="dim" style="margin-bottom:10px"></div>
+              <div class="aside-form">
+                <div class="form-row">
+                  <label>provider</label>
+                  <select id="dm-provider" class="ipt" onchange="updateDmModels()"></select>
+                </div>
+                <div class="form-row">
+                  <label>model</label>
+                  <select id="dm-model" class="ipt"></select>
+                </div>
+                <div class="form-row">
+                  <label>token 下限</label>
+                  <input id="dm-floor" type="number" class="ipt" placeholder="256"/>
+                  <label style="min-width:auto;margin-left:12px">上限</label>
+                  <input id="dm-ceiling" type="number" class="ipt" placeholder="0"/>
+                </div>
+                <div class="dim" style="font-size:11px">留空 / 0 = 模型默认；思考型模型下限建议 ≥256</div>
+                <button class="btn" onclick="saveDecisionModel()">保存并热切换</button>
+                <span id="dm-result" class="aside-result"></span>
+              </div>
             </div>
           </div>
         </div>
@@ -750,10 +926,136 @@
         </div>
       </div>
 
+      <!-- ===================== 页面4: 工具（表情包 / 模型对比） ===================== -->
+      <div class="pane" id="pane-tools">
+        <div class="subtab">
+          <button class="subtab-btn active" data-sub="emojis" onclick="showSub('tools','emojis')">表情包</button>
+          <button class="subtab-btn" data-sub="replay" onclick="showSub('tools','replay')">模型对比</button>
+          <button class="subtab-btn" data-sub="tts" onclick="showSub('tools','tts')">TTS 对比</button>
+        </div>
+        <div class="subtab-body" id="sub-tools-emojis" style="display:none;flex-direction:column">
+          <div style="display:flex;gap:12px;margin-bottom:12px;flex-shrink:0">
+            <input id="emoji-q" type="text" placeholder="搜索表情包（关键词、序号、文字...）"
+                   style="flex:1;padding:8px 14px;border:1px solid var(--hairline);
+                          border-radius:var(--r-pill);font-size:14px;font-family:inherit"
+                   onkeydown="if(event.key==='Enter')emojiSearch(1)">
+            <button onclick="emojiSearch(1)" style="padding:8px 20px;border-radius:var(--r-pill);
+              background:var(--primary);color:#fff;border:none;cursor:pointer;font-family:inherit;
+              font-size:14px">搜索</button>
+            <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:var(--muted)">
+              <input type="checkbox" id="emoji-to" onchange="emojiSearch(1)">仅文字</label>
+          </div>
+          <div class="split" style="flex:1;min-height:0">
+            <div class="col-list" style="width:380px">
+              <div style="display:flex;justify-content:space-between;padding:4px 8px;
+                font-size:12px;color:var(--muted)">
+                <span id="emoji-info">加载中...</span>
+                <span id="emoji-total" style="color:var(--muted)"></span>
+              </div>
+              <div class="scroll" id="emoji-list" style="flex:1"></div>
+              <div style="display:flex;gap:8px;justify-content:center;padding:8px" id="emoji-pager"></div>
+            </div>
+            <div class="col-detail">
+              <div style="display:flex;flex-direction:column;align-items:center;overflow-y:auto;height:100%"
+                   id="emoji-preview">
+                <div class="empty" style="padding:40px">← 点击左侧条目查看表情包</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="subtab-body" id="sub-tools-replay" style="display:none;flex-direction:column">
+          <div style="display:flex;gap:12px;margin-bottom:12px;flex-shrink:0;flex-wrap:wrap;align-items:center">
+            <select id="replay-sel" onchange="loadReplayReport(this.value)"
+                    style="padding:8px 14px;border:1px solid var(--hairline);
+                           border-radius:var(--r-pill);font-size:14px;font-family:inherit;
+                           background:var(--canvas);min-width:280px"></select>
+            <button onclick="loadReplay()" style="padding:8px 20px;border-radius:var(--r-pill);
+              background:var(--primary);color:#fff;border:none;cursor:pointer;font-family:inherit;
+              font-size:14px">刷新</button>
+            <span class="dim" id="replay-meta"></span>
+          </div>
+          <div class="card" style="flex-shrink:0;margin-bottom:14px">
+            <h2>概览 <span class="badge coral" id="replay-stat"></span></h2>
+            <div id="replay-summary" class="dim" style="font-size:13px"></div>
+          </div>
+          <div id="replay-groups" style="display:flex;flex-direction:column;gap:16px;overflow-y:auto;flex:1"></div>
+        </div>
+        <div class="subtab-body" id="sub-tools-tts" style="display:none;flex-direction:column">
+          <div style="display:flex;gap:12px;margin-bottom:12px;flex-shrink:0;flex-wrap:wrap;align-items:center">
+            <input id="tts-text" type="text" placeholder="输入要合成的文本（猫娘台词…）"
+                   style="flex:1;min-width:320px;padding:8px 14px;border:1px solid var(--hairline);
+                          border-radius:var(--r-pill);font-size:14px;font-family:inherit"
+                   onkeydown="if(event.key==='Enter')ttsCompare()">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)">
+              MiMo<select id="tts-mimo-mode" onchange="onTtsMode()"
+                      style="padding:6px 10px;border:1px solid var(--hairline);border-radius:var(--r-pill);
+                             font-size:13px;font-family:inherit;background:var(--canvas)"></select>
+              <select id="tts-mimo-voice"
+                      style="padding:6px 10px;border:1px solid var(--hairline);border-radius:var(--r-pill);
+                             font-size:13px;font-family:inherit;background:var(--canvas)"></select>
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)">
+              MiniMax<select id="tts-mm-mode"
+                      style="padding:6px 10px;border:1px solid var(--hairline);border-radius:var(--r-pill);
+                             font-size:13px;font-family:inherit;background:var(--canvas)"></select>
+              <select id="tts-mm-voice"
+                      style="padding:6px 10px;border:1px solid var(--hairline);border-radius:var(--r-pill);
+                             font-size:13px;font-family:inherit;background:var(--canvas)"></select>
+            </label>
+            <input id="tts-mimo-design" type="text" placeholder="音色设计描述（design 模式用）"
+                   style="display:none;min-width:240px;padding:8px 14px;border:1px solid var(--hairline);
+                          border-radius:var(--r-pill);font-size:14px;font-family:inherit">
+            <button id="tts-go" onclick="ttsCompare()" style="padding:8px 20px;border-radius:var(--r-pill);
+              background:var(--primary);color:#fff;border:none;cursor:pointer;font-family:inherit;
+              font-size:14px">合成对比</button>
+          </div>
+          <div class="split" style="flex:1;min-height:0">
+            <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+              <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:600">
+                MiMo TTS <span class="dim">(mimo-v2.5-tts)</span></div>
+              <div id="tts-mimo-result" class="scroll" style="flex:1">
+                <div class="empty" style="padding:40px">输入文本后点「合成对比」</div>
+              </div>
+            </div>
+            <div style="flex:1;display:flex;flex-direction:column;min-width:0;
+                        border-left:1px solid var(--border-light);padding-left:14px">
+              <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:600">
+                MiniMax TTS <span class="dim">(speech-2.8-hd)</span></div>
+              <div id="tts-mm-result" class="scroll" style="flex:1">
+                <div class="empty" style="padding:40px">输入文本后点「合成对比」</div>
+              </div>
+            </div>
+          </div>
+          <div style="flex-shrink:0;margin-top:16px;border-top:1px solid var(--border-light);padding-top:12px">
+            <div style="font-size:13px;color:var(--muted);margin-bottom:10px;font-weight:600">
+              作品集 <span class="dim">（MiMo 24k vs VoxCPM2 48k，直接点播对比）</span>
+              <button onclick="loadShowcase()" style="margin-left:8px;padding:4px 12px;border-radius:var(--r-pill);
+                border:1px solid var(--hairline);background:var(--canvas);cursor:pointer;
+                font-family:inherit;font-size:12px">刷新</button>
+            </div>
+            <div id="tts-showcase" style="display:flex;flex-wrap:wrap;gap:12px">
+              <div class="empty">加载中…</div>
+            </div>
+          </div>
+          <div style="flex-shrink:0;margin-top:16px;border-top:1px solid var(--border-light);padding-top:12px">
+            <div style="font-size:13px;color:var(--muted);margin-bottom:10px;font-weight:600">
+              NekoAudio 素材试听 <span class="dim">（已下载 45 句 · 24kHz 合成音 · 判断素材音质）</span>
+              <button onclick="loadNeko()" style="margin-left:8px;padding:4px 12px;border-radius:var(--r-pill);
+                border:1px solid var(--hairline);background:var(--canvas);cursor:pointer;
+                font-family:inherit;font-size:12px">刷新</button>
+            </div>
+            <div id="tts-neko" class="scroll" style="max-height:340px;display:flex;flex-direction:column;gap:8px">
+              <div class="empty">加载中…</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
-<div id="toast"></div>
+<div id="toast" class="toast-wrap"></div>
+<script src="/static/js/replay.js"></script>
 <script>
 let curPath = null, savedContent = "", dirty = false, curTab = "live";
 
@@ -779,18 +1081,30 @@ function toast(msg, kind) {
     setTimeout(() => t.remove(), 300);
   }, 3200);
 }
-// 侧边栏 agent 状态灯（5s 轮询）
+// 侧边栏 + 顶栏 agent 状态灯（5s 轮询，全局可见）
 function refreshNavAgent() {
   api('/api/agent/status').then(j => {
     const state = (j.agent || {}).state || (j.mode === 'embedded' ? 'embedded' : 'stopped');
+    const label = state === 'running' ? 'Agent 运行中'
+                : state === 'crashed' ? 'Agent 崩溃'
+                : state === 'embedded' ? '内嵌模式' : 'Agent 未启动';
+    const dotCls = 'agent-dot ' + (state === 'running' ? 'running'
+                                  : state === 'crashed' ? 'crashed' : 'stopped');
+    // 侧边栏
     const dot = document.getElementById('nav-agent-dot');
     const txt = document.getElementById('nav-agent-state');
-    if (!dot || !txt) return;
-    dot.className = 'agent-dot ' + (state === 'running' ? 'running'
-                                    : state === 'crashed' ? 'crashed' : 'stopped');
-    txt.textContent = state === 'running' ? 'Agent 运行中'
-                     : state === 'crashed' ? 'Agent 崩溃'
-                     : state === 'embedded' ? '内嵌模式' : 'Agent 未启动';
+    if (dot) dot.className = dotCls;
+    if (txt) txt.textContent = label;
+    // 顶栏
+    const tdot = document.getElementById('top-agent-dot');
+    const ttxt = document.getElementById('top-agent-state');
+    if (tdot) tdot.className = dotCls;
+    if (ttxt) ttxt.textContent = label;
+    // 顶栏当前模型
+    api('/api/models').then(m => {
+      const mel = document.getElementById('top-agent-model');
+      if (mel && m.global) mel.textContent = m.global.provider + ' · ' + m.global.model;
+    }).catch(() => {});
   }).catch(() => {});
 }
 setInterval(refreshNavAgent, 5000);
@@ -828,18 +1142,22 @@ function openGroupOf(name) {
 const PAGE_SUB = {
   live: ['live'],
   content: ['prompts', 'personas', 'memory'],
-  config: ['groups', 'runtime', 'env', 'console', 'files'],
+  config: ['groups', 'sessionmodel', 'runtime', 'env', 'console', 'files'],
+  tools: ['emojis', 'replay', 'tts'],
 };
 
 // 子标签切换: 显示对应区块 + 首次加载时调用对应 load
 const SUB_LOAD = {
   live: ['loadLive'],
   content: ['loadFiles', 'loadFilesP', 'loadMemory'],
-  config: ['loadGroups', 'loadRuntime', 'loadEnv', 'loadConsole', 'loadFilesBrowser'],
+  config: ['loadGroups', 'loadSessionModel', 'loadRuntime', 'loadEnv',
+           'loadConsole', 'loadFilesBrowser'],
+  tools: [null, 'loadReplay', 'loadTtsVoices'],   // emojis 手动搜索；replay/tts 首载
 };
 const SUB_PAGE = {live:'live', prompts:'content', personas:'content',
                   memory:'content', groups:'config', runtime:'config',
-                  env:'config', console:'config', files:'config'};
+                  env:'config', console:'config', files:'config',
+                  tools:'tools', emojis:'tools', replay:'tools', tts:'tools'};
 let SUB_LOADED = {};
 
 function showSub(page, sub) {
@@ -854,22 +1172,31 @@ function showSub(page, sub) {
   const body = document.getElementById('sub-' + page + '-' + sub);
   if (body) { body.style.display = 'flex'; body.classList.add('open'); }
   // 加载数据(仅首次, 之后靠各自的定时器/手动刷新)
-  const pageIdx = PAGE_SUB[page].indexOf(sub);
+  const pageIdx = PAGE_SUB[page] ? PAGE_SUB[page].indexOf(sub) : -1;
   if (pageIdx >= 0) {
-    const fn = SUB_LOAD[page][pageIdx];
-    if (fn === 'loadFiles') { loadFiles('prompts'); }
-    else if (fn === 'loadFilesP') { loadFilesP(); }
-    else if (typeof window[fn] === 'function') window[fn]();
+    const loadList = SUB_LOAD[page];
+    if (loadList) {
+      const fn = loadList[pageIdx];
+      if (fn === 'loadFiles') { loadFiles('prompts'); }
+      else if (fn === 'loadFilesP') { loadFilesP(); }
+      else if (typeof window[fn] === 'function') window[fn]();
+    }
   }
   // 更新页面标题
   const titles = {live:'实况', status:'状态', prompts:'Prompt 编辑', personas:'人格卡',
-                  memory:'记忆', groups:'群聊配置', runtime:'运行配置', env:'密钥',
-                  console:'控制台', files:'文件'};
+                  memory:'记忆', groups:'群聊配置', sessionmodel:'会话模型',
+                  runtime:'运行配置', env:'密钥',
+                  console:'总览', files:'文件', emojis:'表情包', replay:'模型对比',
+                  tts:'TTS 对比'};
   const subs = {live:'时序队列 · 正在执行 · 决策流水', status:'队列 / 水位 / 任务台账',
                 prompts:'输出协议 / 工具说明 / 模板', personas:'各会话态度卡',
                 memory:'长期记忆文件', groups:'每群热情度',
+                sessionmodel:'每会话决策模型 · 记忆/历史/目标配置',
                 runtime:'runtime.json 热生效', env:'workspace/.env 脱敏',
-                console:'Agent 进程管理', files:'工作区浏览'};
+                console:'Agent 进程管理', files:'工作区浏览',
+                emojis:'序号检索 · 内容搜索 · 图片预览',
+                replay:'k3 vs Gemini 回放对比 · workspace/gemini_replay',
+                tts:'MiMo vs MiniMax 语音合成对比'};
   document.getElementById('page-title').textContent = titles[sub] || sub;
   document.getElementById('page-sub').textContent = subs[sub] || '';
 }
@@ -878,13 +1205,13 @@ function showTab(name) {
   curTab = name;
   const page = SUB_PAGE[name] || 'live';
   // 显示主 pane
-  for (const pid of ['live', 'content', 'config']) {
+  for (const pid of ['live', 'content', 'config', 'tools']) {
     const el = document.getElementById('pane-' + pid);
     if (el) el.classList.toggle('active', pid === page);
   }
-  // 侧边栏高亮
+  // 侧边栏高亮（按一级入口名 name，而非 pane 名 page，支持"控制台/工具"这种 name≠page 的项）
   for (const b of document.querySelectorAll('.nav-item'))
-    b.classList.toggle('active', b.dataset.tab === page);
+    b.classList.toggle('active', b.dataset.tab === name);
   showSub(page, name);
 }
 
@@ -963,15 +1290,188 @@ function loadMemDetail() {
 // 记忆页自动刷新（5s，新好友/新会话自动冒顶）
 setInterval(() => { if (curTab === 'memory') loadMemory(); }, 5000);
 
+// ------------------------------------------------------------- 模型对比（回放报告已移至 /static/js/replay.js）
+
+// ------------------------------------------------------------- TTS 对比（MiMo vs MiniMax）
+function loadTtsVoices() {
+  api('/api/tts/voices').then(j => {
+    const mm = document.getElementById('tts-mimo-mode');
+    const mv = document.getElementById('tts-mimo-voice');
+    const nm = document.getElementById('tts-mm-mode');
+    const nv = document.getElementById('tts-mm-voice');
+    if (mm) mm.innerHTML = Object.entries(j.mimo.modes || {}).map(([k, v]) =>
+      '<option value="' + esc(k) + '">' + esc(v) + '</option>').join('');
+    if (nm) nm.innerHTML = Object.entries(j.minimax.modes || {}).map(([k, v]) =>
+      '<option value="' + esc(k) + '">' + esc(v) + '</option>').join('');
+    if (mv) mv.innerHTML = (j.mimo.voices || []).map(v =>
+      '<option value="' + esc(v.id) + '">' + esc(v.id) + ' · ' + esc(v.label) + '</option>').join('');
+    if (nv) nv.innerHTML = (j.minimax.voices || []).map(v =>
+      '<option value="' + esc(v.id) + '">' + esc(v.label) + '</option>').join('');
+    if (j.mimo.default_mode && mm) mm.value = j.mimo.default_mode;
+    if (j.minimax.default_mode && nm) nm.value = j.minimax.default_mode;
+    if (j.mimo.default && mv) mv.value = j.mimo.default;
+    if (j.minimax.default && nv) nv.value = j.minimax.default;
+    const dd = document.getElementById('tts-mimo-design');
+    if (dd && j.mimo.design_default) dd.placeholder = j.mimo.design_default;
+    onTtsMode();
+    loadShowcase();
+    loadNeko();
+    if (!j.mimo.ready) toast('MiMo 缺 MIMO_API_KEY', 'err');
+    if (!j.minimax.ready) toast('MiniMax 缺 MINIMAX_API_KEY', 'err');
+  }).catch(e => toast(e.message, 'err'));
+}
+
+function onTtsMode() {
+  const mm = document.getElementById('tts-mimo-mode');
+  const mv = document.getElementById('tts-mimo-voice');
+  const dd = document.getElementById('tts-mimo-design');
+  const nm = document.getElementById('tts-mm-mode');
+  const nv = document.getElementById('tts-mm-voice');
+  const mmode = mm ? mm.value : 'preset';
+  const nmode = nm ? nm.value : 'preset';
+  if (mv) mv.style.display = (mmode === 'preset') ? '' : 'none';
+  if (dd) dd.style.display = (mmode === 'design') ? '' : 'none';
+  if (nv) nv.style.display = (nmode === 'preset') ? '' : 'none';
+}
+
+function loadShowcase() {
+  const el = document.getElementById('tts-showcase');
+  if (!el) return;
+  api('/api/tts/showcase').then(j => {
+    const files = j.files || [];
+    if (!files.length) {
+      el.innerHTML = '<div class="empty">暂无作品（workspace/mimo_showcase 与 voxcpm_out 为空）</div>';
+      return;
+    }
+    el.innerHTML = files.map(f => {
+      const srcBadge = f.source === 'voxcpm'
+        ? '<span class="badge coral">VoxCPM2·48k</span>'
+        : '<span class="badge blue">MiMo·24k</span>';
+      return '<div style="border:1px solid var(--border-light);border-radius:var(--r-sm);' +
+        'padding:10px;min-width:260px;background:var(--surface)">' +
+        '<div style="font-size:12px;margin-bottom:6px;word-break:break-all">' +
+        srcBadge + ' ' + esc(f.name) + ' <span class="dim">' + f.duration + 's</span></div>' +
+        '<audio controls preload="none" src="/api/tts/showcase/audio?name=' +
+        encodeURIComponent(f.name) + '&source=' + encodeURIComponent(f.source || 'mimo') +
+        '" style="width:100%"></audio></div>';
+    }).join('');
+  }).catch(e => toast(e.message, 'err'));
+}
+
+function loadNeko() {
+  const el = document.getElementById('tts-neko');
+  if (!el) return;
+  api('/api/tts/neko').then(j => {
+    const files = j.files || [];
+    if (!files.length) {
+      el.innerHTML = '<div class="empty">暂无素材（workspace/neko_audio/audio 为空）</div>';
+      return;
+    }
+    el.innerHTML = files.map(f => {
+      const idx = f.name.replace(/^00\//, '').replace('.wav', '');
+      return '<div style="border:1px solid var(--border-light);border-radius:var(--r-sm);' +
+        'padding:8px 10px;background:var(--surface)">' +
+        '<div style="font-size:12px;color:var(--ink-soft);margin-bottom:4px">' +
+        '<span class="badge">#' + esc(idx) + '</span> ' +
+        '<span class="dim">' + f.duration + 's</span> ' +
+        esc(f.talk || '（无台词）') + '</div>' +
+        '<audio controls preload="none" src="/api/tts/neko/audio?name=' +
+        encodeURIComponent(f.name) + '" style="width:100%"></audio></div>';
+    }).join('');
+  }).catch(e => toast(e.message, 'err'));
+}
+
+function ttsCompare() {
+  const text = (document.getElementById('tts-text').value || '').trim();
+  if (!text) { toast('先输入要合成的文本', 'err'); return; }
+  const btn = document.getElementById('tts-go');
+  if (btn) { btn.disabled = true; btn.textContent = '合成中…'; }
+  const body = {
+    text: text,
+    mimo_mode: document.getElementById('tts-mimo-mode').value,
+    minimax_mode: document.getElementById('tts-mm-mode').value,
+    mimo_voice: document.getElementById('tts-mimo-voice').value,
+    minimax_voice: document.getElementById('tts-mm-voice').value,
+    mimo_design: document.getElementById('tts-mimo-design').value,
+  };
+  api('/api/tts/compare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(j => {
+    renderTtsSide('tts-mimo-result', 'MiMo', j.mimo);
+    renderTtsSide('tts-mm-result', 'MiniMax', j.minimax);
+  }).catch(e => toast(e.message, 'err'))
+    .finally(() => { if (btn) { btn.disabled = false; btn.textContent = '合成对比'; } });
+}
+
+function renderTtsSide(elId, name, r) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (!r || !r.ok) {
+    el.innerHTML = '<div class="empty" style="padding:24px">' +
+      '<b>' + esc(name) + '</b>：' + esc((r && r.error) || '未配置 key') + '</div>';
+    return;
+  }
+  const meta = [esc(r.mode || ''), esc(r.voice || ''), r.latency_s + 's',
+                Math.round((r.bytes || 0) / 1024) + 'KB'].join(' · ');
+  el.innerHTML =
+    '<div class="dim" style="font-size:12px;margin-bottom:10px">' + meta + '</div>' +
+    '<audio controls src="' + r.data_url + '" style="width:100%;margin-bottom:10px"></audio>' +
+    '<div class="dim" style="font-size:11px;word-break:break-all">' +
+    r.data_url.slice(0, 60) + '…</div>';
+}
+
 // ------------------------------------------------------------- 控制台（agent 管理）
 let AGENT_TIMER = null;
+let LOG_CUR_FILE = '';   // 空 = 当前 agent.log；否则历史轮转文件名
+function loadLogFiles() {
+  api('/api/agent/logs_files').then(j => {
+    const sel = document.getElementById('log-file');
+    if (!sel) return;
+    const files = j.files || [];
+    sel.innerHTML = files.map(f =>
+      '<option value="' + esc(f.name) + '">' + esc(f.name) +
+      (f.current ? '（当前）' : '') + '</option>').join('');
+  }).catch(() => {});
+}
+function loadLogTail() {
+  const url = '/api/agent/logs?n=200' +
+    (LOG_CUR_FILE ? '&file=' + encodeURIComponent(LOG_CUR_FILE) : '');
+  api(url).then(j => {
+    const el = document.querySelector('#console-log pre');
+    if (el) el.textContent = j.log || '(无日志)';
+  }).catch(() => {});
+}
+function switchLogFile(name) { LOG_CUR_FILE = name || ''; loadLogTail(); }
+
 function loadConsole() {
   loadAsideSessions();
   loadDecisionModel();
+  loadLogFiles();
+  // 正在执行 + 时序队列（复用实况页的渲染逻辑，总览页独立容器）
+  Promise.all([
+    api('/api/status').catch(() => null),
+    api('/api/ops?n=100').catch(() => null),
+  ]).then(([st, ops]) => {
+    const cur = (st && st.current) || null;
+    const q = (st && st.queue) || [];
+    let winOps = [];
+    if (ops && ops.ops) {
+      if (cur && cur.ts) winOps = ops.ops.filter(o => o.ts >= cur.ts - 90);
+      else winOps = ops.ops.slice(0, 30);
+    }
+    renderCurrent(cur, winOps, 'console-current');
+    document.getElementById('console-queue').innerHTML = queueTable(q);
+    const n = document.getElementById('console-queue-n');
+    if (n) n.textContent = q.length ? q.length + ' 条' : '';
+  }).catch(() => {});
   api('/api/agent/status').then(j => {
     if (j.mode === 'embedded') {
       document.getElementById('console-status').innerHTML =
-        '<div class="empty">网关以内嵌模式运行（随 agent 主进程）</div>';
+        '<div class="hero-crash"><b>⚠ 内嵌模式</b> —— ' +
+        '网关随 agent 主进程运行（python -m src.main --with-gateway），本页无法启停 agent。' +
+        '如需独立管理，请改用 systemd 服务 wechat-agent-gateway 运行网关。</div>';
       document.getElementById('console-log').innerHTML =
         '<div class="empty">日志由 agent 进程输出</div>';
       return;
@@ -984,38 +1484,43 @@ function loadConsole() {
     const exit = a.exit ? ('退出码 ' + a.exit.code +
                             (a.exit.ts ? ' @ ' + new Date(a.exit.ts * 1000)
                              .toLocaleTimeString() : '')) : '';
-    document.getElementById('console-status').innerHTML =
-      '<div class="chip-row" style="margin-bottom:14px">' +
+    let statusHtml =
+      '<div class="chip-row">' +
       '<span class="badge ' + state + '">' + state + '</span>' +
       '<span class="stat-chip">' + pid + '</span>' +
       '<span class="stat-chip">启动 ' + st + '</span>' +
       (exit ? '<span class="stat-chip">' + esc(exit) + '</span>' : '') +
-      '</div>' +
-      '<div class="dim" style="font-size:11px;text-transform:uppercase;' +
-      'letter-spacing:.1em;margin:10px 0 6px">Agent 进程控制</div>' +
-      '<div style="display:flex;gap:10px">' +
+      '</div>';
+    if (state === 'crashed') {
+      statusHtml +=
+        '<div class="hero-crash"><b>⚠ Agent 已崩溃</b>' +
+        (exit ? '（' + esc(exit) + '）' : '') +
+        ' —— 请查看下方日志定位原因，处理后点「启动」恢复。</div>';
+    }
+    statusHtml +=
+      '<div class="hero-controls">' +
+      '<div class="hero-group">' +
+      '<div class="hero-label">Agent 进程控制</div>' +
+      '<div class="hero-btns">' +
       '<button class="btn" onclick="agentAction(&quot;start&quot;)">启动</button>' +
       '<button class="btn ghost" onclick="agentAction(&quot;stop&quot;)">停止</button>' +
       '<button class="btn ghost" onclick="agentAction(&quot;restart&quot;)">重启</button>' +
-      '</div>' +
-      '<div class="dim" style="font-size:11px;text-transform:uppercase;' +
-      'letter-spacing:.1em;margin:18px 0 6px">网关自身（不影响 agent）</div>' +
-      '<div style="display:flex;gap:10px;align-items:center">' +
-      '<button class="btn ghost" onclick="gatewayReload()">刷新网关</button>' +
-      '<span class="dim" style="font-size:12px">只重载网关代码，agent 不受影响</span>' +
+      '</div></div>' +
+      '<div class="hero-group">' +
+      '<div class="hero-label">网关自身（不影响 agent）</div>' +
+      '<div class="hero-btns">' +
+      '<button class="btn ghost" onclick="gatewayReload()">强制重载网关代码</button>' +
+      '<span class="dim" style="font-size:12px">改 src/gateway/*.py 通常自动热重载，此按钮仅手动强制</span>' +
+      '</div></div>' +
       '</div>' +
       '<div style="margin-top:12px"><span id="agent_msg"></span></div>';
+    document.getElementById('console-status').innerHTML = statusHtml;
     document.getElementById('console-log').innerHTML =
       '<pre class="log-pre">' + esc(j.log || '(无日志)') + '</pre>';
-    // 运行中自动刷新日志
+    // 运行中自动刷新日志（保持用户选中的日志文件）
     if (AGENT_TIMER) clearInterval(AGENT_TIMER);
     if (state === 'running') {
-      AGENT_TIMER = setInterval(() => {
-        api('/api/agent/logs?n=200').then(j => {
-          const el = document.querySelector('#console-log pre');
-          if (el && j.log) el.textContent = j.log;
-        }).catch(() => {});
-      }, 3000);
+      AGENT_TIMER = setInterval(() => { loadLogTail(); }, 3000);
     }
   }).catch(e => toast(e.message, 'err'));
 }
@@ -1049,6 +1554,9 @@ function sendAside() {
     if (res) res.textContent = '会话和内容不能为空';
     return;
   }
+  if (!confirm('向「' + session + '」注入消息并触发一次决策？\nagent 可能因此真的回复 / 发送消息给对方。')) {
+    return;
+  }
   if (res) { res.textContent = '发送中…'; res.className = 'aside-result'; }
   api('/api/aside', {method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1067,35 +1575,52 @@ function sendAside() {
   });
 }
 
+// ============================================================= 模型目录（中心配置器）
+// 所有「选模型」处（全局决策模型 / 每会话模型）都从 /api/models 拿清单，
+// 前端不再硬编码 provider→模型列表（此前 DM_MODELS 与后端 AVAILABLE_MODELS
+// 是两份不一致的清单）。
+let MODEL_CATALOG = null;   // {provider: [models]}
+let MODEL_DEFAULTS = {};    // {provider: default_model}
+
+function loadModelCatalog() {
+  return api('/api/models').then(j => {
+    MODEL_CATALOG = j.catalog || {};
+    MODEL_DEFAULTS = j.defaults || {};
+    return j;
+  });
+}
+
 // 决策模型切换（热插拔：保存 runtime.json + 转发 agent 回调端口即时生效）
-const DM_MODELS = {
-  kimi: ['k3', 'k3-256k', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
-  deepseek: ['deepseek-v4-flash', 'deepseek-v4-pro'],
-};
 function updateDmModels() {
   const p = document.getElementById('dm-provider').value;
-  const dl = document.getElementById('dm-models');
-  if (dl) dl.innerHTML = (DM_MODELS[p] || []).map(m =>
-    '<option value="' + m + '"></option>').join('');
+  const sel = document.getElementById('dm-model');
+  if (sel && MODEL_CATALOG) {
+    sel.innerHTML = (MODEL_CATALOG[p] || []).map(m =>
+      '<option value="' + m + '">' + m + '</option>').join('');
+  }
 }
 function loadDecisionModel() {
-  api('/api/decision_model').then(j => {
+  loadModelCatalog().then(() => api('/api/decision_model')).then(j => {
     const c = j.config || {}, live = j.live || {};
     const el = document.getElementById('dm-live');
     if (el) el.textContent = j.agent_online
       ? ('当前在线模型：' + (live.model || '?') +
          '（下限 ' + (live.token_floor || 0) + ' / 上限 ' +
          (live.token_ceiling || '不封顶') + '）')
-      : 'agent 不在线——保存后将在下次启动时生效';
-    if (c.decision_provider)
-      document.getElementById('dm-provider').value = c.decision_provider;
+      : 'agent 不在线——已保存的选择将在下次启动时生效（可到下方直接启动 agent）';
+    const selP = document.getElementById('dm-provider');
+    if (selP && MODEL_CATALOG) {
+      selP.innerHTML = Object.keys(MODEL_CATALOG).map(p =>
+        '<option value="' + p + '">' + p + '</option>').join('');
+      if (c.decision_provider) selP.value = c.decision_provider;
+    }
+    updateDmModels();
     if (c.decision_model)
       document.getElementById('dm-model').value = c.decision_model;
     if (c.decision_token_floor)
       document.getElementById('dm-floor').value = c.decision_token_floor;
     if (c.decision_token_ceiling)
       document.getElementById('dm-ceiling').value = c.decision_token_ceiling;
-    updateDmModels();
   }).catch(() => {});
 }
 function saveDecisionModel() {
@@ -1187,8 +1712,102 @@ function setLevel(session) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({session, level, extra_rule: extra})})
     .then(r => r.json()).then(j => {
-      if (!j.ok) toast(j.error || '保存失败', 'err');
+      if (!j.ok) { toast(j.error || '保存失败', 'err'); return; }
+      toast('已保存 → ' + (j.path || '') + '（下次决策生效）', 'ok');
       loadGroups();
+    }).catch(e => toast(e.message, 'err'));
+}
+
+// ------------------------------------------------------------- 会话模型（每会话决策 provider/选项）
+let SM_DATA = null;   // {sessions, configs, available}
+function loadSessionModel() {
+  loadModelCatalog().then(() => api('/api/session_config')).then(j => {
+    SM_DATA = j;
+    const list = document.getElementById('sessionmodel-list');
+    if (!j.sessions.length) {
+      list.innerHTML = '<div class="empty">暂无会话（agent 尚未同步过消息）</div>';
+      return;
+    }
+    const provOpts = Object.keys(MODEL_CATALOG || {}).map(p =>
+      '<option value="' + p + '">' + p + '</option>').join('');
+    let h = '<div style="display:flex;flex-direction:column;gap:10px">';
+    for (const s of j.sessions) {
+      const cfg = j.configs[s] || {};
+      const key = encodeURIComponent(s);
+      const prov = cfg.provider || '';
+      const model = cfg.model || '';
+      const mem = cfg.include_memory !== false;
+      const hist = cfg.include_history !== false;
+      const goal = cfg.goal || '';
+      const modelOpts = (prov && MODEL_CATALOG && MODEL_CATALOG[prov])
+        ? MODEL_CATALOG[prov].map(m =>
+            '<option value="' + m + '"' + (m === model ? ' selected' : '') +
+            '>' + m + '</option>').join('')
+        : '';
+      h += '<div style="border:1px solid var(--border-light);border-radius:var(--r-sm);' +
+           'padding:10px">' +
+           '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">' +
+           '<b>' + esc(s) + '</b>' +
+           (prov ? '<span class="badge" style="background:var(--pale-blue);color:var(--ink)">' +
+                   esc(prov) + ' / ' + esc(model) + '</span>' : '') +
+           '<span class="dim" style="font-size:12px">（空 = 跟随全局）</span></div>' +
+           '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
+           '<select id="sp-' + key + '" class="ipt" style="width:130px" ' +
+           'onchange="smModels(\'' + key + '\')">' +
+           '<option value="">跟随全局</option>' + provOpts + '</select>' +
+           '<select id="sm-' + key + '" class="ipt" style="width:220px">' +
+           '<option value="">（未选）</option>' + modelOpts + '</select>' +
+           '<label style="font-size:12px;color:var(--muted)">' +
+           '<input type="checkbox" id="smem-' + key + '"' + (mem ? ' checked' : '') + '> 带记忆</label>' +
+           '<label style="font-size:12px;color:var(--muted)">' +
+           '<input type="checkbox" id="shist-' + key + '"' + (hist ? ' checked' : '') + '> 带历史</label>' +
+           '</div>' +
+           '<div style="margin-top:6px;display:flex;gap:8px">' +
+           '<input id="sgoal-' + key + '" class="ipt" style="flex:1" placeholder="本群目标（可选，注入【本群目标】块）" value="' +
+           esc(goal).replace(/"/g, '&quot;') + '"/>' +
+           '<button class="btn sm" data-sess="' + key + '" ' +
+           'onclick="saveSessionModel(decodeURIComponent(this.dataset.sess))">保存</button>' +
+           '<button class="btn sm" style="background:var(--stone)" data-sess="' + key + '" ' +
+           'onclick="clearSessionModel(decodeURIComponent(this.dataset.sess))">清除</button>' +
+           '</div></div>';
+    }
+    h += '</div>';
+    list.innerHTML = h;
+  }).catch(e => toast(e.message, 'err'));
+}
+function smModels(key) {
+  const prov = document.getElementById('sp-' + key).value;
+  const sel = document.getElementById('sm-' + key);
+  const avail = (MODEL_CATALOG && MODEL_CATALOG[prov]) || [];
+  sel.innerHTML = '<option value="">（未选）</option>' +
+    avail.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+}
+function saveSessionModel(session) {
+  const key = encodeURIComponent(session);
+  const provider = document.getElementById('sp-' + key).value;
+  const model = document.getElementById('sm-' + key).value;
+  const include_memory = document.getElementById('smem-' + key).checked;
+  const include_history = document.getElementById('shist-' + key).checked;
+  const goal = document.getElementById('sgoal-' + key).value;
+  const config = {include_memory, include_history, goal};
+  if (provider) { config.provider = provider; config.model = model; }
+  fetch('/api/session_config', {method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({session, config})})
+    .then(r => r.json()).then(j => {
+      if (!j.ok) return toast(j.error || '保存失败', 'err');
+      toast('已保存 ' + session + ' 的会话配置');
+      loadSessionModel();
+    }).catch(e => toast(e.message, 'err'));
+}
+function clearSessionModel(session) {
+  fetch('/api/session_config', {method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({session, config: {}})})
+    .then(r => r.json()).then(j => {
+      if (!j.ok) return toast(j.error || '清除失败', 'err');
+      toast('已清除 ' + session + ' 的会话配置（跟随全局）');
+      loadSessionModel();
     }).catch(e => toast(e.message, 'err'));
 }
 
@@ -1366,16 +1985,27 @@ function loadEnv() {
            '<div class="env-masked"><span class="env-dot"></span><span class="env-dot"></span><span class="env-dot"></span>' +
            '<span class="dim">' + esc(item.masked) + '</span></div>' +
            '<input type="text" data-envkey="' + esc(item.key) +
-           '" placeholder="新值（留空=不变）"/></div>';
+           '" placeholder="新值（留空=不变）"/>' +
+           '<button class="btn sm ghost" data-envdel="' + esc(item.key) +
+           '" onclick="delEnv(this.dataset.envdel)">删除</button></div>';
     h += '<div class="env-row env-new">' +
          '<input type="text" id="env_newkey" placeholder="NEW_KEY"/>' +
          '<input type="text" id="env_newval" placeholder="新值"/>' +
          '</div>';
     h += '</div></div><div style="margin-top:16px">' +
          '<button class="btn" onclick="saveEnv()">保存</button>' +
-         ' <span id="env_msg"></span></div></div>';
+         ' <span id="env_msg"></span>' +
+         ' <span class="dim" style="font-size:12px">留空=保持不变；点「删除」移除该密钥</span></div></div>';
     p.innerHTML = h;
   }).catch(e => toast(e.message, 'err'));
+}
+
+function delEnv(key) {
+  if (!confirm('确认删除密钥 ' + key + ' ？删除后 agent 需重启才真正失效。')) return;
+  api('/api/env', {method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[key]: null})
+  }).then(() => loadEnv()).catch(e => toast(e.message, 'err'));
 }
 
 function saveEnv() {
@@ -1448,9 +2078,10 @@ function queueTable(queue) {
 }
 
 // 正在执行的时序：高亮队列对应条目 + 展示其内部原子操作
-function renderCurrent(cur, ops) {
-  const el = document.getElementById('live-current');
-  const tag = document.getElementById('live-current-tag');
+// elId/tagId 可覆盖：总览页（控制台）与实况页各用一套容器
+function renderCurrent(cur, ops, elId = 'live-current', tagId = 'live-current-tag') {
+  const el = document.getElementById(elId);
+  const tag = document.getElementById(tagId);
   if (!cur) {
     tag.textContent = '无';
     tag.className = 'badge';
@@ -1525,6 +2156,22 @@ function loadLive() {
     const cur = (st && st.current) || null;
     document.getElementById('live-evcount').textContent =
       (ev && ev.events ? ev.events.length : 0) + ' 条';
+    // 缓存命中统计徽章（决策层 cache_stats.json，由 proxy 每次决策累加）
+    const cache = (st && st.cache) || {};
+    const cEl = document.getElementById('live-cache');
+    if (cEl) {
+      if (cache && cache.count) {
+        const rate = cache.prompt_tokens
+          ? Math.round(cache.cached_tokens / cache.prompt_tokens * 100) : 0;
+        cEl.textContent = '缓存 ' + rate + '% · ' + cache.count + ' 次';
+        cEl.className = 'badge ' + (rate >= 50 ? 'green' : '');
+        cEl.title = '累计输入 ' + cache.prompt_tokens + ' token，缓存命中 ' +
+                    cache.cached_tokens + ' token';
+      } else {
+        cEl.textContent = '缓存 -';
+        cEl.className = 'badge';
+      }
+    }
     // 水位：已决策到的最新消息号
     const wmEl = document.getElementById('live-wm');
     if (wmEl) {
@@ -1996,16 +2643,17 @@ function loadFilesBrowser(dir) {
            '<span class="dim">上级目录</span></div>';
     }
     for (const it of j.items) {
+      const full = FILES_DIR ? FILES_DIR + '/' + it.name : it.name;
       if (it.is_dir) {
-        h += '<div class="q-item" onclick="filesOpen(\'' +
-             escAttr(FILES_DIR ? FILES_DIR + '/' + it.name : it.name) + '\')">' +
+        h += '<div class="q-item" data-path="' + escAttr(full) + '" ' +
+             'onclick="filesOpen(this.dataset.path)">' +
              '📁 <span class="flow-sess">' + esc(it.name) + '</span></div>';
       } else {
         const size = it.size < 1024 ? it.size + ' B'
                    : it.size < 1048576 ? (it.size / 1024).toFixed(1) + ' KB'
                    : (it.size / 1048576).toFixed(1) + ' MB';
-        h += '<div class="q-item" onclick="filesRead(\'' +
-             escAttr(FILES_DIR ? FILES_DIR + '/' + it.name : it.name) + '\')">' +
+        h += '<div class="q-item" data-path="' + escAttr(full) + '" ' +
+             'onclick="filesRead(this.dataset.path)">' +
              '📄 <span class="flow-sess">' + esc(it.name) + '</span>' +
              '<span class="dim" style="margin-left:auto">' + size + '</span></div>';
       }
@@ -2046,9 +2694,93 @@ function escAttr(s) {
 }
 
 // 实况页每 3 秒自动刷新（仅实况标签页激活时）
-setInterval(() => { if (curTab === 'live') loadLive(); }, 3000);
+// 实况数据始终后台刷新（不再"切走就冻结、切回看旧数据"）
+setInterval(() => { loadLive(); }, 3000);
 
-showTab('live');
+// ============================================================ 表情包页
+let EMI_PAGE=1, EMI_PP=30, EMI_HAS_MORE=false, EMI_LOADED=false;
+
+async function emojiSearch(page) {
+  EMI_PAGE = page || 1;
+  const q = document.getElementById('emoji-q').value.trim();
+  const to = document.getElementById('emoji-to').checked;
+  let url = '/api/emojis/list?page='+EMI_PAGE+'&per_page='+EMI_PP;
+  if (q) url += '&q=' + encodeURIComponent(q);
+  if (to) url += '&text_only=1';
+
+  try {
+    const j = await api(url);
+    EMI_HAS_MORE = j.has_more;
+    document.getElementById('emoji-info').textContent =
+      '第 '+j.page+' 页'+(j.has_more?' · 还有更多':'');
+    renderEmojiList(j.items);
+    renderEmojiPager();
+  } catch(e) { 
+    document.getElementById('emoji-info').textContent = '加载失败: '+e.message;
+  }
+}
+
+// 首次打开时加载总数
+setTimeout(async () => {
+  try {
+    const j = await api('/api/emojis/stats');
+    document.getElementById('emoji-total').textContent = '共 '+j.total+' 个';
+  } catch(e) {}
+}, 200);
+
+function renderEmojiList(items) {
+  let h = '';
+  for (const it of items) {
+    const kw = (it.keywords||[]).slice(0,4).join(' · ');
+    const txt = it.text ? ' <b style="color:var(--coral)">['+esc(it.text)+']</b>' : '';
+    const real = it.is_real ? ' <span style="color:#fff;background:var(--coral);font-size:10px;padding:1px 5px;border-radius:3px;margin-right:4px">真人</span>' : '';
+    h += '<div class="item-row" onclick="emojiSelect('+it.seq+')" data-seq="'+it.seq+'">'+
+         '<span style="font-weight:700;font-size:13px;min-width:56px">'+it.seq+'</span>'+
+         '<span>'+real+esc((it.description||'').slice(0,50))+txt+'</span>'+
+         '<span class="item-meta">'+kw+'</span></div>';
+  }
+  document.getElementById('emoji-list').innerHTML = h || '<div class="empty">无结果</div>';
+}
+
+function renderEmojiPager() {
+  let h = '';
+  if (EMI_PAGE > 1) {
+    h += '<button class="subtab-btn" onclick="emojiSearch(1)">«</button>';
+    h += '<button class="subtab-btn" onclick="emojiSearch('+(EMI_PAGE-1)+')">‹</button>';
+  }
+  const s = Math.max(1, EMI_PAGE-2);
+  for (let i=s; i<EMI_PAGE; i++)
+    h += '<button class="subtab-btn" onclick="emojiSearch('+i+')">'+i+'</button>';
+  h += '<button class="subtab-btn active">'+EMI_PAGE+'</button>';
+  if (EMI_HAS_MORE) {
+    h += '<button class="subtab-btn" onclick="emojiSearch('+(EMI_PAGE+1)+')">'+(EMI_PAGE+1)+'</button>';
+    if (EMI_PAGE<3) h += '<button class="subtab-btn" onclick="emojiSearch('+(EMI_PAGE+2)+')">'+(EMI_PAGE+2)+'</button>';
+    h += '<button class="subtab-btn" onclick="emojiSearch('+(EMI_PAGE+1)+')">›</button>';
+  }
+  document.getElementById('emoji-pager').innerHTML = h;
+}
+
+function emojiSelect(seq) {
+  document.querySelectorAll('#emoji-list .item-row').forEach(el =>
+    el.classList.toggle('active', +el.dataset.seq === seq));
+  const pv = document.getElementById('emoji-preview');
+  pv.innerHTML = '<div style="padding:20px;text-align:center">'+
+    '<img src="/api/emojis/image/'+seq+'" style="max-width:100%;max-height:60vh;'+
+    'border-radius:var(--r-md)" onerror="this.parentElement.innerHTML=\'<div class=empty>图片不可用</div>\'">'+
+    '</div>';
+}
+
+// 切换到表情包页时自动加载
+const origShowTab = showTab;
+showTab = function(name) {
+  origShowTab(name);
+  if (name === 'emojis' && !EMI_LOADED) {
+    EMI_LOADED = true;
+    setTimeout(() => emojiSearch(1), 100);
+  }
+};
+
+showTab('console');
 </script>
 </body>
 </html>

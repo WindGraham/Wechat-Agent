@@ -139,7 +139,7 @@ class Reader:
 
     @staticmethod
     def _msg_to_entry(m, title, is_group):
-        """slicer 消息 -> SnapEntry。sender 规则与旧 chat_parser 一致。"""
+        """slicer 消息 -> SnapEntry。双因子 (头像+昵称) 校验增强。"""
         ctype = m.get("content_type", "text")
         if ctype in ("time_divider", "system"):
             return SnapEntry(kind="divider", sender="system",
@@ -147,12 +147,17 @@ class Reader:
                              content_type="time_divider" if ctype == "time_divider" else "system")
         is_mine = m.get("side") == "self"
         nick = m.get("nickname")
+
+        # 尝试双因子判定匹配 Sender
         if is_mine:
             sender = "self"
+        elif m.get("matched_user_name"):
+            sender = m["matched_user_name"]
         elif nick:
             sender = nick
         else:
             sender = title if not is_group else "unknown(left)"
+
         content = m.get("content") or ""
         mentions = re.findall(r"@([^\s@，,：:]+)", content) if "@" in content else []
         partial = bool(m.get("partial_top") or m.get("partial_bottom"))

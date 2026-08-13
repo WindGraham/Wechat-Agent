@@ -32,6 +32,7 @@ import shlex
 import time
 
 import cv2
+import numpy as np
 
 from ..device import layout
 from ..device.random_touch import Rect
@@ -45,11 +46,71 @@ log = logging.getLogger("action.image_sender")
 # 聚焦态整条输入栏顶起 ~125px，⊕ 中心变为 (1015,2060)。
 CHAT_PLUS_FOCUSED = Rect(960, 2005, 110, 110)
 
-# 相册选择页第一张图的选择圆（网格 218+271·col, 256+272·row，旧仓库真机标定）
+# 相册选择页第一张图的选择圆（网格 218+271·col, 256+272·row，旧仓库真机标定）。
+# 仅作 CV 检测失败时的兜底坐标；正常路径用 _find_select_circle 动态定位。
 FIRST_IMG_CIRCLE = Rect(198, 236, 40, 40)
 
 PHONE_IMG_DIR = "/sdcard/Pictures"      # 图片 push 目录（相册可扫到）
 PHONE_FILE_DIR = "/sdcard/Download"     # 文件 push 目录（文件选择器可找到）
+
+
+# ------------------------------------------------------------------ CV 选图
+def _find_select_circles(img):
+    """检测相册选择页里**所有**"选择圆圈"，返回 [(cx, cy), ...]（按位置排序）。
+
+    微信相册每张缩略图右上角有一个白色空心圆环（勾选圆圈）。
+    特征：圆环描边亮（白色）、圆心暗（空心）——以此与缩略图内容里
+    的实心圆/暗圆/文字区分。霍夫圆检测候选后按该特征过滤。
+
+    2026-08-13 真机标定：选择圆圈中心约 (218,256) r≈30，环亮~160、
+    圆心亮~13、差~148；缩略图内容里的圆均被该特征正确排除。
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.medianBlur(gray, 5)
+    circles = cv2.HoughCircles(blur, cv2.HOUGH_GRADIENT, dp=1, minDist=50,
+                               param1=80, param2=25,
+                               minRadius=15, maxRadius=45)
+    if circles is None:
+        return []
+    cands = []
+    for x, y, r in circles[0]:
+        x, y, r = int(x), int(y), int(r)
+        # 圆环亮度（半径 r 的描边）
+        ring_mask = np.zeros(gray.shape, np.uint8)
+        cv2.circle(ring_mask, (x, y), r, 255, 2)
+        ring = gray[ring_mask > 0]
+        # 圆心亮度（半径 0.3r 内）
+        rr = max(1, int(r * 0.3))
+        y0, y1 = max(0, y - rr), min(gray.shape[0], y + rr)
+        x0, x1 = max(0, x - rr), min(gray.shape[1], x + rr)
+        center = gray[y0:y1, x0:x1]
+        if len(ring) == 0 or center.size == 0:
+            continue
+        ring_b = float(ring.mean())
+        center_b = float(center.mean())
+        # 空心圆环：圆环足够亮，且明显亮于圆心
+        if ring_b > 150.0 and (ring_b - center_b) > 30.0:
+            cands.append((x, y))
+    cands.sort(key=lambda p: (p[1], p[0]))   # 按 (y, x) 排序 = 网格顺序
+    return cands
+
+
+def _find_select_circle(img):
+    """返回第一张图（最左上角）的选择圆圈位置 (cx, cy)，找不到 None。"""
+    circles = _find_select_circles(img)
+    return circles[0] if circles else None
+
+
+def _clear_album(dev):
+    """清空手机相册：删除公共图片目录的文件 + MediaStore 记录。
+
+    目的（2026-08-13 用户定方案）：默认保持手机相册全空，每次只发一个。
+    发送前清空相册 → push 的图就是唯一第一张 → CV 检测第一张圆圈即可
+    正确选中，不依赖"push 图按时间排第一"这个不可靠假设（此前曾因相册
+    残留截图/旧图导致选错图）。
+    """
+    dev._shell("find /sdcard/Pictures /sdcard/DCIM -type f -delete")
+    dev._shell("content delete --uri content://media/external/images/media")
 
 
 # ------------------------------------------------------------------ 通用辅助
@@ -123,7 +184,13 @@ def send_image(dev, path):
     if cv2.imread(path) is None:
         return _fail("args", f"文件不是有效图片: {path}")
 
-    # 2. push + 媒体扫描
+    # 2. 清空相册：保证 push 的图是唯一第一张（不依赖"按时间排第一"的假设）
+    try:
+        _clear_album(dev)
+    except Exception as e:
+        log.warning("清空相册失败（继续发送）: %s", e)
+
+    # 3. push + 媒体扫描
     ext = os.path.splitext(path)[1].lower() or ".jpg"
     phone_path = f"{PHONE_IMG_DIR}/agent_send{ext}"
     try:
@@ -131,30 +198,38 @@ def send_image(dev, path):
     except Exception as e:
         return _fail("push", f"push 图片到手机失败: {e}", dev, phone_path)
 
-    # 3. 开加号面板（两态 ⊕ 坐标）
+    # 4. 开加号面板（两态 ⊕ 坐标）
     if not _open_plus_panel(dev):
         return _fail("plus_panel", "加号面板未打开", dev, phone_path)
 
-    # 4. 点"相册"卡片（plus_panel 网格检测，第一页必有）
+    # 5. 点"相册"卡片（plus_panel 网格检测，第一页必有）
     r = plus_panel.plus_panel_tap(dev, "相册")
     if not r["success"]:
         return _fail("album_tap", r["error"], dev, phone_path)
     dev.wait_random(1000, 1500)
 
-    # 5. 验证相册选择页已开（标题"图片和视频"），再选第一张图
+    # 6. 验证相册选择页已开，再用 CV 定位第一张图的选择圆圈。
+    #    相册已在第 2 步清空，push 的图就是唯一第一张，检测第一张圆圈即正确。
     if not _ocr_find(dev, "图片和视频"):
         return _fail("album_open", "相册选择页未打开", dev, phone_path)
-    dev.tap_rect(FIRST_IMG_CIRCLE)
+    pos = _find_select_circle(dev.capture_bytes())
+    if pos is None:
+        # CV 检测失败（布局异常）回退到真机标定的硬编码坐标
+        log.warning("select circle 未检测到，回退硬编码坐标")
+        pos = FIRST_IMG_CIRCLE.center
+    else:
+        log.info("select circle 定位: (%d,%d)", int(pos[0]), int(pos[1]))
+    dev.tap_rect(Rect(int(pos[0]) - 20, int(pos[1]) - 20, 40, 40))
     dev.wait_random(600, 1000)
 
-    # 6. OCR 验证选中（出现"发送(N)"按钮），才点发送
+    # 7. OCR 验证选中（出现"发送(N)"按钮），才点发送
     send_pos = _ocr_find(dev, "发送", ymin=1900)
     if not send_pos:
         return _fail("select", "未选中图片（发送按钮未出现）", dev, phone_path)
     dev.tap_rect(Rect(send_pos[0] - 40, send_pos[1] - 30, 80, 60))
     dev.wait_random(1200, 1800)
 
-    # 7. 清理手机临时图片
+    # 8. 清理手机临时图片
     _cleanup(dev, phone_path)
     log.info("image sent: %s", path)
     return {"ok": True, "step": "sent", "path": path}

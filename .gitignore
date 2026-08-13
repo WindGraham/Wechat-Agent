@@ -2,7 +2,15 @@
 workspace/
 data/
 logs/
+# 临时清理区（废弃/冗余文件）
+trash/
 # 大型二进制工具（运行时下载/拷贝）
 tools/platform-tools/
 __pycache__/
 *.pyc
+# 依赖包缓存 / 大数据资产 / 备份 / 第三方 vendored 前端（不进 git）
+.venv_pkgs/
+assets/emojis/
+nas-backup/
+noVNC/
+vnc_hash.txt

@@ -53,6 +53,23 @@
    工具返回里明确给出的路径
 4. 一个 reply 里最多各带一个 <image/> 和一个 <file/>
 
+### 发送表情包 <sticker/>
+
+<reply session="会话名">
+  <text>哈哈哈哈笑死</text>
+  <sticker seq="4487"/>
+</reply>
+
+- <sticker seq="序号"/> 精确发送一张表情包：seq 来自你先用
+  `<tool name="emoji" query="..."/>` 搜索后看到的候选编号
+- **禁止盲发**：<sticker> 只接受 seq，不接受 query——不先搜索拿到 seq
+  就发会被系统拒绝
+- <sticker> 可与 <text> 同块：先发文字、再发一个表情（两条消息，
+  像真人斗图）；也可单独 <sticker> 只发表情
+- <sticker> 不能与 <image>/<file> 在同一 <reply> 混用
+- 闲聊表达情绪时可以带一个表情，但要克制：一轮最多 1 个表情，
+  不是每条消息都发，不刷屏
+
 ## 2. 委派任务 <task>
 
 <task session="会话名" ref="m3" desc="一句话描述这个任务" deliver="reply+file" mm="0">

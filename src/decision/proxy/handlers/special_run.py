@@ -23,7 +23,7 @@ class SpecialRunHandler(EventHandler):
         if proxy._rt("paused", False):
             return
         threading.Thread(
-            target=proxy._run_special,
+            target=proxy._special.run,
             args=(ev["prompt_name"], ev.get("session", "")),
             daemon=True,
             name=f"special-{ev['prompt_name']}",

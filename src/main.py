@@ -165,7 +165,6 @@ def assemble(workspace_root, config_path, with_device=True):
                 reader=comp["session_reader"],
                 submit_bundle=submit_bundle,
                 runtime=runtime,
-                wechat_tools=comp.get("tools"),  # 朋友圈发帖等直接操作微信
             )
             # 记忆提取用便宜模型（独立于主决策 provider，后台异步跑不占主模型配额）
             extract_prefer = runtime.get("extract_provider", "deepseek")

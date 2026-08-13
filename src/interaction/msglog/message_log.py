@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS messages (
     msg_uid      TEXT NOT NULL UNIQUE,
     mentions     TEXT DEFAULT '',
     media_path   TEXT DEFAULT '',         -- 多媒体裁图归档路径（CONTRACTS §一）
+    crop_path    TEXT DEFAULT '',         -- 本条消息在实时采集时的裁图（workspace/crops 相对路径）
     frame_phash  TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_session_seq ON messages(session_id, seq);
@@ -119,6 +120,7 @@ def connect(db_path):
 # 老库兼容：schema 后加列时，对已存在的 db 文件做 ALTER TABLE 补列
 _MIGRATIONS = (
     ("messages", "media_path", "ALTER TABLE messages ADD COLUMN media_path TEXT DEFAULT ''"),
+    ("messages", "crop_path", "ALTER TABLE messages ADD COLUMN crop_path TEXT DEFAULT ''"),
 )
 
 
@@ -477,16 +479,19 @@ def _insert_rows(conn, session_id, entries, first_seq, source, captured_ts,
             complete = 1
         mentions = ",".join(getattr(e, "mentions", None) or [])
         media_path = getattr(e, "media_path", None) or ""
+        crop_path = getattr(e, "crop_path", None) or ""
         cur = conn.execute(
             "INSERT OR IGNORE INTO messages"
             "(session_id, seq, ts_hint, ts_text, ts_captured, sender,"
             " is_mine, content_type, content, content_norm, complete,"
-            " ocr_conf, source, align_key, msg_uid, mentions, media_path)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " ocr_conf, source, align_key, msg_uid, mentions, media_path,"
+            " crop_path)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (session_id, seq, ts_hint, ts_text, captured_ts, sender,
              1 if getattr(e, "is_mine", False) else 0, ctype, content,
              content_norm, complete, getattr(e, "ocr_conf", None), source,
-             akey, _msg_uid(session_id, seq, akey), mentions, media_path))
+             akey, _msg_uid(session_id, seq, akey), mentions, media_path,
+             crop_path))
         inserted += cur.rowcount
         min_seq = seq if min_seq is None else min(min_seq, seq)
         max_seq = seq if max_seq is None else max(max_seq, seq)

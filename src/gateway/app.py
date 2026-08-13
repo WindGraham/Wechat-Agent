@@ -9,6 +9,7 @@
 所有请求必须带 ``Authorization: Bearer <token>``。
 """
 
+import hmac
 import logging
 import os
 
@@ -22,24 +23,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
 # 允许编辑的文件根（相对 project_root），path 参数必须落在其中之一
 EDITABLE_ROOTS = ("config/prompts", "config/personas")
 
-# runtime.json 字段表（CONTRACTS.md §五）：name -> 校验函数
-_RUNTIME_FIELDS = {
-    "max_concurrent_decisions": int,
-    "media_convert_concurrency": int,
-    "history_size": int,
-    "action_max_attempts": int,
-    "task_retention_days": int,
-    "paused": bool,
-    "muted_until": (int, float),
-    "owner": str,
-    "owner_nick": str,
-    "tool_model": str,
-    "decision_provider": str,
-    "decision_model": str,
-    "decision_token_floor": int,
-    "decision_token_ceiling": int,
-}
-_RUNTIME_INTERVAL_FIELDS = ("sweep_interval", "notify_interval")
+# /workspace/<path> 静态路由只允许图片扩展名（crop_gallery 演示页的截图产物）
+_WORKSPACE_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+# /workspace/<path> 静态路由拒绝这些目录前缀（防 .env / chatlog.db / 流水外泄）
+_WORKSPACE_FORBIDDEN_PREFIXES = ("chatlogs/", "runtime/", "memory/", "media/")
 
 # 前端页面（独立文件 pages/index.html）
 _PAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pages")
@@ -67,7 +54,8 @@ def create_app(project_root=None, proxy=None, supervisor=None,
     """
     from .api import create_bps
 
-    app = Flask(__name__)
+    static_folder = os.path.join(_PAGES_DIR, "static")
+    app = Flask(__name__, static_folder=static_folder, static_url_path="/static")
     root = os.path.abspath(project_root or PROJECT_ROOT)
     app.config["PROJECT_ROOT"] = root
 
@@ -79,14 +67,41 @@ def create_app(project_root=None, proxy=None, supervisor=None,
         if token is None:
             return None
         auth = request.headers.get("Authorization", "")
-        if auth != "Bearer " + token:
+        # 时序安全比较，避免普通 == 的逐字节短路（本地场景意义有限，但成本为零）
+        expected = "Bearer " + token
+        if not hmac.compare_digest(auth, expected):
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         return None
 
-    # ------------------------------------------------------------- 页面
+    # ------------------------------------------------------------- 页面与工作区文件路由
     @app.route("/")
     def index():
         return _load_index_html()
+
+    @app.route("/workspace/<path:filename>")
+    def workspace_static(filename):
+        """只允许读取 workspace 下的图片（crop_gallery 演示页用）。
+
+        历史上这里用 send_from_directory 把整个 workspace 裸挂为静态目录，
+        `GET /workspace/chatlogs/chatlog.db`、`GET /workspace/.env` 可直接
+        下载聊天库与密钥原文——本路由现已收紧：仅图片扩展名，且拒绝点文件、
+        chatlogs/runtime/memory 等敏感子目录。
+        """
+        from flask import send_from_directory
+        name = filename.replace("\\", "/")
+        low = name.lower()
+        # 仅图片扩展名
+        if not low.endswith(_WORKSPACE_IMAGE_EXTS):
+            return jsonify({"ok": False, "error": "not allowed"}), 404
+        # 拒绝点文件段（含 .env）与敏感目录
+        for seg in name.split("/"):
+            if seg.startswith("."):
+                return jsonify({"ok": False, "error": "not allowed"}), 404
+        for prefix in _WORKSPACE_FORBIDDEN_PREFIXES:
+            if name == prefix.rstrip("/") or name.startswith(prefix):
+                return jsonify({"ok": False, "error": "not allowed"}), 404
+        ws_dir = os.path.join(root, "workspace")
+        return send_from_directory(ws_dir, name)
 
     # ------------------------------------------------------------- 蓝图注册
     ctx = {
@@ -96,8 +111,6 @@ def create_app(project_root=None, proxy=None, supervisor=None,
         "agent_callback_url": agent_callback_url,
         "reloader": reloader,
         "editable_roots": EDITABLE_ROOTS,
-        "runtime_fields": _RUNTIME_FIELDS,
-        "runtime_interval_fields": _RUNTIME_INTERVAL_FIELDS,
     }
     for bp in create_bps(ctx):
         app.register_blueprint(bp)

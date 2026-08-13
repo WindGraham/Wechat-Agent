@@ -153,10 +153,14 @@ class _FakeProvider:
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.calls = 0
+        self.model = "fake"
 
     def chat(self, messages, max_tokens=300, temperature=0.8):
         self.calls += 1
         return self.outputs.pop(0) if self.outputs else "<silent/>"
+
+    def cache_stats(self):
+        return {"cached_tokens": 0, "prompt_tokens": 0, "total": 0}
 
     def vision_file(self, path, prompt):
         return "一只猫"
@@ -225,6 +229,34 @@ class ProxyTest(unittest.TestCase):
         self.assertTrue(proxy.run_once())
         self.assertEqual(len(submitted), 1)
         self.assertIn("收到", submitted[0][1])
+
+    def test_emoji_tool(self):
+        """emoji 工具：检索候选返回 seq 列表（注入临时索引，不依赖真实 assets）。"""
+        import sqlite3
+        from src.shared.emoji_index import EmojiIndex
+        tmp = tempfile.mkdtemp()
+        db = os.path.join(tmp, "index.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE emojis (
+                seq INTEGER PRIMARY KEY, filename TEXT, ext TEXT,
+                original_md5 TEXT UNIQUE, description TEXT, text_content TEXT,
+                is_real INTEGER DEFAULT 0, style TEXT, mood TEXT,
+                use_case TEXT, keywords TEXT, frames INTEGER DEFAULT 1,
+                filesize INTEGER, processed_at TEXT);
+        """)
+        conn.execute(
+            "INSERT INTO emojis (seq,filename,ext,original_md5,description,"
+            "text_content,is_real,style,mood,use_case,keywords,frames,filesize) "
+            "VALUES (1,'000001.gif','.gif','a','开心','开心',0,'文字','开心',"
+            "'开心场景','[\"开心\"]',1,100)")
+        conn.commit(); conn.close()
+        proxy, _ = self._proxy([], [], [])
+        proxy._emoji_idx = EmojiIndex(db, os.path.join(tmp, "renamed"))
+        result = proxy._exec_emoji_search({"query": "开心"})
+        self.assertIn("seq=1", result)
+        self.assertIn("候选", result)
+        self.assertIn("缺 query", proxy._exec_emoji_search({"query": ""}))
 
     def test_silent_no_bundle(self):
         submitted = []

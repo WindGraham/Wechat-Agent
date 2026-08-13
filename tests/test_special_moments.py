@@ -125,9 +125,9 @@ class SpecialPromptTest(unittest.TestCase):
     def test_load_cat_diary(self):
         spec = self.lib.load_special("cat_diary")
         self.assertIsNotNone(spec)
-        self.assertEqual(spec["meta"]["output_mode"], "task")
-        self.assertEqual(spec["meta"]["target"], "moments")
+        self.assertEqual(spec["meta"]["output_mode"], "tool")
         self.assertIn("猫娘日记", spec["system"])
+        self.assertIn('name="moments"', spec["system"])
 
     def test_load_memory_consolidation(self):
         spec = self.lib.load_special("memory_consolidation")

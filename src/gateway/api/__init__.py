@@ -9,7 +9,7 @@ ctx: 依赖上下文 {root, proxy, supervisor, agent_callback_url, reloader}。
 
 from flask import Blueprint
 
-from . import agent, config, live, memory  # noqa: F401
+from . import agent, config, emojis, live, memory, messages, models, replay, sessioncfg, tts  # noqa: F401
 
 
 def create_bps(ctx: dict) -> list:
@@ -19,4 +19,10 @@ def create_bps(ctx: dict) -> list:
         memory.create_bp(ctx),
         config.create_bp(ctx),
         live.create_bp(ctx),
+        models.create_bp(ctx),
+        emojis.create_bp(ctx),
+        replay.create_bp(ctx),
+        sessioncfg.create_bp(ctx),
+        messages.create_bp(ctx),
+        tts.create_bp(ctx),
     ]

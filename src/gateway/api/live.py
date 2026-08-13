@@ -8,7 +8,7 @@ import os
 
 from flask import Blueprint, jsonify, request
 
-from .common import list_tasks, read_json, read_jsonl_tail
+from .common import list_group_sessions, list_tasks, read_json, read_jsonl_tail
 
 
 def create_bp(ctx: dict) -> Blueprint:
@@ -41,6 +41,7 @@ def create_bp(ctx: dict) -> Blueprint:
             "watermarks": read_json(os.path.join(runtime_dir,
                                                  "watermarks.json")),
             "tasks": list_tasks(os.path.join(root, "workspace", "tasks")),
+            "cache": read_json(os.path.join(runtime_dir, "cache_stats.json")),
         }
         agent_st = _agent_current()
         if agent_st and agent_st.get("current"):
@@ -84,26 +85,8 @@ def create_bp(ctx: dict) -> Blueprint:
         """列出所有会话及其热情度级别。"""
         from ..group_config import LEVELS, read_level
         personas_dir = os.path.join(root, "config", "personas")
-        sessions = set()
-        try:
-            import sqlite3
-            db = os.path.join(root, "workspace", "chatlogs", "chatlog.db")
-            if os.path.exists(db):
-                conn = sqlite3.connect(db)
-                for r in conn.execute("SELECT name FROM sessions"):
-                    sessions.add(r[0])
-                conn.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            for f in os.listdir(personas_dir):
-                if f.endswith(".yaml") and f not in ("default.yaml",
-                                                    "tool_group.yaml"):
-                    sessions.add(f[:-5])
-        except OSError:
-            pass
         groups = []
-        for name in sorted(sessions):
+        for name in list_group_sessions(root):
             level, extra = read_level(personas_dir, name)
             groups.append({"session": name,
                            "level": level or "normal",

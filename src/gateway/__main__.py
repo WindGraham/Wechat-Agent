@@ -16,6 +16,8 @@
     WECHAT_AGENT_PYTHON            覆盖 agent 解释器路径（默认 ~/.venvs/...）
     WECHAT_AGENT_WORKSPACE         传给 agent 的 --workspace（默认不传）
     WECHAT_AGENT_CONFIG            传给 agent 的 --config（默认不传）
+    WECHAT_AGENT_CALLBACK_PORT     agent 侧 task_done 回调端口（默认 13015，
+                                   须与 src/main.py 读到的同环境变量一致）
 """
 
 import logging
@@ -52,7 +54,9 @@ def main(argv=None):
         os.path.abspath(__file__))))
 
     supervisor = _create_supervisor(root)
-    agent_port = 13015  # agent 侧 task_done 回调端口（约定）
+    # agent 侧 task_done 回调端口：与 src/main.py 的 WECHAT_AGENT_CALLBACK_PORT
+    # 同源覆盖（默认 13015），避免两端各自硬编码漂移后回调打偏。
+    agent_port = int(os.environ.get("WECHAT_AGENT_CALLBACK_PORT", "13015"))
     callback = f"http://127.0.0.1:{agent_port}"
 
     def create_factory():

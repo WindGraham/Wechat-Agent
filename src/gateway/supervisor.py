@@ -38,6 +38,8 @@ KEEP_LOG_ROTATIONS = 5
 STOP_GRACE_S = 10
 # monitor 轮询间隔
 MONITOR_POLL_S = 2.0
+# 认领进程（非本进程 spawn）无法取得真实退出码，用此哨兵表示"退出原因未知"
+EXIT_UNKNOWN = -1
 
 
 def _pid_alive(pid: int) -> bool:
@@ -56,7 +58,12 @@ def _pid_alive(pid: int) -> bool:
 class _AdoptedProc:
     """认领进程的轻量代理：伪装成 Popen 的 poll/pid/wait 接口。
     网关重启后认领的 agent 不是本进程 spawn 的，没有句柄可 wait，
-    只轮询 /proc 存活状态（poll 返回 None=活着）。"""
+    只轮询 /proc 存活状态（poll 返回 None=活着）。
+
+    退出码取不到真实值（非子进程无法 waitpid，且 init 回收极快），
+    故死亡时返回 EXIT_UNKNOWN 哨兵——让 status() 判为 crashed 而非
+    stopped，避免"agent 崩了却显示正常停止"（2026-08 认领逻辑的坑）。
+    """
 
     def __init__(self, pid: int):
         self.pid = pid
@@ -64,19 +71,19 @@ class _AdoptedProc:
 
     def poll(self):
         if self._dead:
-            return 0
+            return EXIT_UNKNOWN
         if _pid_alive(self.pid):
             return None
         self._dead = True
-        return 0
+        return EXIT_UNKNOWN
 
     def wait(self, timeout=None):
         deadline = time.time() + (timeout if timeout else 10)
         while time.time() < deadline:
             if self.poll() is not None:
-                return 0
+                return EXIT_UNKNOWN
             time.sleep(0.2)
-        return 0
+        return EXIT_UNKNOWN
 
 
 class AgentSupervisor:
@@ -105,6 +112,7 @@ class AgentSupervisor:
 
         os.makedirs(self._logs_dir, exist_ok=True)
         self._adopt_existing()           # 网关重启后认领仍在跑的 agent
+        self._restore_crash()            # 网关重启后恢复"最近一次崩溃"标记
 
     # ---------------------------------------------------------------- 路径
     @staticmethod
@@ -125,6 +133,12 @@ class AgentSupervisor:
     def log_path(self):
         return os.path.join(self._logs_dir, "agent.log")
 
+    @property
+    def crash_path(self):
+        """最近一次崩溃标记文件（workspace/runtime/agent_last_crash.json）。"""
+        return os.path.join(os.path.dirname(self._pid_file),
+                            "agent_last_crash.json")
+
     # ---------------------------------------------------------------- pid 持久化
     def _write_pid(self, pid: int):
         try:
@@ -140,6 +154,35 @@ class AgentSupervisor:
                 os.remove(self._pid_file)
         except OSError as e:
             log.warning("pid 文件清理失败: %s", e)
+
+    # ---------------------------------------------------------------- 崩溃标记持久化
+    def _write_crash(self, info: dict):
+        """落盘最近一次崩溃（code/ts）。网关重启后 status 仍能报 crashed。"""
+        try:
+            os.makedirs(os.path.dirname(self.crash_path), exist_ok=True)
+            with open(self.crash_path, "w", encoding="utf-8") as f:
+                import json
+                json.dump(info, f, ensure_ascii=False)
+        except OSError as e:
+            log.warning("崩溃标记写入失败: %s", e)
+
+    def _clear_crash(self):
+        try:
+            if os.path.exists(self.crash_path):
+                os.remove(self.crash_path)
+        except OSError as e:
+            log.warning("崩溃标记清理失败: %s", e)
+
+    def _restore_crash(self):
+        """网关重启后回读崩溃标记（若内存无退出信息）。"""
+        if self._last_exit is not None:
+            return
+        try:
+            import json
+            with open(self.crash_path, encoding="utf-8") as f:
+                self._last_exit = json.load(f)
+        except (OSError, ValueError):
+            pass
 
     def _adopt_existing(self):
         """网关重启后：读 pid 文件，若进程仍在运行则认领（附身跟踪）。
@@ -186,7 +229,7 @@ class AgentSupervisor:
                 self._proc = subprocess.Popen(
                     cmd, stdout=f, stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL, start_new_session=True)
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 f.close()
                 log.error("agent spawn 失败: %s", e)
                 self._proc = None
@@ -195,6 +238,7 @@ class AgentSupervisor:
             f.close()
             self._started_at = self._clock()
             self._last_exit = None
+            self._clear_crash()      # 新进程启动，旧崩溃标记作废
             self._write_pid(self._proc.pid)
             self._ensure_monitor()
             return True
@@ -229,6 +273,7 @@ class AgentSupervisor:
             self._proc = None
             self._clear_pid()
             self._monitor_stop()
+        self._clear_crash()          # 主动停止不算崩溃，清标记
         return True
 
     def restart(self):
@@ -254,8 +299,44 @@ class AgentSupervisor:
 
     def logs_tail(self, n: int = 200) -> str:
         """agent.log 尾部 n 行（网关状态页展示）。"""
+        return self._tail_file(self.log_path, n)
+
+    def logs_list(self) -> list:
+        """日志文件清单（当前 agent.log + 历史轮转 agent.log.<ts>），新→旧。
+
+        控制台此前只能看当前 agent.log，重启前的日志要去文件页翻历史轮转；
+        这里直接列出，供控制台切换查看。"""
+        items = []
         try:
-            with open(self.log_path, "rb") as f:
+            names = [f for f in os.listdir(self._logs_dir)
+                     if f == "agent.log" or f.startswith("agent.log.")]
+            for name in names:
+                full = os.path.join(self._logs_dir, name)
+                try:
+                    st = os.stat(full)
+                    items.append({"name": name, "size": st.st_size,
+                                  "mtime": st.st_mtime,
+                                  "current": name == "agent.log"})
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        items.sort(key=lambda x: -x["mtime"])
+        return items
+
+    def logs_tail_file(self, name: str, n: int = 200) -> str:
+        """读指定日志文件尾部 n 行（name 限 agent.log / agent.log.<ts>）。"""
+        # 防目录穿越：只允许本 logs 目录下的 agent.log 系列文件
+        if name != "agent.log" and not name.startswith("agent.log."):
+            return ""
+        if os.sep in name or ".." in name:
+            return ""
+        return self._tail_file(os.path.join(self._logs_dir, name), n)
+
+    @staticmethod
+    def _tail_file(path: str, n: int) -> str:
+        try:
+            with open(path, "rb") as f:
                 f.seek(0, os.SEEK_END)
                 size = f.tell()
                 f.seek(max(0, size - 65536))   # 先截 64KB 再按行
@@ -316,7 +397,12 @@ class AgentSupervisor:
                     self._last_exit = {"code": rc, "ts": self._clock()}
                     self._proc = None
                     self._clear_pid()
-                log.warning("agent 退出，code=%s", rc)
+                if rc != 0:
+                    self._write_crash(self._last_exit)
+                    log.warning("agent 崩溃，code=%s（已写崩溃标记）", rc)
+                else:
+                    self._clear_crash()
+                    log.info("agent 正常退出，code=0")
                 return
             self._stop_monitor.wait(MONITOR_POLL_S)
 

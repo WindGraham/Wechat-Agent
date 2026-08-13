@@ -28,6 +28,16 @@ EOF
 
 mkdir -p logs
 
+# 检测是否已有网关在运行，避免双进程抢 13014 端口（启动入口不唯一的坑）。
+# 若网关已由 systemd 服务（wechat-agent-gateway）托管，请用 systemctl，不要用本脚本。
+if pgrep -f "[s]rc.gateway" >/dev/null 2>&1; then
+    echo "检测到已有网关在运行：" >&2
+    pgrep -af "[s]rc.gateway" >&2
+    echo "若它是 systemd 服务，请用 systemctl --user restart wechat-agent-gateway 管理；" >&2
+    echo "否则先 ./run.sh stop 再启动。" >&2
+    exit 1
+fi
+
 if [ "$1" = "-d" ]; then
     setsid nohup "$PYTHON" -m src.gateway > logs/gateway.log 2>&1 < /dev/null &
     sleep 1

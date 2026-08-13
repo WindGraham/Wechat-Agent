@@ -30,8 +30,8 @@ from ...shared.types import ActionResult
 log = logging.getLogger("interaction.sender")
 
 # ------------------------------------------------------------------ 块提取
-# 顶层块开头：<reply ...> / <task ...> / <tool .../> / <silent/>
-_BLOCK_START_RE = re.compile(r"<(reply|task|tool|silent)(?=[\s>/])")
+# 顶层块开头：<reply ...> / <task ...> / <tool .../> / <silent/> / <moments-post .../>
+_BLOCK_START_RE = re.compile(r"<(reply|task|tool|silent|moments-post)(?=[\s>/])")
 
 MAX_REPLY_BLOCKS = 3          # 一包最多执行的 reply 块数（防刷屏）
 TEXT_MSG_GAP = (1.0, 3.0)     # 多条 <text> 之间的随机延迟（秒）
@@ -84,11 +84,12 @@ class BundleSender:
     """
 
     def __init__(self, port_sender, port_navigator, port_tools,
-                 session_reader=None):
+                 session_reader=None, emoji_index=None):
         self._sender = port_sender         # 底层拟人发送器
         self._nav = port_navigator         # 导航器
         self._tools = port_tools           # WeChatTools（quote/image/file 用其 dev）
         self._session_reader = session_reader  # 日志定位引用目标方向（可选）
+        self._emoji_index_inst = emoji_index   # 表情检索（可选，None 时懒加载默认）
         self._mutex = False                # 屏幕互斥锁（发送中=True）
         self._rand = random.uniform
         self._clock = time.time
@@ -116,18 +117,25 @@ class BundleSender:
             self._mutex = False
 
     def _execute_bundle(self, session: str, blocks_xml: str) -> ActionResult:
-        """执行一包动作块。"""
+        """执行一包动作块（<reply>/<silent/>/<moments-post>）。"""
         blocks = _extract_blocks(blocks_xml)
         replies = [b for tag, b in blocks if tag == "reply"]
+        moments = [b for tag, b in blocks if tag == "moments-post"]
         has_silent = any(tag == "silent" for tag, _ in blocks)
         for tag, _ in blocks:
             if tag in ("task", "tool"):
                 log.warning("<%s> 块不应到达交互层（Proxy 分流），跳过", tag)
 
-        if not replies and has_silent:
+        # 朋友圈发布：独立动作，与 reply 正交（决策层经 submit_bundle 投递）
+        for block in moments:
+            result = self._execute_moments(block)
+            if not result.ok:
+                return result
+
+        if not replies and has_silent and not moments:
             return ActionResult(ok=True)  # 沉默，无动作
 
-        if not replies:
+        if not replies and not moments:
             return ActionResult(ok=False,
                                 error="XML 包中无可执行的 <reply> 块",
                                 retryable=False)
@@ -139,6 +147,41 @@ class BundleSender:
                 return result
 
         return ActionResult(ok=True)
+
+    def _execute_moments(self, block_xml: str) -> ActionResult:
+        """执行 <moments-post text="..."/>：发一条纯文字朋友圈。
+
+        交互层内部动作：submit_bundle 已持屏幕互斥锁，这里直接调
+        action/moments_poster.py 的真机发布流程（决策层不碰设备）。
+        """
+        try:
+            root = ET.fromstring(block_xml)
+        except ET.ParseError:
+            cleaned = re.sub(r'&(?!lt;|amp;|gt;|quot;)', '&amp;', block_xml)
+            try:
+                root = ET.fromstring(cleaned)
+            except ET.ParseError as e:
+                log.warning("moments-post XML parse error: %s", e)
+                return ActionResult(ok=False, error=f"XML 解析失败: {e}",
+                                    retryable=False)
+        text = (root.get("text") or root.text or "").strip()
+        if not text:
+            return ActionResult(ok=False, error="<moments-post> 缺 text 属性",
+                                retryable=False)
+        from ..ports.android.action.moments_poster import post_text_moments
+        log.info("发布朋友圈: %r", text[:40])
+        try:
+            r = post_text_moments(self._tools, text)
+        except Exception as e:
+            log.exception("发布朋友圈异常")
+            return ActionResult(ok=False, error=f"发布朋友圈异常: {e}",
+                                retryable=True)
+        if r.get("ok") and r.get("posted"):
+            return ActionResult(ok=True)
+        return ActionResult(ok=False,
+                            error=f"发布朋友圈失败: {r.get('error')}",
+                            retryable=True,
+                            escalation_hint="朋友圈发布失败")
 
     def _execute_reply(self, session: str, block_xml: str) -> ActionResult:
         """执行单个 <reply> 块。"""
@@ -154,25 +197,45 @@ class BundleSender:
                 return ActionResult(ok=False, error=f"XML 解析失败: {e}",
                                     retryable=False)
 
-        # <image> 与 <file> 绝不可混用（契约），且不与 <text> 同块执行
+        # <image>/<file>/<sticker> 三种媒体绝不可混用（契约）。
+        # 每种媒体都可与 <text> 同块：先发文字、再发媒体（两条消息）。
         image_elem = root.find("image")
         file_elem = root.find("file")
-        if image_elem is not None and file_elem is not None:
+        sticker_elem = root.find("sticker")
+        media_n = sum(e is not None for e in (image_elem, file_elem, sticker_elem))
+        if media_n > 1:
             return ActionResult(ok=False,
-                                error="<image> 与 <file> 不可在同一 <reply> 混用",
+                                error="<image>/<file>/<sticker> 不可在同一 <reply> 混用",
                                 retryable=False)
+
+        # 先校验媒体参数（提前报错，避免发了文字才发现媒体参数非法）
+        media_kind = media_path = None
         if image_elem is not None:
             img_path = (image_elem.get("path") or "").strip()
             if not img_path:
                 return ActionResult(ok=False, error="<image> 缺 path 属性",
                                     retryable=False)
-            return self._do_send_media(session, "image", img_path)
+            media_kind, media_path = "image", img_path
         if file_elem is not None:
             file_path = (file_elem.get("path") or "").strip()
             if not file_path:
                 return ActionResult(ok=False, error="<file> 缺 path 属性",
                                     retryable=False)
-            return self._do_send_media(session, "file", file_path)
+            media_kind, media_path = "file", file_path
+        sticker_seq = None
+        if sticker_elem is not None:
+            query = (sticker_elem.get("query") or "").strip()
+            seq = (sticker_elem.get("seq") or "").strip()
+            if query:
+                return ActionResult(ok=False,
+                                    error="<sticker> 不允许 query 盲发："
+                                          "请先 <tool name=\"emoji\" query=\"...\"/> "
+                                          "搜索拿到 seq 再精确发送",
+                                    retryable=False)
+            if not seq:
+                return ActionResult(ok=False, error="<sticker> 缺 seq 属性",
+                                    retryable=False)
+            sticker_seq = seq
 
         # <text> 列表：ET 解析已反转义，e.text 即最终文本
         texts = [(e.text or "") for e in root.findall("text")]
@@ -198,10 +261,18 @@ class BundleSender:
             else:
                 log.warning("[%s] 引用失败（%s），降级普通发送", session, r.error)
 
+        # 先发文字，再发媒体（image/file/sticker 都与 text 共存，先文后图）
         if texts:
-            return self._do_send_texts(session, texts)
+            r = self._do_send_texts(session, texts)
+            if not r.ok:
+                return r
 
-        # 没有 <text>/image/file/quote：裸文本兜底（健壮性，契约外输入）
+        if sticker_seq is not None:
+            return self._do_send_sticker(session, sticker_seq)
+        if media_kind is not None:
+            return self._do_send_media(session, media_kind, media_path)
+
+        # 没有 <text>/媒体：裸文本兜底（健壮性，契约外输入）
         if root.text and root.text.strip():
             return self._do_send_texts(session, [root.text])
         return ActionResult(ok=True)
@@ -361,4 +432,50 @@ class BundleSender:
                 error=f"发{kind}失败@{r.get('step')}: {r.get('error')}",
                 retryable=retryable,
                 escalation_hint=f"发{kind}到 {session} 失败: {r.get('error')}")
+        return ActionResult(ok=True)
+
+    def _emoji_index(self):
+        """懒加载表情检索器（测试可注入自定义实例）。"""
+        if self._emoji_index_inst is None:
+            from ...shared.emoji_index import EmojiIndex
+            self._emoji_index_inst = EmojiIndex()
+        return self._emoji_index_inst
+
+    def _do_send_sticker(self, session: str, seq: str) -> ActionResult:
+        """发表情包：按 seq 精确取图 → 复用相册流程发送（gif 自动成动图表情）。
+
+        只接受 seq（精确发送）；query 盲发已在 _execute_reply 里禁止。
+        """
+        from ..ports.android.action import image_sender
+        index = self._emoji_index()
+        try:
+            picked = index.get(int(seq))
+        except (TypeError, ValueError):
+            return ActionResult(ok=False,
+                                error=f"<sticker> seq 必须是数字: {seq!r}",
+                                retryable=False)
+        if not picked:
+            return ActionResult(ok=False,
+                                error=f"表情库中找不到 seq={seq} 的表情",
+                                retryable=False)
+        log.info("[%s] send sticker seq=%s (%s): %s", session,
+                 picked["seq"],
+                 picked.get("text_content") or picked.get("mood"),
+                 picked["path"])
+        err = self._enter_session(session)
+        if err is not None:
+            return err
+        try:
+            r = image_sender.send_image(self._tools.dev, picked["path"])
+        except Exception as e:
+            log.exception("[%s] send sticker exception", session)
+            return ActionResult(ok=False, error=f"发表情异常: {e}",
+                                retryable=True)
+        if not r.get("ok"):
+            retryable = r.get("step") not in ("args",)
+            return ActionResult(
+                ok=False,
+                error=f"发表情失败@{r.get('step')}: {r.get('error')}",
+                retryable=retryable,
+                escalation_hint=f"发表情到 {session} 失败: {r.get('error')}")
         return ActionResult(ok=True)

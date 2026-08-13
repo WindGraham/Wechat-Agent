@@ -37,11 +37,27 @@ class LLMProvider:
         self._timeout = timeout
         self._token_floor = 0          # 0 = 无下限（子类可设 256）
         self._token_ceiling = 0        # 0 = 不封顶
+        self._last_usage = {}          # 最近一次响应的 usage（缓存统计用）
         self._sess = requests.Session()
         self._sess.headers.update({
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         })
+
+    def cache_stats(self) -> dict:
+        """归一化 usage → 缓存命中统计。
+
+        k3/DeepSeek: usage.cached_tokens；Gemini: usageMetadata.
+        cachedContentTokenCount（中转站当前不返回 → 0）。
+        返回 {cached_tokens, prompt_tokens, total}。"""
+        u = self._last_usage or {}
+        cached = (u.get("cached_tokens") or
+                  u.get("cachedContentTokenCount") or 0)
+        prompt = (u.get("prompt_tokens") or
+                  u.get("promptTokenCount") or 0)
+        return {"cached_tokens": int(cached),
+                "prompt_tokens": int(prompt),
+                "total": int(cached) + int(prompt)}
 
     def set_token_limits(self, floor: int = 0, ceiling: int = 0):
         """设置 max_tokens 下限/上限（网关热调用）。
@@ -62,7 +78,7 @@ class LLMProvider:
         return max_tokens
 
     # ---------------------------------------------------------------- 文本
-    def chat(self, messages, max_tokens=300, temperature=0.8) -> str:
+    def chat(self, messages, max_tokens=8192, temperature=0.8) -> str:
         """POST chat/completions。5xx/429 退避重试 1 次，4xx 直接抛。"""
         payload = {"model": self.model, "messages": messages,
                    "max_tokens": self._clamp_tokens(max_tokens)}
@@ -82,7 +98,9 @@ class LLMProvider:
                     continue
                 raise ProviderError(f"LLM request failed: {last_err}")
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
+                data = r.json()
+                self._last_usage = data.get("usage", {}) or {}
+                return data["choices"][0]["message"]["content"].strip()
             if r.status_code == 429 or r.status_code >= 500:
                 log.warning("llm HTTP %d (attempt %d)", r.status_code, attempt)
                 if attempt == 0:
@@ -93,7 +111,7 @@ class LLMProvider:
         raise ProviderError("unreachable")
 
     # ---------------------------------------------------------------- 带思考的文本
-    def chat_full(self, messages, max_tokens=300, temperature=0.8):
+    def chat_full(self, messages, max_tokens=8192, temperature=0.8):
         """chat + reasoning（thinking）一并返回。
 
         返回 (content: str, thinking: str)。thinking 为空字符串表示
@@ -118,7 +136,9 @@ class LLMProvider:
                     continue
                 raise ProviderError(f"LLM request failed: {last_err}")
             if r.status_code == 200:
-                msg = r.json()["choices"][0]["message"]
+                data = r.json()
+                self._last_usage = data.get("usage", {}) or {}
+                msg = data["choices"][0]["message"]
                 content = (msg.get("content") or "").strip()
                 thinking = ""
                 for key in ("reasoning_content", "reasoning"):
@@ -172,9 +192,9 @@ class KimiProvider(LLMProvider):
                          omit_temperature=True, **kw)
         self._token_floor = self.MIN_MAX_TOKENS
 
-    def chat(self, messages, max_tokens=2048, temperature=0.8) -> str:
-        # 默认上限 2048：思考+正文共享额度，300 时代办回执这类复杂 prompt
-        # 会被 thinking 吃光 → content 空 → 交付静默丢失（2026-08-09 实测）
+    def chat(self, messages, max_tokens=8192, temperature=0.8) -> str:
+        # 不设小上限（2026-08-13 用户定）：思考型模型 reasoning 吃额度，
+        # 给小了 content 会空/截断。交给基类默认 8192，配合 token_floor 兜底。
         return super().chat(messages, max_tokens=max_tokens,
                             temperature=temperature)
 
@@ -183,8 +203,8 @@ class DeepSeekProvider(LLMProvider):
     """DeepSeek API（备用）。base_url https://api.deepseek.com。
 
     注意：v4 系列（deepseek-v4-pro/flash，1M 上下文）是 always_thinking
-    思考型模型，reasoning 会消耗 max_tokens——与 k3 同一个坑
-    （上限给太小会 content 为空），默认下限 256、默认上限 2048。"""
+    思考型模型，reasoning 会消耗 max_tokens——与 k3 同一个坑。
+    max_tokens 不设小上限（走基类默认 8192），仅保 token_floor 下限防空。"""
 
     MIN_MAX_TOKENS = 256
 
@@ -193,6 +213,6 @@ class DeepSeekProvider(LLMProvider):
                          "https://api.deepseek.com", **kw)
         self._token_floor = self.MIN_MAX_TOKENS
 
-    def chat(self, messages, max_tokens=2048, temperature=0.8) -> str:
+    def chat(self, messages, max_tokens=8192, temperature=0.8) -> str:
         return super().chat(messages, max_tokens=max_tokens,
                             temperature=temperature)

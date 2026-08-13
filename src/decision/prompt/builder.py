@@ -108,7 +108,7 @@ class ContextBuilder:
     def build(self, session: str, is_group: bool, trigger: str,
               history, new_messages, tool_feedback: str = "",
               running_tasks=None, memory_block: str = "",
-              known_sessions=None) -> list:
+              known_sessions=None, goal: str = "") -> list:
         """返回 [{"role": "system", ...}, {"role": "user", ...}]。
 
         running_tasks: 该会话执行中的后台任务台账记录列表（实时板块，
@@ -116,7 +116,9 @@ class ContextBuilder:
         memory_block: 自动注入的记忆块文本（proxy 用 MemoryInjector 拼好
         传入；空串则不注入）。对应【记忆】块（L0全局+L2会话+L1在场人）。
         known_sessions: [(name, is_group)] 已知会话名单（跨会话投递时
-        提供准确会话名；空/None 则不注入）。"""
+        提供准确会话名；空/None 则不注入）。
+        goal: 本会话目标/任务提示（网关按会话配置，构建 prompt 时注入
+        【本群目标】块，让模型按目标工作；空串则不注入）。"""
         persona_text = self._personas.render(session)
         system_parts = self._lib.system_blocks(persona=persona_text)
         system = "\n\n".join(p for p in system_parts if p)
@@ -131,6 +133,10 @@ class ContextBuilder:
                 time=time.strftime("%Y-%m-%d %H:%M", lt),
                 weekday=f"周{weekday}", trigger=trigger),
         ]
+        # 本群目标：紧随会话信息（模型先看到任务再读背景）
+        if goal:
+            user_parts.append(self._lib.user_block(
+                "goal", goal=goal))
         # 记忆块在历史之前注入（LLM 先看到记忆背景，再看历史与新消息）
         if memory_block:
             user_parts.append(memory_block)

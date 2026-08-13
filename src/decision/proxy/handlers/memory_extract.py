@@ -23,7 +23,7 @@ class MemoryExtractHandler(EventHandler):
         if proxy._rt("paused", False):
             return
         threading.Thread(
-            target=proxy._extract_memory,
+            target=proxy._memory_svc.extract,
             args=(ev["session"],
                   ev.get("conversation_text", ""),
                   ev.get("user_names", [])),

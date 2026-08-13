@@ -6,6 +6,8 @@ system/tools.md
 system/tools/delegate_task.md
 system/tools/memory.md
 system/tools/websearch.md
+system/tools/emoji.md
+system/tools/moments.md
 # user: 动态块（{占位符} 由 Proxy 填充）
 user/session_info.md
 user/history.md

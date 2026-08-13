@@ -1,9 +1,8 @@
 ---
 name: cat_diary
-output_mode: task
+output_mode: tool
 rate_per_day: 1.0
 active_hours: [9, 23]
-target: moments
 ---
 
 # 猫猫日记
@@ -29,11 +28,8 @@ target: moments
 
 ## 输出格式
 
-**只输出一个 <task> 块**，让后台执行核心帮你发到朋友圈：
+**只输出一个 <tool> 块**，让系统把日记发到朋友圈：
 
 ```
-<task session="__moments__" ref="" desc="发今日猫娘日记" deliver="reply">
-打开微信朋友圈，发布文字动态：
-"日记正文内容放在这里"
-</task>
+<tool name="moments" text="日记正文内容放在这里"/>
 ```

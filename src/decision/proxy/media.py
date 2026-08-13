@@ -5,6 +5,7 @@
 某会话决策前，其新消息里的媒体条目必须转换完成（或超时降级）。
 """
 
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -66,6 +67,19 @@ class MediaConverter:
                 new_content = f"{orig}{ANNOTATED_MARK}{desc}"
                 self._writer(session, m.sender, m.content, new_content)
                 m.content = new_content
+
+                # 将多模态识别结果同步更新写回对应 sidecar json 文件
+                json_path = os.path.splitext(path)[0] + ".json"
+                if os.path.exists(json_path):
+                    try:
+                        with open(json_path, "r", encoding="utf-8") as jf:
+                            sdata = json.load(jf)
+                        sdata["vision_description"] = desc
+                        with open(json_path, "w", encoding="utf-8") as jf:
+                            json.dump(sdata, jf, ensure_ascii=False, indent=2)
+                    except Exception:  # noqa: BLE001
+                        log.exception("更新媒体 sidecar json 失败: %s", json_path)
+
                 return True
             except Exception:  # noqa: BLE001
                 log.exception("媒体转换失败: %s", m.media_path)

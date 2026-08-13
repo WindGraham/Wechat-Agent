@@ -268,6 +268,7 @@ flowchart LR
 ```
 
 观测面（网关数据源全部只读）：`queue.json`（时序队列）、
-`proxy_events.jsonl`（prompt/llm_output/route 流水）、
+`proxy_events.jsonl`（prompt/llm_output/route 流水；超限自动归档轮转为
+`proxy_events.jsonl.<ts>`，全量留存不丢数据，2026-08-12 起）、
 ops_journal（原子操作）、`/api/home_scan`（首页解析）、
 `/api/task_done`（进程外补跑任务的结果注入）。

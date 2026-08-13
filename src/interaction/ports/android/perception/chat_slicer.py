@@ -57,6 +57,7 @@ AVATAR_EDGE_MARGIN = 15         # 只放宽贴近内容区顶/底的候选（防
 AVATAR_TEX_STD = 5.0            # 暗头像补救：局部对比度（标准差）阈值
 AVATAR_TEX_STD_RELAXED = 4.0    # 保险丝重扫时的放宽阈值
 AVATAR_CARD_GRAY_MAX = 0.5      # 候选区中性灰（30~56）占比 >50% → 面板卡片，非头像
+AVATAR_PARTIAL_H = 100          # 头像高 < 此值视为被上一条消息遮挡的残缺头像（完整检测框 108，残缺 73~94）
 
 # 居中灰小字（time_divider/system）：x0>=300 排除左侧长文，灰字校验排除白字
 CENTER_X0_MIN = 300
@@ -285,11 +286,23 @@ def _read_nickname(img, gray, hsv, avatar):
 
 
 def _nick_eq(line, nickname):
-    """OCR 行是否就是昵称行：归一化后相等或互为包含（OCR 截断/粘连容错）。"""
+    """OCR 行是否就是昵称行（归一化后）。
+
+    只接受：精确相等 / 行是昵称的前缀（OCR 截断昵称）/ 昵称 + 纯标点后缀。
+    绝不判定"昵称是行的子串"——引用块首行"风图：xxx"含昵称"风图"会被
+    误当昵称行剥离，破坏引用块完整性（2026-08-13 修复）。"""
     a, b = normalize_text(line), normalize_text(nickname)
     if not a or not b:
         return False
-    return a == b or (len(a) >= 2 and a in b) or (len(b) >= 2 and b in a)
+    if a == b:
+        return True
+    if len(a) >= 2 and a in b:
+        return True
+    if a.startswith(b) and len(b) >= 2:
+        tail = a[len(b):]
+        if tail.strip("：:，,。. 　·-—") == "":
+            return True
+    return False
 
 
 def strip_nickname_line(lines, nickname):
@@ -358,21 +371,33 @@ def _extract_center_msgs(ocr_items, consumed, gray, seg_y0, seg_y1,
 
 
 def _match_quote(quotes, used_quotes, ocr_items, consumed,
-                 ref_rect, ref_y0, ref_y1):
+                 ref_rect, ref_y0, ref_y1, seg_y0=None, seg_y1=None):
     """引用块配对（自 chat_parser L459-470 平移）：在 quotes 中找与参考
     矩形（文字泡 rect 或段条带）垂直相邻 + 水平重叠的引用块。
 
     返回 (quote_text, matched_qi)；无配对返回 (None, None)。
     ref_rect: 参考矩形（用于水平重叠判定）；ref_y0/ref_y1: 参考物垂直
-    范围（引用块在上方 gap_above，或罕见在下方 gap_below）。"""
+    范围（引用块在上方 gap_above，或罕见在下方 gap_below）。
+    seg_y0/seg_y1: 当前消息段边界——引用块必须落在段内，否则是相邻
+    消息的引用块（头像驱动下正文气泡与下一条消息的引用块 gap 常 <60px，
+    会跨消息误配，2026-08-13 修复）。"""
     for qi, (qc, _qv) in enumerate(quotes):
         if qi in used_quotes:
             continue
         qx, qy, qw, qh = qc[:4]
+        # 引用块必须在当前消息段内（头像顶切段边界），否则跳过
+        if seg_y0 is not None and qy < seg_y0 - 2:
+            continue
+        if seg_y1 is not None and qy + qh > seg_y1 + 2:
+            continue
         gap_above = ref_y0 - (qy + qh)
         gap_below = qy - ref_y1
+        # 水平重叠按较窄者宽度的 35% 判（引用块通常比简短正文宽很多，
+        # 如引用一整句话 + 正文只回一个"棒"字，此时 qw*0.35 会误拒——
+        # 已有段边界约束兜底，这里只做弱对齐校验）
+        ref_w = ref_rect[2] if len(ref_rect) >= 3 else qw
         if not ((-8 <= gap_above <= 115 or -8 <= gap_below <= 60)
-                and x_overlap(qc, ref_rect) >= qw * 0.35):
+                and x_overlap(qc, ref_rect) >= min(qw, ref_w) * 0.35):
             continue
         q_hits = sorted(
             (i for i, it in enumerate(ocr_items)
@@ -415,10 +440,11 @@ def _comp_outline(mask, comp, epsilon=None):
 
 
 # ---------------------------------------------------------------- 主入口
-def slice_chat(img, ocr_items, is_group, title):
+def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
     """头像顶切段解析聊天页。
     img: BGR 全屏截图；ocr_items: run_ocr 格式列表（调用方传入，不被修改）；
     is_group: 群聊才读昵称；title: 会话名（保留入参，当前仅透传）。
+    roster_matcher: 可选的花名册双因子匹配器 (RosterMatcher 实例)。
     返回 {"messages":[msg...], "is_group":bool, "avatar_count":int}。"""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -443,9 +469,6 @@ def slice_chat(img, ocr_items, is_group, title):
                                   min_h=LC.BUBBLE_MIN_H)
 
     # ---- 引用块检测（自 chat_parser L396-410 平移）：深灰小块（引用预览）
-    # 引用消息的气泡上方会有一个深色小块，内含"昵称：被引用内容"。
-    # 全宽细条（置顶条/引用预览条）已由上面 carve 挖掉，这里按灰度+高度
-    # 从剩余 gray_comps 中挑出真正的引用块；末尾剩的孤儿引用块单独输出。
     quotes = []                 # (rect, mean_val)
     for c in gray_comps:
         x, y, w, h, area = c
@@ -453,6 +476,9 @@ def slice_chat(img, ocr_items, is_group, title):
             continue            # 全宽细条（置顶/引用预览条），非消息引用块
         if y + h / 2 > LC.INPUT_BAR_Y0 - 60:
             continue            # 输入栏附近的深色块（麦克风/加号面板）不是引用
+        # 排除表情/小图标/普通文本泡（单行短词如 "G"）
+        if w < 100 or h < 35:
+            continue
         sub = bubble_mask[y:y + h, x:x + w]
         mean_val = float(gray[y:y + h, x:x + w][sub > 0].mean()) \
             if area else LC.BUBBLE_GRAY
@@ -493,6 +519,11 @@ def slice_chat(img, ocr_items, is_group, title):
     messages = []           # (sort_y, msg)
 
     # ---- 段定义：屏幕顶→首头像顶为残缺段；末头像顶→内容区底为末段
+    # 一条消息 = 头像+昵称+正文+引用，四部分都在【本条头像上边界】与
+    # 【下一条头像上边界】之间。引用块在正文下方（不在头像上方），故段
+    # 边界直接用头像顶，不向上扩展到引用块——引用块经 _match_quote 的
+    # gap_below 归入它上方那条消息（2026-08-13 修复：旧逻辑把头像上方的
+    # 引用块扩展进段顶，导致引用块被误归入下一条消息）。
     seg_bounds = [(a["y"], a) for a in avatars]
     segments = []           # (y0, y1, avatar|None)
     if seg_bounds:
@@ -501,7 +532,7 @@ def slice_chat(img, ocr_items, is_group, title):
         for i, (top, av) in enumerate(seg_bounds):
             y1 = seg_bounds[i + 1][0] if i + 1 < len(seg_bounds) \
                 else LC.INPUT_BAR_Y0
-            segments.append((top, y1, av))
+            segments.append((av["y"], y1, av))
     else:
         segments.append((LC.CONTENT_Y0, LC.INPUT_BAR_Y0, None))
 
@@ -514,6 +545,8 @@ def slice_chat(img, ocr_items, is_group, title):
             side = "other" if avatar["side"] == "L" else "self"
             low_confidence = avatar["low_confidence"]
             media_present = False       # quote 消息正文是否含媒体（需归档）
+            body_rect = None            # quote 消息：正文气泡 rect（裁切重排：正文在上）
+            quote_rect = None           # quote 消息：引用块 rect（裁切重排：引用在下）
 
             # ---- 文字泡优先（§2.10 强制顺序）
             found = _find_text_bubble(side, seg_y0, seg_y1, gray_comps,
@@ -573,13 +606,27 @@ def slice_chat(img, ocr_items, is_group, title):
                 # 水平重叠 >= 引用块宽的 35% 即视为同一消息的引用预览。
                 quote_text = None
                 if content_type == "text" and content.strip():
-                    quote_text, _qi = _match_quote(
+                    quote_text, qi_matched = _match_quote(
                         quotes, used_quotes, ocr_items, consumed,
-                        comp, y, y + h)
-                if quote_text:
-                    content_type = "quote"
-                    content = (quote_text + "\n" + content).strip()
-                    lines = content.split("\n")
+                        comp, y, y + h, seg_y0=seg_y0, seg_y1=seg_y1)
+                    if quote_text and qi_matched is not None:
+                        content_type = "quote"
+                        # 正文在前，引用块内容在后（用户要求：引用框内部的消息
+                        # 排在具体实际信息下面，2026-08-13 调整）
+                        content = (content + "\n" + quote_text).strip()
+                        lines = content.split("\n")
+                        # 记录正文气泡 rect（融合前）与引用块 rect，供裁切
+                        # 重排（正文在上、引用在下）
+                        body_rect = list(bubble_rect)
+                        qc_rect = quotes[qi_matched][0]
+                        qx, qy, qw, qh = qc_rect[:4]
+                        quote_rect = [int(qx), int(qy), int(qw), int(qh)]
+                        # 将引用块的物理矩形融合进 bubble_rect，确保 y_top 完整覆盖顶部的引用小框！
+                        new_bx0 = min(bubble_rect[0], int(qx))
+                        new_by0 = min(bubble_rect[1], int(qy))
+                        new_bx1 = max(bubble_rect[0] + bubble_rect[2], int(qx + qw))
+                        new_by1 = max(bubble_rect[1] + bubble_rect[3], int(qy + qh))
+                        bubble_rect = [new_bx0, new_by0, new_bx1 - new_bx0, new_by1 - new_by0]
             if content_type == "multimedia":
                 # OCR 提取段内一切可读文字，显式标注 multimedia（§2.10）
                 # 排除输入栏区域（cy >= 聚焦态栏顶 2015）：输入框里未发送的
@@ -630,7 +677,7 @@ def slice_chat(img, ocr_items, is_group, title):
                     seg_rect, seg_y0, seg_y1)
                 if quote_text:
                     content_type = "quote"
-                    content = (quote_text + "\n" + content).strip()
+                    content = (content + "\n" + quote_text).strip()
                     lines = content.split("\n")
                     media_present = True    # 引用+图片/视频：正文段需归档
 
@@ -646,24 +693,69 @@ def slice_chat(img, ocr_items, is_group, title):
                     lines = new_lines
                     content = "\n".join(lines)
 
+            # 如果是 multimedia 类型且未匹配到普通气泡，寻找段内非背景图片/视频区域作为 bubble_rect
+            if bubble_rect is None and avatar is not None and seg_y1 > seg_y0:
+                # 寻找段内位于头像下方或同高度的非背景色块
+                sub_nonbg = nonbg_side[seg_y0:seg_y1, :]
+                if sub_nonbg.size > 0:
+                    comps = comps_from_mask(sub_nonbg, min_area=400, close_ksize=5, min_w=15, min_h=15)
+                    av_x1 = avatar["x"] + avatar["w"]
+                    av_y1_off = avatar["y"] + avatar["h"] - seg_y0
+                    valid_comps = []
+                    for c in comps:
+                        x, y, w, h, area = c
+                        # 排除头像列（x 在头像右缘内，y 落在头像范围）
+                        if x < av_x1 and y < av_y1_off:
+                            continue
+                        # 排除输入栏右侧的 UI 元素（加号/语音按钮等，贴输入栏）
+                        if x > 700 and seg_y0 + y > LC.INPUT_BAR_Y0 - 150:
+                            continue
+                        valid_comps.append(c)
+                    if valid_comps:
+                        # 合并所有图片/视频碎块，取整体外接边界（图片贴输入栏时常被切成碎块）
+                        xs0 = min(c[0] for c in valid_comps)
+                        ys0 = min(c[1] for c in valid_comps)
+                        xs1 = max(c[0] + c[2] for c in valid_comps)
+                        ys1 = max(c[1] + c[3] for c in valid_comps)
+                        bubble_rect = [int(xs0), int(seg_y0 + ys0), int(xs1 - xs0), int(ys1 - ys0)]
             partial_bottom = bool(is_last and (
                 bubble_rect is None
-                or bubble_rect[1] + bubble_rect[3] >= LC.INPUT_BAR_Y0 - 10))
+                or bubble_rect[1] + bubble_rect[3] >= LC.INPUT_BAR_Y0 - 60
+                or avatar["y"] + avatar["h"] >= LC.INPUT_BAR_Y0 - 60))
             msg = {
                 "side": side, "nickname": nickname,
                 "content_type": content_type, "lines": lines,
                 "content": content, "content_norm": normalize_text(content),
-                "partial_top": avatar["y"] <= LC.CONTENT_Y0 + 2,
+                "partial_top": (avatar["y"] <= LC.CONTENT_Y0 + 2
+                                or (avatar["h"] < AVATAR_PARTIAL_H
+                                    and avatar["y"] < LC.SCREEN_H // 2)),
                 "partial_bottom": partial_bottom,
                 "avatar": {"x": avatar["x"], "y": avatar["y"],
                            "w": avatar["w"], "h": avatar["h"],
                            "side": avatar["side"]},
                 "bubble_rect": bubble_rect,
+                "seg_y0": int(seg_y0),
+                "body_rect": body_rect,
+                "quote_rect": quote_rect,
                 "outline": bubble_outline,
                 "low_confidence": low_confidence,
                 "ocr_conf": ocr_conf,
                 "y": int(seg_y0),
             }
+
+            # 双因子匹配与资料页 Hook 标记（若提供了花名册匹配器）
+            if roster_matcher and side == "other":
+                ax, ay, aw, ah = avatar["x"], avatar["y"], avatar["w"], avatar["h"]
+                # 微信头像在手机上是 1:1 正方形，切框补全至正方形 (以高度为准)
+                sq_dim = max(aw, ah)
+                crop = img[ay:min(img.shape[0], ay+sq_dim), ax:min(img.shape[1], ax+sq_dim)]
+                matched, matched_name, _info = roster_matcher.match_dual_factor(crop, nickname)
+                if matched:
+                    msg["matched_user_name"] = matched_name
+                    msg["uncertain_entity"] = False
+                else:
+                    msg["uncertain_entity"] = True
+                    msg["uncertain_avatar_pos"] = (int(ax + aw / 2), int(ay + ah / 2))
             if content_type == "quote" and media_present:
                 msg["media_present"] = True     # 引用+图片/视频：正文需归档
             messages.append((seg_y0, msg))
@@ -705,6 +797,153 @@ def slice_chat(img, ocr_items, is_group, title):
             }))
 
     messages.sort(key=lambda t: t[0])
-    return {"messages": [m for _, m in messages],
+    
+    # 填充每一条消息的 y_top 和 y_bottom（准确界定范围，精细包络时间戳/气泡，排除输入栏）
+    msg_list = [m for _, m in messages]
+    input_bar_y = LC.INPUT_BAR_Y0
+    for idx, msg in enumerate(msg_list):
+        msg_y = msg.get("y", 0)
+        ctype = msg.get("content_type")
+        
+        # 1. 顶边界 y_top 计算
+        if ctype == "time_divider":
+            # 时间戳精细包络：单行字高约 30px，居中对齐，y_top 精确置于字顶上方 10px
+            y_top = max(0, msg_y - 12)
+        else:
+            # 普通消息：优先使用 segment 的起点 seg_y0 包络与该消息配对的引用块
+            seg_y0_val = msg.get("seg_y0")
+            if seg_y0_val is not None:
+                y_top = max(0, seg_y0_val - 12)
+            else:
+                y_top = max(0, msg_y - 12)
+                av = msg.get("avatar")
+                if av and av["y"] >= LC.CONTENT_Y0 + 30:
+                    y_top = min(y_top, max(0, av["y"] - 12))
+                b_rect = msg.get("bubble_rect")
+                if b_rect:
+                    y_top = min(y_top, max(0, b_rect[1] - 12))
+        
+        # 2. 底边界 y_bottom 初步计算
+        if idx + 1 < len(msg_list):
+            next_msg = msg_list[idx + 1]
+            next_y = next_msg.get("y", input_bar_y)
+            next_ctype = next_msg.get("content_type")
+            next_av = next_msg.get("avatar")
+            
+            # 下一条消息的真实起始顶界（头像顶/消息顶/引用顶/时间戳顶）
+            next_top = next_y
+            if next_av and next_av["y"] >= LC.CONTENT_Y0 + 30:
+                next_top = min(next_top, next_av["y"])
+            next_b_rect = next_msg.get("bubble_rect")
+            if next_b_rect:
+                next_top = min(next_top, next_b_rect[1])
+                
+            if next_ctype == "time_divider":
+                # 下一条是时间戳：严格切在时间戳文字上方（留 12px 空隙，绝对不切到时间戳）
+                y_bottom = next_y - 12
+            else:
+                # 下一条是普通消息：切在下一条头像/消息顶界上方 8px
+                y_bottom = next_top - 8
+        else:
+            b_rect = msg.get("bubble_rect")
+            if b_rect:
+                y_bottom = min(input_bar_y, b_rect[1] + b_rect[3] + 25)
+            else:
+                y_bottom = min(input_bar_y, msg_y + 350)
+                
+        # 3. 气泡/多媒体底边完整性保护 (确保包络完整卡片/文字泡底边)
+        b_rect = msg.get("bubble_rect")
+        if b_rect and ctype != "time_divider":
+            b_bottom = b_rect[1] + b_rect[3] + 25  # 给文字泡/大卡片底部保留 25px 视感 padding 缓冲
+            if idx + 1 < len(msg_list):
+                next_msg = msg_list[idx + 1]
+                next_y = next_msg.get("y", input_bar_y)
+                next_av = next_msg.get("avatar")
+                next_top = min(next_y, next_av["y"]) if next_av else next_y
+                # 若气泡底边大于初步 y_bottom 且未遮挡下一条消息主体，以气泡底边为准
+                y_bottom = min(input_bar_y, max(y_bottom, min(next_top - 5, b_bottom)))
+            else:
+                y_bottom = min(input_bar_y, max(y_bottom, b_bottom))
+
+        # 特殊保护：时间戳本身的 bottom 只需要精确覆盖其文字高度 (+42px)
+        if ctype == "time_divider":
+            y_bottom = min(y_bottom, msg_y + 42)
+            
+        msg["y_top"] = int(y_top)
+        msg["y_bottom"] = int(y_bottom)
+
+    return {"messages": msg_list,
             "is_group": bool(is_group),
             "avatar_count": len(avatars)}
+
+
+# ================================================================ 完整性四态判定
+STATE_COMPLETE = "complete"            # 完整：头像+昵称+正文都在屏内，身份可识别
+STATE_TOP_CLIP = "top_clipped"         # 顶部残缺：头像/昵称/正文头在屏幕外（上方）
+STATE_BOTTOM_CLIP = "bottom_clipped"   # 底部残缺：正文尾在屏幕外（输入栏下方）
+STATE_BOTH_CLIP = "both_clipped"       # 顶+底都残缺：超长消息跨整个屏幕
+STATE_UNIDENTIFIABLE = "unidentifiable"  # 真识别不了：头像/身份检测失败，与位置无关
+STATE_SYSTEM = "system"                # 时间戳/系统消息（天生完整，不参与四态）
+
+
+def classify_message(msg):
+    """判定一条 slice_chat 消息的完整性四态。
+
+    返回 dict: {state, y_top, y_bottom}。y_top/y_bottom 硬约束在内容区
+    [LC.CONTENT_Y0, LC.INPUT_BAR_Y0] 内，绝不裁到顶部置顶条和底部输入栏。
+
+    判定顺序（优先级从高到低）：
+      1. 系统/时间戳 → system
+      2. partial_top 且 partial_bottom → both_clipped（超长消息跨全屏）
+      3. partial_top → top_clipped
+      4. partial_bottom → bottom_clipped
+      5. 无头像或身份识别失败 → unidentifiable
+      6. 否则 → complete
+    """
+    ctype = msg.get("content_type")
+    if ctype in ("time_divider", "system"):
+        return {"state": STATE_SYSTEM,
+                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
+                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+
+    pt = bool(msg.get("partial_top"))
+    pb = bool(msg.get("partial_bottom"))
+
+    if pt and pb:
+        return {"state": STATE_BOTH_CLIP,
+                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
+                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+    if pt:
+        return {"state": STATE_TOP_CLIP,
+                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
+                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+    if pb:
+        return {"state": STATE_BOTTOM_CLIP,
+                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
+                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+
+    # 自己的消息（side=self）：身份就是"自己"，无需昵称行
+    if msg.get("side") == "self":
+        return {"state": STATE_COMPLETE,
+                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
+                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+
+    # 无头像 → 识别不了（孤儿引用块 / 头像检测失败）
+    avatar = msg.get("avatar")
+    if avatar is None:
+        return {"state": STATE_UNIDENTIFIABLE,
+                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
+                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+
+    # 身份识别失败（昵称 OCR 失败 且 头像双因子匹配失败）
+    nickname = msg.get("nickname")
+    matched = msg.get("matched_user_name")
+    if not nickname and not matched:
+        return {"state": STATE_UNIDENTIFIABLE,
+                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
+                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+
+    # 完整：头像 + 昵称 + 正文都在屏内
+    return {"state": STATE_COMPLETE,
+            "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
+            "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}

@@ -8,6 +8,9 @@ import os
 
 from flask import Blueprint, jsonify, request
 
+from src.shared.model_catalog import VALID_PROVIDERS, is_valid_model
+
+from ..runtime_schema import MODEL_FIELDS, read_runtime, write_runtime
 from .common import list_personas, list_prompts, resolve_editable
 
 
@@ -107,7 +110,19 @@ def create_bp(ctx: dict) -> Blueprint:
             n = int(request.args.get("n", "200"))
         except ValueError:
             n = 200
-        return jsonify({"ok": True, "log": supervisor.logs_tail(n)})
+        file = request.args.get("file", "")
+        if file:
+            log = supervisor.logs_tail_file(file, n)
+        else:
+            log = supervisor.logs_tail(n)
+        return jsonify({"ok": True, "log": log})
+
+    @bp.route("/api/agent/logs_files")
+    def api_agent_logs_files():
+        """日志文件清单（当前 + 历史轮转），供控制台切换查看重启前的日志。"""
+        if supervisor is None:
+            return jsonify({"ok": False, "error": "网关未以独立模式运行"}), 400
+        return jsonify({"ok": True, "files": supervisor.logs_list()})
 
     @bp.route("/api/gateway/reload", methods=["POST"])
     def api_gateway_reload():
@@ -171,11 +186,16 @@ def create_bp(ctx: dict) -> Blueprint:
 
     @bp.route("/api/workspace_file", methods=["GET"])
     def api_workspace_file():
-        """读工作区任意文本文件（只读）。路径限定在 root 内。"""
+        """读工作区文本文件（只读）。与 /api/workspace 同源白名单：
+        只允许 workspace|config|docs 三根，且限定在 root 内（防目录穿越
+        与越权读 src/、tools/ 等仓库内其它文件）。"""
         rel = request.args.get("path", "")
         rel = rel.strip().strip("/")
         if not rel:
             return jsonify({"ok": False, "error": "缺 path"}), 400
+        # 与 /api/workspace 列表一致：只允许这三类顶层目录
+        if not rel.startswith(("workspace", "config", "docs")):
+            return jsonify({"ok": False, "error": "path not allowed"}), 403
         full = os.path.realpath(os.path.join(root, rel))
         if full != root and not full.startswith(os.path.realpath(root) + os.sep):
             return jsonify({"ok": False, "error": "path not allowed"}), 403
@@ -215,25 +235,7 @@ def create_bp(ctx: dict) -> Blueprint:
                         "mtime": os.path.getmtime(full)})
 
     # ---------------------------------------------------------- 决策模型切换
-    _MODEL_KEYS = ("decision_provider", "decision_model",
-                   "decision_token_floor", "decision_token_ceiling")
-
-    def _read_runtime() -> dict:
-        import json as _json
-        path = os.path.join(root, "config", "runtime.json")
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = _json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
-
-    def _write_runtime(data: dict):
-        import json as _json
-        path = os.path.join(root, "config", "runtime.json")
-        with open(path, "w", encoding="utf-8") as f:
-            _json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
+    # 字段表/读写已收敛到 runtime_schema.py（与 /api/runtime 同源，不再各写一份）
 
     def _agent_model_call(method, body=None):
         """转发到 agent 回调端口 /decision_model；返回 (resp_dict, error)。"""
@@ -264,7 +266,7 @@ def create_bp(ctx: dict) -> Blueprint:
         热切换（不重启）；agent 不在线则只持久化，标注重启后生效。
         """
         if request.method == "GET":
-            cfg = {k: _read_runtime().get(k) for k in _MODEL_KEYS}
+            cfg = {k: read_runtime(root).get(k) for k in MODEL_FIELDS}
             live, _err = _agent_model_call("GET")
             return jsonify({"ok": True, "config": cfg,
                             "live": (live or {}).get("provider"),
@@ -290,11 +292,14 @@ def create_bp(ctx: dict) -> Blueprint:
         except (TypeError, ValueError):
             return jsonify({"ok": False,
                             "error": "token_floor/ceiling 必须是整数"}), 400
-        if provider not in ("kimi", "deepseek"):
+        if provider not in VALID_PROVIDERS:
             return jsonify({"ok": False,
-                            "error": "provider 必须是 kimi|deepseek"}), 400
+                            "error": f"provider 必须是 {'|'.join(VALID_PROVIDERS)}"}), 400
         if not model:
             return jsonify({"ok": False, "error": "缺 model"}), 400
+        if not is_valid_model(provider, model):
+            return jsonify({"ok": False,
+                            "error": f"model 不在 {provider} 目录里（见 model_catalog）"}), 400
         if floor < 0 or ceiling < 0:
             return jsonify({"ok": False,
                             "error": "token 上下限不能为负"}), 400
@@ -303,12 +308,12 @@ def create_bp(ctx: dict) -> Blueprint:
                             "error": "token_ceiling 不能小于 token_floor"}), 400
 
         # 1. 持久化（重启后生效）
-        cfg = _read_runtime()
+        cfg = read_runtime(root)
         cfg.update({"decision_provider": provider,
                     "decision_model": model,
                     "decision_token_floor": floor,
                     "decision_token_ceiling": ceiling})
-        _write_runtime(cfg)
+        write_runtime(root, cfg)
 
         # 2. 热切换（不重启 agent）
         live, err = _agent_model_call("POST", {
