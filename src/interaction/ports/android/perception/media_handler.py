@@ -215,39 +215,42 @@ class MediaHandler:
         sig = self._detect_page_signature(img)
         log.info("[media] after tap signature=%s", sig)
 
-        if sig == "webview":
-            return self._read_link_from_webview(task, img)
         if sig == "chat_record":
             return self._read_chat_record(task, img)
         if sig == "file_card":
             return self._handle_file(task, img)
-
-        # 既不是 webview 也不是聊天记录：保存现场并返回
-        err_path = self._save_frame(img, task, "unknown_card")
-        self.dev.back()
-        self.dev.wait_random(600, 1000)
-        return MediaResult(
-            msg_id=task.msg_id, msg_type=task.msg_type,
-            content=None,
-            raw_files=[err_path],
-            error=f"未知卡片页面 signature={sig}")
+        # webview 首屏不显示「复制链接」（它在 ⋯ 菜单里），固定签名常检测不到 →
+        # 一律尝试链接流：_read_link_from_webview 内找不到「复制链接」会优雅退出。
+        return self._read_link_from_webview(task, img)
 
     def _read_link_from_webview(self, task: MediaTask, first_frame: np.ndarray) -> MediaResult:
-        """webview 内：右上角 ⋯ → 复制链接 → 读剪贴板 → 回会话。
+        """尝试从当前页取链接：点 ⋯ → 找「复制链接」→ 直读剪贴板 → 回会话。
 
-        优先 root+setuid 直读剪贴板（dev.read_clipboard，见 tools/clipboard/ClipIO.java）。
-        直读失败（非 root / 空 / 异常）时回退「粘贴到输入框 → 底部 OCR → 清空」。
+        webview 首屏不显示「复制链接」（在 ⋯ 菜单），故不做前置签名判断；这里
+        点 ⋯ 后 OCR 找「复制链接」，找不到即认定非 webview，优雅退出（不读脏剪贴板）。
+        直读剪贴板失败（非 root / 空 / 异常）回退「粘贴 → 底部 OCR → 清空」。
         """
         run_dir = _ensure_dir(os.path.join(DEBUG_ROOT, "links", f"{task.msg_id}_{_ts()}"))
         files: List[str] = []
 
-        # 1) 点右上角更多
+        # 1) 点右上角更多（⋯）
         self.dev.tap_rect(Rect(950, 95, 110, 110))
         self.dev.wait_random(800, 1200)
 
-        # 2) 点「复制链接」
-        # 底部面板， native 坐标经验值 1010,1900；优先用 OCR 定位
-        copy_pos = self._find_text_on_screen("复制链接", fallback=(1010, 1900))
+        # 2) OCR 找「复制链接」；找不到 = 非 webview，优雅退出
+        img = self.dev.capture_bytes()
+        items = run_ocr(img)
+        copy_pos = self._find_text_opt(items, ("复制链接",))
+        if copy_pos is None:
+            log.info("[media] 非 webview（无「复制链接」），优雅退出")
+            self.dev.back(); self.dev.wait_random(600, 1000)   # 关 ⋯ 菜单
+            self.dev.back(); self.dev.wait_random(800, 1200)   # 回聊天页
+            return MediaResult(
+                msg_id=task.msg_id, msg_type="card",
+                content=None,
+                raw_files=[self._save_frame(img, task, "not_webview")],
+                error="非 webview 页面（无「复制链接」）")
+
         self.dev.tap(*copy_pos)
         self.dev.wait_random(800, 1200)
 

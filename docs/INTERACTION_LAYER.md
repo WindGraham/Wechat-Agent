@@ -205,6 +205,9 @@ A 的行动清空 → 最后一次日志同步 → 此时才向 Proxy 发 LogUpd
 
 **接入**：`realtime_scan(handle_media=False)` 默认关闭（保持轻量滚动）；置
 True 时对非文本完整消息调用 `MediaHandler`，结果经 `_media_to_entry` 入库。
+`history_collect` 用 union 缝合，中途 tap 媒体会打断连续缝合/配准，**不宜内联**——
+其媒体处置应走独立 pass（采集完成后逐条回到消息位置处理），坐标需由 union 行 y
+映射回设备行（`_screen_bounds`/缝合偏移），暂未内联接入。
 所有处置落盘 `workspace/media/{type}/{msg_id}_{ts}/`（含 manifest.json），
 `workspace/media/collect_debug/` 留错误现场；异常统一 `_return_to_chat` 回聊天页。
 

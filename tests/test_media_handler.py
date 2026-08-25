@@ -195,3 +195,25 @@ class MediaHandlerOffline(unittest.TestCase):
         self.assertEqual(man["bbox"], [1, 2, 3, 4])
         self.assertEqual(man["result"]["records"][0]["sender"], "a")
         self.assertTrue(man["success"])
+
+    def test_media_to_entry_and_key(self):
+        """realtime_scan 接入 helper：MediaResult -> message_log entry + 去重 key。"""
+        from src.interaction.loop.realtime_scan import _media_to_entry, _entry_key
+        from src.interaction.ports.android.perception.media_handler import MediaResult
+        r = MediaResult(msg_id="m1", msg_type="link",
+                        content="https://mp.weixin.qq.com/s/x",
+                        raw_files=["/w/a.png", "/w/b.png"], success=True)
+        m = {"side": "other", "matched_user_name": "风图", "content": "群聊的聊天记录"}
+        e = _media_to_entry(r, m, "猫猫群", "17:58")
+        self.assertEqual(e.sender, "风图")
+        self.assertEqual(e.content_type, "link")
+        self.assertEqual(e.complete, 1)
+        self.assertEqual(e.content, "https://mp.weixin.qq.com/s/x")
+        self.assertEqual(e.media_path, "/w/a.png;/w/b.png")
+        self.assertEqual(e.time_hint, "17:58")
+        self.assertIn("link", _entry_key(e))
+        # dict content -> JSON 字符串
+        r2 = MediaResult(msg_id="m2", msg_type="chat_record",
+                         content={"records": ["a"]}, raw_files=[], success=True)
+        e2 = _media_to_entry(r2, m, "g", None)
+        self.assertEqual(e2.content, '{"records": ["a"]}')
