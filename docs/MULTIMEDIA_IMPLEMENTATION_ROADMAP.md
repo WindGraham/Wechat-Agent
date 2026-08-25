@@ -448,7 +448,7 @@ for msg in messages:
 ## 9. 任务清单（可直接勾选）
 
 - [x] 链接读取：root+setuid 直读剪贴板 `read_clipboard()`（真机返回 URL；见 §2.2.1）；输入框 OCR 保留为回退
-- [x] 链接读取：`media_handler._read_link_from_webview()` 已用直读剪贴板，OCR 回退；接入交互层仍待做
+- [x] 链接读取：`media_handler._read_link_from_webview()` 直读剪贴板，OCR 回退；真机 e2e 验证通过（游泳馆群「学生助理招新通知」→ 复制链接 → 常驻读 → 返回 `https://mp.weixin.qq.com/s/GAV9uRX7RivF6calz-RNOw`）；webview 签名漏判已修复（unknown→链接流+OCR找复制链接）
 - [x] 图片处置：`_handle_media`/`_save_photo_or_video`（真机签名探测过；照片保存流待真实照片样本）
 - [x] 视频处置：`_save_photo_or_video(is_video=True)`（代码；视频样本待验证）
 - [x] 表情包处置：`_handle_sticker`/`_handle_sticker_detail`（已真机验证）
@@ -462,7 +462,7 @@ for msg in messages:
 - [ ] 接入 `history_collect.py`（未接入）
 - [x] 中间文件落盘：`MediaResult.run_dir` + `_write_manifest`（每个消息写 manifest.json）
 - [x] 单元测试：`tests/test_media_handler.py`（11 项，离线 mock run_ocr）
-- [x] 真机冒烟测试：聊天记录卡/表情包/OCR点击/常驻剪贴板读已真机验证；图片保存/链接复制→常驻读/文件卡待真实消息样本
+- [x] 真机冒烟测试：聊天记录卡/表情包/OCR点击/常驻剪贴板读/**链接复制→常驻读**（游泳馆群公众号文章 e2e 返回 URL）已真机验证；图片保存/文件卡待真实照片/文件消息样本
 - [ ] 更新 `docs/INTERACTION_LAYER.md`
 - [ ] commit push
 
