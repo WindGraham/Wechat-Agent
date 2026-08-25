@@ -32,12 +32,13 @@ from src.interaction.ports.android.perception.roster_matcher import RosterMatche
 from src.interaction.msglog import message_log
 from src.shared.fling_physics import plan_swipe
 
-SCROLL_RANGE = (1000, 1400)
+SCROLL_RANGE = (1350, 1450)   # 目标总滚动 ≈0.75×消息区高(1417px)：大位移快采，
+                             # 但 < 一屏 → 必有重叠（设计 §1：0 < dy < M）
 SWIPE_RANGE = (600, 900)
 X_RANGE = (400, 680)
 Y_START_RANGE = (1100, 1300)
 DUR_JITTER = (0.9, 1.1)
-SLEEP_S = 0.6
+SLEEP_S = 0.25   # 快滑后等惯性略稳定；find_overlap_dy 实测位移，无需等完全停
 
 # 实时裁图归档：workspace/crops/<群>/<hash>.jpg（网关 /workspace/ 只读图片路由可访问）
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -96,24 +97,36 @@ def scroll_to_latest(dev, n=30):
 
 
 def do_swipe(dev, direction="earlier"):
-    target = random.uniform(*SCROLL_RANGE)
-    swipe_px = random.uniform(*SWIPE_RANGE)
-    plan = plan_swipe(target, swipe=swipe_px)
+    """控制滚动距离的快滑：fling 物理模型反解时长，总滚动压在 target(1350~1450px)。
+
+    总滚动 = 0.75×消息区高 ≈1417px（设计 §1）：大位移快采，但必须 < 消息区高
+    (≈1910px) 且 < find_overlap_dy 横带可配准上限(~1640px)——否则相邻两屏无
+    重叠、配不上（重叠 = 消息区高 − dy ≈ 473px > 0）。故保留 plan_swipe 反解
+    时长控制位移，只把 dev.swipe（swipe_zone 含 wait_random 100~250ms）换成
+    直发 input swipe 省开销。
+    """
+    target = random.uniform(*SCROLL_RANGE)       # 目标总滚动 1000~1400px
+    swipe_px = random.uniform(*SWIPE_RANGE)      # 手指位移 600~900px
+    plan = plan_swipe(target, swipe=swipe_px)    # 反解时长，控制总滚动=target
     dur_ms = int(plan.duration_ms * random.uniform(*DUR_JITTER))
     x = int(random.uniform(*X_RANGE))
     y = int(random.uniform(*Y_START_RANGE))
     if direction == "earlier":
-        dev.swipe(x, y, x, y + int(plan.swipe_px), dur_ms)
+        dev._shell(f"input swipe {x} {y} {x} {y + int(plan.swipe_px)} {dur_ms}")
     else:
-        dev.swipe(x, y, x, y - int(plan.swipe_px), dur_ms)
+        dev._shell(f"input swipe {x} {y} {x} {y - int(plan.swipe_px)} {dur_ms}")
 
 
 def realtime_scan(conn, group, max_rounds=40, on_new=None, scroll_back=True,
-                  dev=None, stop_empty_rounds=0):
+                  dev=None, stop_empty_rounds=0, reconcile_uncertain=False):
     """实时滚动采集：每屏识别 → 全局去重 → 实时入库。返回累计入库消息数。
 
     stop_empty_rounds>0 时：连续 N 屏入库 0 条（已滚到库里已有的历史、即
     「上一次的位置」）就提前停止，不再继续往上翻。
+
+    reconcile_uncertain=True 时：识别双因子失配（slice_chat 标 uncertain_entity）
+    的消息，会在其仍在屏上时点头像进资料页调和（改名/换头像），再退回聊天页
+    继续滚动。默认 False（不打断滚动）。
     """
     dev = dev or DeviceCtl()
     rm = RosterMatcher(group)
@@ -125,6 +138,7 @@ def realtime_scan(conn, group, max_rounds=40, on_new=None, scroll_back=True,
         time.sleep(1.0)
 
     seen = set()
+    reconciled = set()   # 已调和的成员（按昵称去重，避免每屏重复点头像）
     total = 0
     empty_streak = 0     # 连续入库 0 条的屏数（用于「翻到上一次位置」提前停）
     cur_divider = None   # 最近的时间分割线文本（跨屏传播，供 ts_hint 解析）
@@ -175,6 +189,29 @@ def realtime_scan(conn, group, max_rounds=40, on_new=None, scroll_back=True,
                 clipped += 1
             else:  # top_clipped / both_clipped / unidentifiable：无身份锚，暂跳过
                 clipped += 1
+
+        # 识别失配 → 点头像进资料页调和（inline：消息仍在屏上时做，然后退回聊天页）
+        if reconcile_uncertain:
+            from src.interaction.ports.android.perception.roster_update import \
+                reconcile_on_mismatch
+            for m in res["messages"]:
+                if not m.get("uncertain_entity"):
+                    continue
+                key = (m.get("nickname") or m.get("matched_user_name") or "").strip()
+                if not key or key in reconciled:
+                    continue
+                reconciled.add(key)
+                try:
+                    actions = reconcile_on_mismatch(dev, group, m, rm=rm)
+                    if actions:
+                        print(f"    [reconcile] {key}: {actions}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"    [reconcile] {key} 失败: {e}")
+                try:
+                    dev.back()          # 从资料页退回聊天页，继续滚动
+                    time.sleep(0.8)
+                except Exception:
+                    pass
 
         n = 0
         if new_entries:

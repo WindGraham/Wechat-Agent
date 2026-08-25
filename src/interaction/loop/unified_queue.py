@@ -331,32 +331,33 @@ class UnifiedQueue:
         按 session 查找会落空，重试计数失效）。本接口保留给外部调用方。
 
         - 未达上限：保持原位置重试
-        - 达到上限：排到队尾（作为新条目）
+        - 达到上限：排到队尾（attempts 保留继续计，不归零）
+        - 达到硬上限（2×上限）：彻底丢弃
         """
         with self._lock:
             existing = self._entries.get(session)
             if existing and existing.kind == "action":
                 existing.attempts += 1
-                if existing.attempts >= self._max_attempts:
-                    # 耗尽：排到队尾
+                if existing.attempts >= self._max_attempts * 2:
+                    log.error("queue: %s 行动重试 %d 次仍失败，丢弃",
+                              session, existing.attempts)
                     del self._entries[session]
-                    new_entry = QueueEntry(
-                        kind="action", session=session,
-                        ts=time.time(),
-                        mention=existing.mention,
-                        payload=blocks_xml,
-                        attempts=0,
-                    )
-                    self._entries[session] = new_entry
+                    self._persist()
+                    return None
+                if existing.attempts >= self._max_attempts:
+                    # 耗尽：排到队尾，attempts 保留继续计
+                    existing.ts = time.time()
+                    existing.payload = blocks_xml
+                    self._persist()
                     log.warning("queue: %s max attempts reached, requeued at tail",
                                 session)
-                    return new_entry
-                else:
-                    # 未达上限：保持原 payload
-                    existing.payload = blocks_xml
-                    log.info("queue: %s retry %d/%d",
-                             session, existing.attempts, self._max_attempts)
                     return existing
+                # 未达上限：保持原 payload
+                existing.payload = blocks_xml
+                self._persist()
+                log.info("queue: %s retry %d/%d",
+                         session, existing.attempts, self._max_attempts)
+                return existing
             else:
                 # 全新入队
                 return self.push_action(session, blocks_xml)

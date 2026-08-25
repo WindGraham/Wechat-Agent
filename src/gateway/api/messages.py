@@ -85,4 +85,34 @@ def create_bp(ctx: dict) -> Blueprint:
             "has_more": page * page_size < total,
         })
 
+    @bp.route("/api/messages/latest")
+    def api_latest():
+        """按采集时间 ts_captured 增量拉取新入库消息（供前端实时刷新）。
+
+        与 /api/messages/list 的区别：list 按发送时间 ts_hint 倒序（展示用）。
+        采集历史（往更早方向翻）时，新入库消息的发送时间更旧、永远排不到
+        页首，靠 list 无法检测「有没有新采集」。这里按 ts_captured 排序 +
+        since_ts 增量拉取，专门给前端 pollNew 探测新数据。
+        """
+        group = request.args.get("group", "").strip()
+        if not group:
+            return jsonify({"ok": False, "error": "缺少 group 参数"}), 400
+        try:
+            since_ts = float(request.args.get("since_ts") or 0)
+            limit = min(500, max(1, int(request.args.get("limit", 200))))
+        except ValueError:
+            return jsonify({"ok": False, "error": "since_ts/limit 必须是数字"}), 400
+
+        rows = _query(
+            "SELECT m.seq, m.sender, m.is_mine, m.content_type, m.content, "
+            "       m.ts_hint, m.ts_captured, m.media_path, m.complete, "
+            "       m.crop_path "
+            "FROM messages m JOIN sessions s ON s.session_id = m.session_id "
+            "WHERE s.name = ? AND m.ts_captured > ? "
+            "ORDER BY m.ts_captured ASC LIMIT ?",
+            (group, since_ts, limit))
+        messages = [dict(r) for r in rows]
+        max_ts = messages[-1]["ts_captured"] if messages else None
+        return jsonify({"ok": True, "messages": messages, "max_ts": max_ts})
+
     return bp

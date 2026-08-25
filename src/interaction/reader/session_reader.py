@@ -104,42 +104,45 @@ class SessionReader:
         return [self._row_to_message(session, r, is_group) for r in rows]
 
     # ------------------------------------------------------------------ 同步流程（进会话→读屏→写库→回传）
-    def sync_session(self, session: str, is_group: bool) -> Optional[LogUpdated]:
+    def sync_session(self, session: str, is_group: bool,
+                     reconcile: bool = False) -> Optional[LogUpdated]:
         """进入一个会话，完成一次完整的日志同步。
 
-        流程：读当前屏 → 增量写库（gap 自愈）→ 版本号+1 → 返回 LogUpdated。
+        使用滚动裁切方案（重叠-残缺-缝合 + 书签续采 + 统一裁切线分段）。
+        reconcile=True 时，双因子失配消息在屏上点头像进资料页调和
+        （改名/换头像写回花名册 + 新成员动态学习）。
         返回 None 表示同步失败。
         """
         from ..msglog import (get_or_create_session, set_session_kind,
-                              append_incremental,
-                              increment_sync_version, get_sync_version)
+                              increment_sync_version)
+        from ..loop.history_collect import collect_group_history
 
         sid = get_or_create_session(self._conn, session, is_group)
         # 旅程实测到真实 is_group，显式写回（get_or_create_session 不覆写）
         set_session_kind(self._conn, session, is_group)
 
-        # 1. 读取当前屏
+        # 记录同步前的最大 seq（用于检查是否有 @我）
+        max_seq_before = self._get_max_seq(sid)
+
+        # 使用滚动裁切方案做消息同步
         try:
-            entries, state = self._pr.read_current()
+            total = collect_group_history(
+                self._pr.dev, self._conn, session,
+                max_rounds=40,
+                stop_empty_rounds=2,
+                stop_at_anchor=True,
+                use_cutlines=True,
+                reconcile=reconcile and is_group,
+            )
         except Exception:
-            log.exception("[%s] read_current failed", session)
+            log.exception("[%s] collect_group_history failed", session)
             return None
 
-        # 2. 增量写库（gap 自愈）
-        new_entries = self._append_gap_aware(sid, session, entries)
-        self._last_new[session] = len(new_entries)
+        # 检查是否有 @我（从最新入库的消息中检查）
+        mention_hint = self._check_mention_since(sid, max_seq_before)
 
-        # 3. 多媒体打标（非文字泡 → 占位符 + 裁图路径）
-        if new_entries:
-            self._tag_media(session, sid, new_entries)
-
-        # 4. 版本号+1
+        # 版本号+1
         new_version = increment_sync_version(self._conn, sid)
-
-        # 5. 检查是否有 @我
-        mention_hint = any(
-            self._is_at_me(e) for e in new_entries
-        ) if new_entries else False
 
         updated = LogUpdated(
             session=session,
@@ -147,8 +150,39 @@ class SessionReader:
             mention_hint=mention_hint,
         )
         log.info("[%s] sync complete: version=%d new=%d mention=%s",
-                 session, new_version, len(new_entries), mention_hint)
+                 session, new_version, total, mention_hint)
         return updated
+
+    def _get_max_seq(self, sid: int) -> int:
+        """获取会话的最大 seq（同步前）。"""
+        try:
+            row = self._conn.execute(
+                "SELECT MAX(seq) as max_seq FROM messages WHERE session_id=?",
+                (sid,)).fetchone()
+            return row["max_seq"] if row and row["max_seq"] else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _check_mention_since(self, sid: int, max_seq_before: int) -> bool:
+        """检查自 max_seq_before 以来是否有 @我 的消息。"""
+        try:
+            rows = self._conn.execute(
+                "SELECT content, mentions FROM messages "
+                "WHERE session_id=? AND seq > ?",
+                (sid, max_seq_before)).fetchall()
+            for r in rows:
+                content = r["content"] or ""
+                mentions = (r["mentions"] or "").split(",") if r["mentions"] else []
+                if "@所有人" in content:
+                    return True
+                owner = self._owner_nick
+                if owner:
+                    for m in mentions:
+                        if m and (m == owner or m in owner or owner in m):
+                            return True
+            return False
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------ 内部
     GAP_FORCE_CAP = 3  # 连续 gap 达此次数后强制追加

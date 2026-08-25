@@ -34,8 +34,11 @@ GROUP_NAME = "交流一下？"
 # ---------------------------------------------------------------- 网格页成员过滤（防状态栏/标题/通知误识别）
 GRID_Y_MIN = 300          # 状态栏+标题栏以上
 GRID_Y_MAX = 2050         # 底部“收起”按钮以下
+# 「查看全部群成员」入口的文案在不同微信版本可能是其中一种
+_MEMBER_ENTRY_KEYWORDS = ("更多群成员", "查看全部群成员", "查看更多群成员")
 # 这些文本永远不是成员昵称
-_NON_MEMBER_KEYWORDS = ["聊天信息", "更多群成员", "收起", "添加", "移出", "群聊名称",
+_NON_MEMBER_KEYWORDS = ["聊天信息", "更多群成员", "查看全部群成员", "查看更多群成员",
+                        "收起", "添加", "移出", "群聊名称",
                         "查找聊天记录", "消息免打扰", "置顶聊天", "保存到通讯录"]
 _STATUS_RE = re.compile(r"^\d{2}:\d{2}(?::\d{2})?$|^\d+%$|^微信\s*[(（]|^交流一下|^YOUSAOBI")  # 通知预览/状态栏常见片段
 
@@ -57,16 +60,22 @@ def _looks_like_member_name(item):
 
 
 def _is_grid_page(items):
-    return any(k in i.get("text", "") for i in items for k in ("聊天信息", "更多群成员", "收起", "群聊名称"))
+    # 展开后的成员网格页以「收起」为标志（预览态只有「更多群成员」）。
+    # 「聊天信息」标题在预览态和展开态都有，不能单独当判据。
+    texts = [i.get("text", "") for i in items]
+    if any("收起" in t for t in texts):
+        return True
+    # 小群（如 9 人群）没有「更多群成员/收起」入口，
+    # 聊天信息页的成员平铺本身就是完整网格。
+    on_info = any("聊天信息" in t for t in texts)
+    has_entry = any(any(k in t for k in _MEMBER_ENTRY_KEYWORDS) for t in texts)
+    has_group_settings = any("群聊名称" in t or "群二维码" in t for t in texts)
+    return on_info and has_group_settings and not has_entry
 
 
 def _is_profile_page(items):
     texts = " ".join(i.get("text", "") for i in items)
     return any(k in texts for k in ("微信号", "朋友资料", "发消息", "音视频通话", "添加到通讯录"))
-OUTPUT_DIR = f"workspace/group_rosters/{GROUP_NAME}"
-AVATAR_DIR = os.path.join(OUTPUT_DIR, "avatars")
-PROFILE_SHOTS_DIR = os.path.join(OUTPUT_DIR, "profile_shots")
-JSON_PATH = os.path.join(OUTPUT_DIR, "members_roster.json")
 ADB = "./tools/platform-tools/adb -s cf04642e"
 
 def run_cmd(cmd):
@@ -87,23 +96,28 @@ def _iou_box(a, b):
 
 
 class FullGroupSpider:
-    def __init__(self):
-        os.makedirs(AVATAR_DIR, exist_ok=True)
-        os.makedirs(PROFILE_SHOTS_DIR, exist_ok=True)
-        self.roster_data = {"group_name": GROUP_NAME, "total_count": 0, "members": []}
+    def __init__(self, group_name=GROUP_NAME):
+        self.group_name = group_name
+        self.output_dir = f"workspace/group_rosters/{group_name}"
+        self.avatar_dir = os.path.join(self.output_dir, "avatars")
+        self.profile_shots_dir = os.path.join(self.output_dir, "profile_shots")
+        self.json_path = os.path.join(self.output_dir, "members_roster.json")
+        os.makedirs(self.avatar_dir, exist_ok=True)
+        os.makedirs(self.profile_shots_dir, exist_ok=True)
+        self.roster_data = {"group_name": group_name, "total_count": 0, "members": []}
         self.processed_names = set()
         self.profile_shot_counter = 0
 
     def save_json(self):
         self.roster_data["total_count"] = len(self.roster_data["members"])
-        with open(JSON_PATH, "w", encoding="utf-8") as f:
+        with open(self.json_path, "w", encoding="utf-8") as f:
             json.dump(self.roster_data, f, ensure_ascii=False, indent=2)
 
     def _archive_profile_shot(self, snap_path):
         """把个人资料页截图存档到 profile_shots/，返回相对路径。"""
         self.profile_shot_counter += 1
         fname = f"profile_{self.profile_shot_counter:04d}.png"
-        dst = os.path.join(PROFILE_SHOTS_DIR, fname)
+        dst = os.path.join(self.profile_shots_dir, fname)
         try:
             shutil.copy2(snap_path, dst)
             return os.path.join("profile_shots", fname)
@@ -272,12 +286,12 @@ class FullGroupSpider:
         ext = ".png"
         counter = 1
         final_filename = save_filename
-        while os.path.exists(os.path.join(AVATAR_DIR, final_filename)):
+        while os.path.exists(os.path.join(self.avatar_dir, final_filename)):
             final_filename = f"{base_name}_{counter}{ext}"
             counter += 1
 
         avatar_rel_path = os.path.join("avatars", final_filename)
-        avatar_full_path = os.path.join(AVATAR_DIR, final_filename)
+        avatar_full_path = os.path.join(self.avatar_dir, final_filename)
         cv2.imwrite(avatar_full_path, bgra)
         return avatar_rel_path
 
@@ -336,6 +350,7 @@ class FullGroupSpider:
 
         main_nickname, group_nickname, wechat_id, region, is_friend = "", "", "", "", 0
         wxid_cy = None
+        group_nick_cy = None
         for i in full_items:
             t = i["text"]
             if "微信号" in t:
@@ -348,20 +363,30 @@ class FullGroupSpider:
                 if clean_r:
                     region = clean_r
             elif "群昵称" in t:
+                group_nick_cy = i["cy"]
                 clean_g = t.replace("群昵称:", "").replace("群昵称：", "").replace("群昵称", "").strip()
                 if clean_g:
                     group_nickname = clean_g
             elif "发消息" in t or "音视频通话" in t:
                 is_friend = 1
 
+        def _longpress_copy_spider(cy):
+            run_cmd(f"{ADB} shell input swipe 400 {int(cy)} 400 {int(cy)} 800")
+            time.sleep(1)
+            run_cmd(f"{ADB} shell input tap 450 {int(cy)-65}")
+            time.sleep(1)
+            return self.get_clipboard_exact()
+
+        # 微信号/群昵称 长按复制提权兜底（长群昵称会被省略号截断）
         if wxid_cy and not wechat_id:
-            run_cmd(f"{ADB} shell input swipe 400 {int(wxid_cy)} 400 {int(wxid_cy)} 800")
-            time.sleep(1)
-            run_cmd(f"{ADB} shell input tap 450 {int(wxid_cy)-65}")
-            time.sleep(1)
-            exact = self.get_clipboard_exact()
+            exact = _longpress_copy_spider(wxid_cy)
             if exact:
                 wechat_id = exact
+        if group_nick_cy and (not group_nickname
+                              or group_nickname.rstrip().endswith(("...", "…"))):
+            exact = _longpress_copy_spider(group_nick_cy)
+            if exact:
+                group_nickname = exact
 
         # 2. 精确定位头像，把昵称 OCR 限制在“头像右侧”区域
         avatar_box = self.find_profile_avatar_box(snap_path)
@@ -424,35 +449,137 @@ class FullGroupSpider:
             "update_ts": time.time()
         }
 
-    def ensure_grid_page(self):
-        """确保进入群成员网格页面"""
-        run_cmd(f"{ADB} exec-out screencap -p > /tmp/check_page.png")
-        items = run_ocr("/tmp/check_page.png")
-        if any("更多群成员" in i["text"] or "收起" in i["text"] or "聊天信息" in i["text"] for i in items):
-            return
-        log.info("[*] 正在导航进入【交流一下？】群成员网格页...")
+    def _enter_via_folded(self):
+        """折叠群聊兜底：首页找到「折叠的聊天」入口 → 进去找群 → 进会话。
+
+        被折叠的群不出现在首页列表也不被搜索命中（JY君C 实测），
+        只能从折叠入口进。返回 bool。
+        """
+        log.info("[*] 尝试从「折叠的聊天」进入群「%s」...", self.group_name)
+        name_ns = self.group_name.replace(" ", "")
         run_cmd(f"{ADB} shell am force-stop com.tencent.mm")
         time.sleep(1)
         run_cmd(f"{ADB} shell monkey -p com.tencent.mm -c android.intent.category.LAUNCHER 1")
+        time.sleep(4)
+
+        def _find_on_screen(kw, contains=True):
+            run_cmd(f"{ADB} exec-out screencap -p > /tmp/fold_scan.png")
+            for i in run_ocr("/tmp/fold_scan.png"):
+                t = i.get("text", "").replace(" ", "")
+                if 250 < i.get("cy", 0) < 2150 and (
+                        kw in t if contains else t == kw):
+                    return i
+            return None
+
+        # 1. 首页找「折叠的聊天」入口（最多下翻 6 屏）
+        entry = None
+        for _ in range(7):
+            entry = _find_on_screen("折叠的聊天")
+            if entry:
+                break
+            run_cmd(f"{ADB} shell input swipe 540 1800 540 600 300")
+            time.sleep(1.2)
+        if not entry:
+            log.warning("[-] 首页未找到「折叠的聊天」入口")
+            return False
+        run_cmd(f"{ADB} shell input tap 400 {int(entry['cy'])}")
+        time.sleep(2)
+
+        # 2. 折叠列表里找目标群（最多下翻 8 屏）
+        target = None
+        for _ in range(9):
+            target = _find_on_screen(name_ns)
+            if target:
+                break
+            run_cmd(f"{ADB} shell input swipe 540 1800 540 600 300")
+            time.sleep(1.2)
+        if not target:
+            log.warning("[-] 折叠列表中未找到群「%s」", self.group_name)
+            return False
+        run_cmd(f"{ADB} shell input tap 400 {int(target['cy'])}")
+        time.sleep(2.5)
+
+        # 3. 校验聊天页标题（去空格互含；长名会被省略号截断）
+        run_cmd(f"{ADB} exec-out screencap -p > /tmp/fold_title.png")
+        for i in run_ocr("/tmp/fold_title.png"):
+            t = i.get("text", "").replace(" ", "").strip()
+            if i.get("cy", 9999) > 220 or len(t) < 2:
+                continue
+            t = t.rstrip("….")
+            if name_ns.startswith(t) or t.startswith(name_ns[:4]):
+                return True
+        log.warning("[-] 折叠列表点进后会话标题与「%s」不符", self.group_name)
+        run_cmd(f"{ADB} shell input keyevent 4")
+        return False
+
+    def ensure_grid_page(self):
+        """确保进入「展开后的群成员网格页」。返回 bool（成功/失败）。
+
+        失败即 False，调用方据此中止，绝不在预览页/错误页上硬爬。
+        进群导航复用生产链路 WeChatTools.enter_session（列表翻 5 屏 +
+        搜索兜底 + 页面类型校验），2026-08-25 起替代手搓的首页/搜索逻辑
+        （手搓版连续踩坑：点错会话无校验、ADBKeyboard 焦点丢失、
+        搜索页查询框冒充标题、长群名空格被 OCR 吞掉）。
+        """
+        log.info("[*] 正在导航进入【%s】群成员网格页...", self.group_name)
+        from src.interaction.ports.android.action.wechat_tools import \
+            WeChatTools
+        tools = WeChatTools()
+        r = tools.enter_session(self.group_name)
+        if not r.success:
+            log.warning("[-] 列表+搜索未能进入群「%s」: %s，试折叠入口",
+                        self.group_name, r.error)
+            if not self._enter_via_folded():
+                log.warning("[-] 折叠入口也未能进入群「%s」", self.group_name)
+                return False
+
+        # 右上角 … 进聊天信息页（980,140 为实测「…」中心，OnePlus 6T）
+        run_cmd(f"{ADB} shell input tap 980 140")
         time.sleep(3)
-        run_cmd(f"{ADB} exec-out screencap -p > /tmp/home_check.png")
-        items_home = run_ocr("/tmp/home_check.png")
-        jlyx = next((i for i in items_home if "交流一下" in i["text"]), None)
-        if jlyx:
-            run_cmd(f"{ADB} shell input tap 308 {int(jlyx['cy'])}")
-            time.sleep(2)
-            run_cmd(f"{ADB} shell input tap 980 140")
-            time.sleep(2)
+
+        # 找「更多群成员」并点（冷启动页面渲染慢，重试 5 次；点完校验「收起」）
+        for attempt in range(5):
             run_cmd(f"{ADB} exec-out screencap -p > /tmp/set_check.png")
             items_set = run_ocr("/tmp/set_check.png")
-            more = next((i for i in items_set if "更多群成员" in i["text"]), None)
+            texts = [i.get("text", "") for i in items_set]
+            on_info = any("聊天信息" in t for t in texts)
+            more = next((i for i in items_set
+                         if any(k in i["text"] for k in _MEMBER_ENTRY_KEYWORDS)), None)
             if more:
-                run_cmd(f"{ADB} shell input tap 501 {int(more['cy'])}")
+                run_cmd(f"{ADB} shell input tap {int(more['cx'])} {int(more['cy'])}")
+                time.sleep(2.5)
+                run_cmd(f"{ADB} exec-out screencap -p > /tmp/grid_verify.png")
+                if _is_grid_page(run_ocr("/tmp/grid_verify.png")):
+                    return True
+                log.info("[*] 点了「更多群成员」但未见展开，重试 %d/5", attempt + 1)
+            elif on_info and _is_grid_page(items_set):
+                # 小群：无「更多群成员」入口，信息页即完整网格
+                log.info("[*] 小群无展开入口，信息页即完整成员网格")
+                return True
+            elif on_info:
+                # 已在聊天信息页，但「更多群成员」还没渲染出来 → 多等再试
+                log.info("[*] 聊天信息页但未见入口，多等重试 %d/5", attempt + 1)
                 time.sleep(2)
+            else:
+                # 不在聊天信息页 → 重新点右上角…
+                # 但落在搜索页时（查询框含群名曾让标题校验误通过）不再盲点，
+                # (980,140) 在搜索页是「搜索」按钮，越点越偏
+                if any(any(k in t for k in ("搜索网络结果", "最近在搜", "AI搜索"))
+                       for t in texts):
+                    log.warning("[-] 落在搜索页而非会话，中止导航")
+                    return False
+                log.info("[*] 未在聊天信息页，重点…重试 %d/5", attempt + 1)
+                run_cmd(f"{ADB} shell input tap 980 140")
+                time.sleep(2.5)
+            time.sleep(1)
+        log.warning("[-] 多次重试仍未进入成员网格页")
+        return False
 
     def run(self):
-        self.ensure_grid_page()
-        log.info(f"🚀 开始全量采集【{GROUP_NAME}】群聊花名册（超级横幅接力模式）...")
+        if not self.ensure_grid_page():
+            log.error("[-] 无法进入群成员网格页，终止采集")
+            return
+        log.info(f"🚀 开始全量采集【{self.group_name}】群聊花名册（超级横幅接力模式）...")
         
         min_y_cutoff = 0  # 当前屏有效处理区域的上界 Y
         consecutive_misses = 0
@@ -489,6 +616,13 @@ class FullGroupSpider:
                         log.warning("[-] 该头像未进入个人资料页，可能是加号/空白，按 back 恢复网格...")
                         self._recover_to_grid()
                         continue
+                    dedup_key = f"{rec['main_nickname']}|{rec['wechat_id']}"
+                    if dedup_key in self.processed_names:
+                        log.info(f"[*] 跳过重复成员: {rec['main_nickname']} | {rec['wechat_id']}")
+                        run_cmd(f"{ADB} shell input keyevent 4")
+                        time.sleep(1.2)
+                        continue
+                    self.processed_names.add(dedup_key)
                     self.roster_data["members"].append(rec)
                     self.save_json()
                     processed_in_this_screen += 1
@@ -545,8 +679,100 @@ class FullGroupSpider:
                     log.info("🎉 连续多次滑动均未发现新锚点，全群成员已彻底全量采集完毕！")
                     break
 
-        log.info(f"✅ 全量任务结束！共成功采集 {len(self.roster_data['members'])} 位成员全套档案，保存在: {JSON_PATH}")
+        log.info(f"✅ 全量任务结束！共成功采集 {len(self.roster_data['members'])} 位成员全套档案，保存在: {self.json_path}")
+
+
+def crawl_group_roster(group_name):
+    """给任意群聊建/更新花名册：自动导航 → 全量爬取 → 标记「已获取」。
+
+    返回 dict：{"ok": bool, "group": str, "members": int, "error": str}。
+    供凌晨3点休眠后的批量扫描（Phase 2）调用。
+    """
+    import sys
+    sys.path.insert(0, ".")
+    from src.interaction.msglog import message_log
+    from src.interaction.ports.android.perception.roster_matcher import \
+        update_group_manifest
+    conn = message_log.connect("workspace/chatlogs/chatlog.db")
+    try:
+        spider = FullGroupSpider(group_name=group_name)
+        spider.run()
+        n = len(spider.roster_data["members"])
+        if n > 0:
+            message_log.set_roster_status(conn, group_name, message_log.ROSTER_DONE)
+            update_group_manifest(group_name, status="completed", member_count=n)
+            return {"ok": True, "group": group_name, "members": n, "error": ""}
+        return {"ok": False, "group": group_name, "members": 0,
+                "error": "采集到 0 个成员（导航失败或页面不对）"}
+    except Exception as e:
+        message_log.set_roster_status(conn, group_name, message_log.ROSTER_FAILED)
+        return {"ok": False, "group": group_name, "members": 0, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        conn.close()
+
+
+def crawl_private_roster(session_name):
+    """给私信联系人建花名册：进会话 → 右上角… → 聊天信息页点联系人 → 资料页提取 → 打标。
+
+    复用 extract_profile_max 提取主昵称/微信号/地区/头像（圆角裁剪逻辑不变）。
+    返回 dict 同 crawl_group_roster（members 恒为 1 或 0）。
+
+    注意：私信「聊天信息页→联系人卡片→资料页」的具体点击点需真机验证，
+    此处沿用群聊导航同款坐标（308 首页条目 / 980,140 右上角…），如与
+    当前微信版本不符，需微调本函数内的坐标/OCR 定位。
+    """
+    import sys
+    sys.path.insert(0, ".")
+    from src.interaction.msglog import message_log
+    conn = message_log.connect("workspace/chatlogs/chatlog.db")
+    try:
+        spider = FullGroupSpider(group_name=session_name)
+
+        # 1. 进会话（生产导航：列表翻屏 + 搜索兜底 + 页面类型校验）
+        from src.interaction.ports.android.action.wechat_tools import \
+            WeChatTools
+        tools = WeChatTools()
+        r = tools.enter_session(session_name)
+        if not r.success:
+            message_log.set_roster_status(conn, session_name, message_log.ROSTER_FAILED)
+            return {"ok": False, "group": session_name, "members": 0,
+                    "error": f"无法进入会话: {r.error}"}
+
+        # 2. 右上角 … → 聊天信息页
+        run_cmd(f"{ADB} shell input tap 980 140")
+        time.sleep(2)
+
+        # 3. 聊天信息页顶部联系人卡片 → 点名字进资料页
+        run_cmd(f"{ADB} exec-out screencap -p > /tmp/pv_info.png")
+        items_info = run_ocr("/tmp/pv_info.png")
+        name_it = next((i for i in items_info
+                        if session_name in i["text"] and 200 < i["cy"] < 800), None)
+        if name_it:
+            run_cmd(f"{ADB} shell input tap {int(name_it['cx'])} {int(name_it['cy'])}")
+            time.sleep(2)
+
+        # 4. 提取资料（extract_profile_max 内部校验是否在资料页）
+        rec = spider.extract_profile_max()
+        if rec is None:
+            message_log.set_roster_status(conn, session_name, message_log.ROSTER_FAILED)
+            return {"ok": False, "group": session_name, "members": 0,
+                    "error": "资料页提取失败（可能未进入资料页）"}
+        spider.roster_data["members"].append(rec)
+        spider.save_json()
+        message_log.set_roster_status(conn, session_name, message_log.ROSTER_DONE)
+        return {"ok": True, "group": session_name, "members": 1, "error": ""}
+    except Exception as e:
+        message_log.set_roster_status(conn, session_name, message_log.ROSTER_FAILED)
+        return {"ok": False, "group": session_name, "members": 0, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
-    spider = FullGroupSpider()
-    spider.run()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--private":
+        name = sys.argv[2] if len(sys.argv) > 2 else GROUP_NAME
+        print(f"结果: {crawl_private_roster(name)}")
+    else:
+        name = sys.argv[1] if len(sys.argv) > 1 else GROUP_NAME
+        print(f"结果: {crawl_group_roster(name)}")

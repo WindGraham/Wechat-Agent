@@ -85,8 +85,10 @@ def init_device_with_retry(retry_interval=DEVICE_RETRY_INTERVAL,
 
 
 # ------------------------------------------------------------------ 装配
-def assemble(workspace_root, config_path, with_device=True):
-    """装配全部组件。with_device=False 时跳过端口/设备（dry-run 用）。
+def assemble(workspace_root, config_path, with_device=True,
+             with_decision=True):
+    """装配全部组件。with_device=False 时跳过端口/设备（dry-run 用）；
+    with_decision=False 时跳过决策层 Proxy（采集模式：只读入库不回话）。
 
     返回 (components: dict, manifest: list[str])；manifest 为装配清单行。
     """
@@ -131,7 +133,7 @@ def assemble(workspace_root, config_path, with_device=True):
     if with_device:
         tools = init_device_with_retry()
         _assemble_interaction(comp, manifest, tools, dirs, runtime, queue,
-                              conn)
+                              conn, collect=not with_decision)
     else:
         manifest.append("device: [dry-run 跳过] Android 端口 "
                         "(WeChatTools/DeviceCtl/FrameBus/Reader/Scanner/"
@@ -140,7 +142,9 @@ def assemble(workspace_root, config_path, with_device=True):
                         "BundleSender/JourneyManager/InteractionLoop 不装配")
 
     # 7. 决策层装配（Proxy：LLM 唯一对话对象，三层唯一交汇点）
-    if not with_device or "session_reader" not in comp:
+    if not with_decision:
+        manifest.append("decision: [collect 模式] Proxy 不装配（只采集不回话）")
+    elif not with_device or "session_reader" not in comp:
         manifest.append("decision: [dry-run 跳过] Proxy 不装配")
     else:
         try:
@@ -149,9 +153,14 @@ def assemble(workspace_root, config_path, with_device=True):
 
             def submit_bundle(session, xml):
                 """Proxy 动作出口：XML bundle 投统一时间序队列。
-                入队成功即 ActionResult.ok（执行结果由旅程异步完成）。"""
+                入队成功即 ActionResult.ok（执行结果由旅程异步完成）。
+                黑名单会话（系统/feed）直接拒收且不重试。"""
                 entry = queue.push_action(session, xml)
-                return ActionResult(ok=entry is not None)
+                if entry is None:
+                    return ActionResult(
+                        ok=False, error="会话被黑名单拦截",
+                        retryable=False)
+                return ActionResult(ok=True)
 
             provider = create_provider(
                 prefer=runtime.get("decision_provider", "kimi"),
@@ -194,8 +203,11 @@ def assemble(workspace_root, config_path, with_device=True):
     return comp, manifest
 
 
-def _assemble_interaction(comp, manifest, tools, dirs, runtime, queue, conn):
-    """端口就绪后的交互层装配（全部依赖注入，不碰全局状态）。"""
+def _assemble_interaction(comp, manifest, tools, dirs, runtime, queue, conn,
+                          collect=False):
+    """端口就绪后的交互层装配（全部依赖注入，不碰全局状态）。
+
+    collect=True：只读采集模式——不执行/丢弃 action，禁用好友自动通过。"""
     from .interaction.ports.android.action.navigator import Navigator
     from .interaction.ports.android.action.sender import Sender
     from .interaction.ports.android.perception.frame_bus import FrameBus
@@ -259,13 +271,19 @@ def _assemble_interaction(comp, manifest, tools, dirs, runtime, queue, conn):
     comp["on_log_updated"] = on_log_updated
 
     journey = JourneyManager(queue, session_reader, bundle_sender,
-                             navigator, on_log_updated=on_log_updated)
+                             navigator, on_log_updated=on_log_updated,
+                             collect=collect)
+    # 花名册扫描「休眠」信号：RosterSweep 与 InteractionLoop 共享，
+    # 扫描期间置位 → 主循环暂停正常活动，把手机让给凌晨爬取。
+    maintenance = threading.Event()
     # InteractionLoop 内部对 wake_and_dim / sweep 已有 try/except 健康检查，
     # 运行期设备掉线按周期容错，不额外包装。
     loop = InteractionLoop(scanner, watcher, queue, journey, tools,
-                           config=runtime)
+                           config=runtime, maintenance=maintenance,
+                           collect=collect)
     comp["journey"] = journey
     comp["loop"] = loop
+    comp["maintenance"] = maintenance
     manifest.append("loop: JourneyManager + InteractionLoop "
                     "(config 热读取自 runtime)")
 
@@ -424,6 +442,8 @@ def main(argv=None):
                         help="只装配不启动：打印装配清单后退出（不触设备）")
     parser.add_argument("--once", action="store_true",
                         help="主循环只跑一轮（冒烟用）")
+    parser.add_argument("--collect", action="store_true",
+                        help="采集模式：不装配决策层 Proxy（只读消息入库，不回复）")
     parser.add_argument("--with-gateway", action="store_true",
                         help="开发模式：本进程内嵌网关线程（生产用独立网关进程，"
                              "见 run.sh / python -m src.gateway）")
@@ -437,7 +457,8 @@ def main(argv=None):
 
     with_device = not args.dry_run
     comp, manifest = assemble(args.workspace, args.config,
-                              with_device=with_device)
+                              with_device=with_device,
+                              with_decision=not args.collect)
 
     print("════ 装配清单 ════")
     for line in manifest:
@@ -474,6 +495,25 @@ def main(argv=None):
     else:
         log.info("独立网关模式：本进程不内嵌网关，"
                  "管理面请访问 python -m src.gateway（run.sh）")
+
+    # 凌晨3点花名册扫描线程：休眠后检测未获取的会话并逐个爬取（daemon）。
+    # 采集模式跳过：花名册爬取会长时间占用设备，与「只采集消息」冲突。
+    if args.collect:
+        log.info("collect 模式：跳过 roster sweep 线程（不爬花名册）")
+    else:
+        try:
+            from .interaction.loop.roster_sweep import RosterSweep
+            roster_sweep = RosterSweep(
+                db_path=comp["msglog_path"],
+                maintenance=comp.get("maintenance"),
+            )
+            _t = threading.Thread(target=roster_sweep.run_forever,
+                                  daemon=True, name="roster-sweep")
+            _t.start()
+            comp["roster_sweep"] = roster_sweep
+            log.info("roster sweep thread started（凌晨3点花名册扫描）")
+        except Exception as e:  # noqa: BLE001
+            log.warning("roster sweep 线程启动失败（不影响主流程）: %s", e)
 
     loop = comp["loop"]
     try:

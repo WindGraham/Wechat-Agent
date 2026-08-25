@@ -44,6 +44,9 @@ class Reader:
         self.frame_bus = frame_bus
         self.dev = tools.dev
         self._conn = conn if conn is not None else msg_log.connect(db_path)
+        # 花名册双因子匹配器缓存：group_name -> RosterMatcher|None（懒加载，
+        # 同一群多次同步/翻页复用，避免每帧重载 500 人头像模板）
+        self._roster_matchers = {}
 
     # ---------------------------------------------------------- 当前屏
     # 过渡帧重试上限：搜索/列表进聊天页有 1~2s 转场动画，capture 可能截到
@@ -51,11 +54,11 @@ class Reader:
     # 见 docs/BUGREPORT_TIMING_RACE_20260810.md §3.1）
     READ_PAGE_RETRIES = 2
 
-    def read_current(self):
+    def read_current(self, session=None):
         """读取当前屏（不滑动）。返回 (entries 早→晚, state)。
 
         聊天页优先走 chat_slicer（头像顶切段：昵称/multimedia/partial 标记），
-        失败降级旧的 elements 转换。"""
+        失败降级旧的 elements 转换。session 为会话名（群聊用于花名册双因子识别）。"""
         state = self.frame_bus.capture()
         # 过渡帧兜底：本方法只在旅程已进入会话后调用，页面理应是聊天页；
         # 截到非聊天页帧 = 转场动画未结束，等它稳定后重截，最多
@@ -68,7 +71,7 @@ class Reader:
                         retry + 1, self.READ_PAGE_RETRIES)
             self.dev.wait_random(600, 1000)
             state = self.frame_bus.capture()
-        entries = self._slice_entries(state)
+        entries = self._slice_entries(state, session=session)
         if entries is None:
             entries = self._state_to_entries(state)
         return entries, state
@@ -93,10 +96,12 @@ class Reader:
         self.dev.wait_random(600, 1000)
 
     # ---------------------------------------------------------- chat_slicer 集成
-    def _slice_entries(self, state):
+    def _slice_entries(self, state, session=None):
         """聊天页用 chat_slicer 重解析当前屏 → SnapEntry 列表（含昵称/归档）。
 
-        返回 None 表示不适用（非聊天页/无图/失败），调用方降级。"""
+        群聊且 session 有对应花名册时注入 RosterMatcher，做头像+昵称双因子
+        识别（matched_user_name / uncertain_entity）。返回 None 表示不适用
+        （非聊天页/无图/失败），调用方降级。"""
         try:
             if state.get("page", {}).get("type") != "wechat_chat":
                 # 不许静默：过渡帧/卡页时返回 None 会让 sync 读到空且
@@ -119,7 +124,10 @@ class Reader:
             from .ocr_engine import run_ocr
             from .chat_slicer import slice_chat
             ocr_items = run_ocr(img)
-            sliced = slice_chat(img, ocr_items, is_group=is_group, title=title)
+            rm = (self._roster_matcher_for(session)
+                  if (is_group and session) else None)
+            sliced = slice_chat(img, ocr_items, is_group=is_group, title=title,
+                                roster_matcher=rm)
             msgs = sliced.get("messages", [])
             # 多媒体归档（WP7）：裁图存会话专目录 + media_id 标注。
             # quote 消息正文段可能是图片/视频（引用+媒体），一并归档
@@ -136,6 +144,39 @@ class Reader:
         except Exception:  # noqa: BLE001
             log.exception("chat_slicer integration failed, fallback")
             return None
+
+    def _roster_matcher_for(self, session):
+        """session 名 → 花名册 RosterMatcher（懒加载 + 缓存）。
+
+        群聊双因子识别（头像+昵称）用。OCR 会话名可能与花名册目录名有
+        括号人数/混淆字符差异，用 name_match 容错解析到已爬取的花名册目录；
+        找不到返回 None（slice_chat 降级为纯昵称 OCR，行为同现状）。
+        """
+        if not session:
+            return None
+        if session in self._roster_matchers:
+            return self._roster_matchers[session]
+        matcher = None
+        try:
+            from .roster_matcher import RosterMatcher, ROSTERS_DIR
+            from .....shared.name_match import _name_match
+            key = None
+            if os.path.isdir(os.path.join(ROSTERS_DIR, session)):
+                key = session
+            elif os.path.isdir(ROSTERS_DIR):
+                for d in sorted(os.listdir(ROSTERS_DIR)):
+                    if d.startswith(".") or not os.path.isdir(
+                            os.path.join(ROSTERS_DIR, d)):
+                        continue
+                    if _name_match(session, d):
+                        key = d
+                        break
+            if key:
+                matcher = RosterMatcher(key)
+        except Exception:  # noqa: BLE001
+            log.exception("roster matcher resolve failed: %s", session)
+        self._roster_matchers[session] = matcher
+        return matcher
 
     @staticmethod
     def _msg_to_entry(m, title, is_group):
@@ -204,7 +245,7 @@ class Reader:
         known = list(msg_log.session_tail(self._conn, sid, n=30))
 
         state = self.snap_settled(min_entries=1)
-        backlog = [self._entries_of(state)]
+        backlog = [self._entries_of(state, session=name)]
         last_keys = [(e.sender, e.content) for e in backlog[0]]
 
         stuck = 0
@@ -218,7 +259,7 @@ class Reader:
                     self._is_miniapp_panel(state):
                 log.warning("[%s] 触发下拉小程序面板，中止积压收集", name)
                 break
-            cur = self._entries_of(state)
+            cur = self._entries_of(state, session=name)
             keys = [(e.sender, e.content) for e in cur]
             if not cur or keys == last_keys:        # 懒加载未完成/滚不动
                 stuck += 1
@@ -249,10 +290,10 @@ class Reader:
                 if not r.success or r.page != "wechat_chat":
                     raise RuntimeError(f"backlog 后无法回到会话 {name}: {r.error}")
                 state = self.frame_bus.capture()
-                bottom_screens.append(self._entries_of(state))
+                bottom_screens.append(self._entries_of(state, session=name))
                 break
             state = self.snap_settled(min_entries=1)
-            cur = self._entries_of(state)
+            cur = self._entries_of(state, session=name)
             keys = [(e.sender, e.content) for e in cur]
             if not cur or keys == last_bottom_keys:
                 log.info("[%s] 已到底部（连续两屏相同），停", name)
@@ -271,9 +312,9 @@ class Reader:
         return merged, state
 
     # ---------------------------------------------------------- 转换/匹配
-    def _entries_of(self, state):
-        """chat_slicer 优先，失败降级 elements 转换。"""
-        entries = self._slice_entries(state)
+    def _entries_of(self, state, session=None):
+        """chat_slicer 优先，失败降级 elements 转换。session 用于花名册识别。"""
+        entries = self._slice_entries(state, session=session)
         if entries is not None:
             return entries
         return self._state_to_entries(state)

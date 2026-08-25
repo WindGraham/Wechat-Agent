@@ -65,9 +65,12 @@ CENTER_GRAY_MEAN_MAX = 180
 
 
 # ---------------------------------------------------------------- 掩膜
-def _build_masks(img, gray, hsv, bg):
-    """内容区行带内的三类掩膜（与 chat_parser 同定义）：灰泡/绿泡/非背景。"""
-    Y0, Y1 = LC.CONTENT_Y0, LC.INPUT_BAR_Y0
+def _build_masks(img, gray, hsv, bg, cy0=LC.CONTENT_Y0, cy1=LC.INPUT_BAR_Y0):
+    """内容区行带内的三类掩膜（与 chat_parser 同定义）：灰泡/绿泡/非背景。
+
+    cy0/cy1：识别区域上下界（整屏=内容区 [CONTENT_Y0, 输入栏顶]；
+    union 拼接图=整图 [0, union高]，见 history_collect.stitch_union）。"""
+    Y0, Y1 = cy0, cy1
 
     def _banded(band_mask):
         full = np.zeros(gray.shape, np.uint8)
@@ -92,7 +95,7 @@ def _carve(mask, rect):
     mask[y0:y1, x0:x1] = 0
 
 
-def _capsule_rects(ocr_items):
+def _capsule_rects(ocr_items, cy0=LC.CONTENT_Y0, cy1=LC.INPUT_BAR_Y0):
     """悬浮胶囊（"有人@我"/"N条新消息"）外扩区域：头像检测前挖掉防误判。"""
     rects = []
     cx0_, cy0_, cx1_, cy1_ = LC.CAPSULE_SCAN
@@ -102,9 +105,9 @@ def _capsule_rects(ocr_items):
                 "有人@我" in text_n or LC.NEW_MSG_RE.search(text_n)):
             x0, y0, x1, y1 = (int(v) for v in it["box"])
             rects.append((max(0, x0 - LC.CAPSULE_PAD_L),
-                          max(LC.CONTENT_Y0, y0 - LC.CAPSULE_PAD_T),
+                          max(cy0, y0 - LC.CAPSULE_PAD_T),
                           min(LC.SCREEN_W, x1 + LC.CAPSULE_PAD_R),
-                          min(LC.INPUT_BAR_Y0, y1 + LC.CAPSULE_PAD_B)))
+                          min(cy1, y1 + LC.CAPSULE_PAD_B)))
     return rects
 
 
@@ -115,11 +118,11 @@ def _avatar_ok(w, h):
             and LC.AVATAR_ASPECT_LO < w / h < LC.AVATAR_ASPECT_HI)
 
 
-def _avatar_edge_ok(y, h):
-    """残缺头像（只露半个）只接受贴屏幕内容区顶/底的候选"""
+def _avatar_edge_ok(y, h, cy0=LC.CONTENT_Y0, cy1=LC.INPUT_BAR_Y0):
+    """残缺头像（只露半个）只接受贴识别区域顶/底的候选"""
     return AVATAR_EDGE_MIN_H <= h < LC.AVATAR_MIN_H \
-        and (y <= LC.CONTENT_Y0 + AVATAR_EDGE_MARGIN
-             or y + h >= LC.INPUT_BAR_Y0 - AVATAR_EDGE_MARGIN)
+        and (y <= cy0 + AVATAR_EDGE_MARGIN
+             or y + h >= cy1 - AVATAR_EDGE_MARGIN)
 
 
 def _card_gray_frac(gray, hsv, x, y, w, h):
@@ -262,12 +265,13 @@ def _find_text_bubble(side, seg_y0, seg_y1, gray_comps, green_comps,
 
 
 # ---------------------------------------------------------------- 昵称（§2.10 实测规格）
-def _read_nickname(img, gray, hsv, avatar):
+def _read_nickname(img, gray, hsv, avatar,
+                   cy0=LC.CONTENT_Y0, cy1=LC.INPUT_BAR_Y0):
     """裁昵称条带验证灰色文字存在 + 放大 3x 只走识别器。
     返回 (nickname, ok)；灰色文字不存在或读不出 → (None, False)。"""
     ax_r = avatar["x"] + avatar["w"]
-    y0 = max(LC.CONTENT_Y0, avatar["y"] + NICK_DY0)
-    y1 = min(LC.INPUT_BAR_Y0, avatar["y"] + NICK_DY1)
+    y0 = max(cy0, avatar["y"] + NICK_DY0)
+    y1 = min(cy1, avatar["y"] + NICK_DY1)
     x0 = min(LC.SCREEN_W - 1, ax_r + NICK_DX0)
     x1 = LC.SCREEN_W              # 不限右界：长昵称不截断（该行高只有昵称）
     if y1 <= y0 or x1 <= x0:
@@ -440,19 +444,28 @@ def _comp_outline(mask, comp, epsilon=None):
 
 
 # ---------------------------------------------------------------- 主入口
-def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
+def slice_chat(img, ocr_items, is_group, title, roster_matcher=None,
+               content_y0=None, content_y1=None):
     """头像顶切段解析聊天页。
-    img: BGR 全屏截图；ocr_items: run_ocr 格式列表（调用方传入，不被修改）；
+    img: BGR 截图（全屏 或 两屏缝合 union，见 history_collect.stitch_union）；
+    ocr_items: run_ocr 格式列表（调用方传入，不被修改）；
     is_group: 群聊才读昵称；title: 会话名（保留入参，当前仅透传）。
     roster_matcher: 可选的花名册双因子匹配器 (RosterMatcher 实例)。
+    content_y0/content_y1: 识别区域上下界。默认内容区 [LC.CONTENT_Y0,
+    LC.INPUT_BAR_Y0]（整屏）；union 拼接图传 (0, union高)——内容区是整图，
+    不再有固定标题栏/输入栏。所有纵向边界判定（段切分/头像残缺/完整性）
+    都按此区域，不再硬编码全屏常量（设计文档 §9 #2）。
     返回 {"messages":[msg...], "is_group":bool, "avatar_count":int}。"""
+    cy0 = LC.CONTENT_Y0 if content_y0 is None else int(content_y0)
+    cy1 = LC.INPUT_BAR_Y0 if content_y1 is None else int(content_y1)
+    cmid = cy0 + (cy1 - cy0) // 2
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    bg = estimate_bg(gray, 400, LC.CONTENT_Y1)
-    bubble_mask, green_mask, nonbg = _build_masks(img, gray, hsv, bg)
+    bg = estimate_bg(gray, 400, cy1)
+    bubble_mask, green_mask, nonbg = _build_masks(img, gray, hsv, bg, cy0, cy1)
 
     # ---- 挖掉悬浮胶囊与全宽细条（置顶条），防止被当成头像/气泡
-    capsule_rects = _capsule_rects(ocr_items)
+    capsule_rects = _capsule_rects(ocr_items, cy0, cy1)
     nonbg_side = nonbg.copy()
     for r in capsule_rects:
         _carve(bubble_mask, r)
@@ -461,6 +474,13 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
     gray_comps = comps_from_mask(bubble_mask, min_area=LC.BUBBLE_MIN_AREA,
                                  close_ksize=9, min_w=LC.BUBBLE_MIN_W,
                                  min_h=LC.BUBBLE_MIN_H)
+    # ---- 置顶消息条（chat_parser bars 同判据）：顶部全宽细条（w>900、h<170、
+    # x<30、y<600），是固定 UI 不是消息。记录后把条内 OCR 文字标记 consumed，
+    # 防止漏进任何消息文本（2026-08-14 用户反馈：置顶信息被识别进文本区）。
+    pinned_rects = [(c[0], c[1], c[0] + c[2], c[1] + c[3])
+                    for c in gray_comps
+                    if c[2] > BUBBLE_MAX_W and c[3] < 170
+                    and c[0] < 30 and c[1] < 600]
     for c in gray_comps:
         if c[2] > BUBBLE_MAX_W and c[3] < 200:      # 全宽细条（置顶/引用预览）
             _carve(nonbg_side, (c[0], c[1], c[0] + c[2], c[1] + c[3]))
@@ -474,7 +494,7 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
         x, y, w, h, area = c
         if w > BUBBLE_MAX_W and h < 170:
             continue            # 全宽细条（置顶/引用预览条），非消息引用块
-        if y + h / 2 > LC.INPUT_BAR_Y0 - 60:
+        if y + h / 2 > cy1 - 60:
             continue            # 输入栏附近的深色块（麦克风/加号面板）不是引用
         # 排除表情/小图标/普通文本泡（单行短词如 "G"）
         if w < 100 or h < 35:
@@ -497,11 +517,11 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
 
     # ---- 头像切段
     avatars = _merge_avatars(_detect_avatars(
-        gray, hsv, nonbg_side, LC.CONTENT_Y0, LC.INPUT_BAR_Y0))
+        gray, hsv, nonbg_side, cy0, cy1))
     # 保险丝：段高 >600 → 段内放宽阈值重扫（§2.9 细则 2）
     tops = [a["y"] for a in avatars]
     rescan_spans = []
-    bounds = [LC.CONTENT_Y0] + tops + [LC.INPUT_BAR_Y0]
+    bounds = [cy0] + tops + [cy1]
     for a, b in zip(bounds, bounds[1:]):
         if b - a > SEG_RESCAN_MIN_H:
             rescan_spans.append((a, b))
@@ -516,6 +536,12 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
             avatars = _merge_avatars(avatars + new)
 
     consumed = [False] * len(ocr_items)
+    # 置顶消息条文字不参与消息识别：条内 OCR 文字直接 consumed（防止被多媒体
+    # 段/居中灰小字等路径收进某条消息的 content）。
+    for _i, _it in enumerate(ocr_items):
+        if any(rect_contains((r[0] - 8, r[1] - 8, r[2] + 16, r[3] + 16),
+                             _it["cx"], _it["cy"]) for r in pinned_rects):
+            consumed[_i] = True
     messages = []           # (sort_y, msg)
 
     # ---- 段定义：屏幕顶→首头像顶为残缺段；末头像顶→内容区底为末段
@@ -527,14 +553,14 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
     seg_bounds = [(a["y"], a) for a in avatars]
     segments = []           # (y0, y1, avatar|None)
     if seg_bounds:
-        if seg_bounds[0][0] > LC.CONTENT_Y0 + 2:
-            segments.append((LC.CONTENT_Y0, seg_bounds[0][0], None))
+        if seg_bounds[0][0] > cy0 + 2:
+            segments.append((cy0, seg_bounds[0][0], None))
         for i, (top, av) in enumerate(seg_bounds):
             y1 = seg_bounds[i + 1][0] if i + 1 < len(seg_bounds) \
-                else LC.INPUT_BAR_Y0
+                else cy1
             segments.append((av["y"], y1, av))
     else:
-        segments.append((LC.CONTENT_Y0, LC.INPUT_BAR_Y0, None))
+        segments.append((cy0, cy1, None))
 
     for seg_y0, seg_y1, avatar in segments:
         partial_top_seg = avatar is None
@@ -638,7 +664,7 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
                     (i for i, it in enumerate(ocr_items)
                      if not consumed[i]
                      and seg_y0 <= it["cy"] < seg_y1
-                     and it["cy"] < LC.INPUT_BAR_Y0 - 95
+                     and it["cy"] < cy1 - 95
                      and not any(rect_contains(
                          (r[0], r[1], r[2] - r[0], r[3] - r[1]),
                          it["cx"], it["cy"]) for r in capsule_rects)),
@@ -684,7 +710,8 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
             # ---- 昵称（仅群聊 other 段）
             nickname = None
             if is_group and side == "other":
-                nickname, nick_ok = _read_nickname(img, gray, hsv, avatar)
+                nickname, nick_ok = _read_nickname(
+                    img, gray, hsv, avatar, cy0, cy1)
                 if not nick_ok:
                     low_confidence = True
                 # 昵称行偶发被 OCR 行分配粘进内容首行：剥离，sender/content 分离
@@ -708,7 +735,7 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
                         if x < av_x1 and y < av_y1_off:
                             continue
                         # 排除输入栏右侧的 UI 元素（加号/语音按钮等，贴输入栏）
-                        if x > 700 and seg_y0 + y > LC.INPUT_BAR_Y0 - 150:
+                        if x > 700 and seg_y0 + y > cy1 - 150:
                             continue
                         valid_comps.append(c)
                     if valid_comps:
@@ -720,15 +747,15 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
                         bubble_rect = [int(xs0), int(seg_y0 + ys0), int(xs1 - xs0), int(ys1 - ys0)]
             partial_bottom = bool(is_last and (
                 bubble_rect is None
-                or bubble_rect[1] + bubble_rect[3] >= LC.INPUT_BAR_Y0 - 60
-                or avatar["y"] + avatar["h"] >= LC.INPUT_BAR_Y0 - 60))
+                or bubble_rect[1] + bubble_rect[3] >= cy1 - 60
+                or avatar["y"] + avatar["h"] >= cy1 - 60))
             msg = {
                 "side": side, "nickname": nickname,
                 "content_type": content_type, "lines": lines,
                 "content": content, "content_norm": normalize_text(content),
-                "partial_top": (avatar["y"] <= LC.CONTENT_Y0 + 2
-                                or (avatar["h"] < AVATAR_PARTIAL_H
-                                    and avatar["y"] < LC.SCREEN_H // 2)),
+                "partial_top": bool(
+                    avatar["h"] < AVATAR_PARTIAL_H
+                    and avatar["y"] < cmid),
                 "partial_bottom": partial_bottom,
                 "avatar": {"x": avatar["x"], "y": avatar["y"],
                            "w": avatar["w"], "h": avatar["h"],
@@ -750,6 +777,10 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
                 sq_dim = max(aw, ah)
                 crop = img[ay:min(img.shape[0], ay+sq_dim), ax:min(img.shape[1], ax+sq_dim)]
                 matched, matched_name, _info = roster_matcher.match_dual_factor(crop, nickname)
+                # 匹配度数值（2026-08-14：头像分/昵称分/候选昵称，供可视化）
+                msg["avatar_score"] = _info.get("avatar_score")
+                msg["nick_score"] = _info.get("nick_score")
+                msg["avatar_cand"] = _info.get("avatar_cand")
                 if matched:
                     msg["matched_user_name"] = matched_name
                     msg["uncertain_entity"] = False
@@ -789,7 +820,7 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
                 "side": None, "nickname": None,
                 "content_type": "quote", "lines": text.split("\n"),
                 "content": text, "content_norm": normalize_text(text),
-                "partial_top": qy <= LC.CONTENT_Y0 + 2,
+                "partial_top": qy <= cy0 + 2,
                 "partial_bottom": False,
                 "avatar": None, "bubble_rect": list(qc[:4]),
                 "outline": None, "low_confidence": False,
@@ -800,10 +831,13 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
     
     # 填充每一条消息的 y_top 和 y_bottom（准确界定范围，精细包络时间戳/气泡，排除输入栏）
     msg_list = [m for _, m in messages]
-    input_bar_y = LC.INPUT_BAR_Y0
+    input_bar_y = cy1
     for idx, msg in enumerate(msg_list):
         msg_y = msg.get("y", 0)
         ctype = msg.get("content_type")
+        # 记录识别区域边界，供 classify_message 用区域而非全屏常量夹取坐标
+        msg["content_y0"] = cy0
+        msg["content_y1"] = cy1
         
         # 1. 顶边界 y_top 计算
         if ctype == "time_divider":
@@ -817,7 +851,7 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
             else:
                 y_top = max(0, msg_y - 12)
                 av = msg.get("avatar")
-                if av and av["y"] >= LC.CONTENT_Y0 + 30:
+                if av and av["y"] >= cy0 + 30:
                     y_top = min(y_top, max(0, av["y"] - 12))
                 b_rect = msg.get("bubble_rect")
                 if b_rect:
@@ -832,7 +866,7 @@ def slice_chat(img, ocr_items, is_group, title, roster_matcher=None):
             
             # 下一条消息的真实起始顶界（头像顶/消息顶/引用顶/时间戳顶）
             next_top = next_y
-            if next_av and next_av["y"] >= LC.CONTENT_Y0 + 30:
+            if next_av and next_av["y"] >= cy0 + 30:
                 next_top = min(next_top, next_av["y"])
             next_b_rect = next_msg.get("bubble_rect")
             if next_b_rect:
@@ -889,61 +923,67 @@ STATE_SYSTEM = "system"                # 时间戳/系统消息（天生完整�
 def classify_message(msg):
     """判定一条 slice_chat 消息的完整性四态。
 
-    返回 dict: {state, y_top, y_bottom}。y_top/y_bottom 硬约束在内容区
-    [LC.CONTENT_Y0, LC.INPUT_BAR_Y0] 内，绝不裁到顶部置顶条和底部输入栏。
+    返回 dict: {state, y_top, y_bottom}。y_top/y_bottom 硬约束在识别区域
+    [content_y0, content_y1] 内（整屏=内容区 [LC.CONTENT_Y0, LC.INPUT_BAR_Y0]；
+    union 缝合图=整图，坐标由 slice_chat 写入 msg），绝不裁到固定 UI。
+
+    完整性按设计文档 §4：一条消息完整 ⟺ [本条头像顶, 下条头像顶] 两条边界
+    都在识别区域内（slice_chat 的段边界 + partial_top/partial_bottom 即此语义）。
 
     判定顺序（优先级从高到低）：
       1. 系统/时间戳 → system
-      2. partial_top 且 partial_bottom → both_clipped（超长消息跨全屏）
+      2. partial_top 且 partial_bottom → both_clipped（超长消息跨整个区域）
       3. partial_top → top_clipped
       4. partial_bottom → bottom_clipped
       5. 无头像或身份识别失败 → unidentifiable
       6. 否则 → complete
     """
+    cy0 = int(msg.get("content_y0", LC.CONTENT_Y0))
+    cy1 = int(msg.get("content_y1", LC.INPUT_BAR_Y0))
     ctype = msg.get("content_type")
     if ctype in ("time_divider", "system"):
         return {"state": STATE_SYSTEM,
-                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
-                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+                "y_top": max(cy0, int(msg.get("y_top", 0))),
+                "y_bottom": min(cy1, int(msg.get("y_bottom", 0)))}
 
     pt = bool(msg.get("partial_top"))
     pb = bool(msg.get("partial_bottom"))
 
     if pt and pb:
         return {"state": STATE_BOTH_CLIP,
-                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
-                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+                "y_top": max(cy0, int(msg.get("y_top", 0))),
+                "y_bottom": min(cy1, int(msg.get("y_bottom", 0)))}
     if pt:
         return {"state": STATE_TOP_CLIP,
-                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
-                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+                "y_top": max(cy0, int(msg.get("y_top", 0))),
+                "y_bottom": min(cy1, int(msg.get("y_bottom", 0)))}
     if pb:
         return {"state": STATE_BOTTOM_CLIP,
-                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
-                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+                "y_top": max(cy0, int(msg.get("y_top", 0))),
+                "y_bottom": min(cy1, int(msg.get("y_bottom", 0)))}
 
     # 自己的消息（side=self）：身份就是"自己"，无需昵称行
     if msg.get("side") == "self":
         return {"state": STATE_COMPLETE,
-                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
-                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+                "y_top": max(cy0, int(msg.get("y_top", 0))),
+                "y_bottom": min(cy1, int(msg.get("y_bottom", 0)))}
 
     # 无头像 → 识别不了（孤儿引用块 / 头像检测失败）
     avatar = msg.get("avatar")
     if avatar is None:
         return {"state": STATE_UNIDENTIFIABLE,
-                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
-                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+                "y_top": max(cy0, int(msg.get("y_top", 0))),
+                "y_bottom": min(cy1, int(msg.get("y_bottom", 0)))}
 
     # 身份识别失败（昵称 OCR 失败 且 头像双因子匹配失败）
     nickname = msg.get("nickname")
     matched = msg.get("matched_user_name")
     if not nickname and not matched:
         return {"state": STATE_UNIDENTIFIABLE,
-                "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
-                "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+                "y_top": max(cy0, int(msg.get("y_top", 0))),
+                "y_bottom": min(cy1, int(msg.get("y_bottom", 0)))}
 
-    # 完整：头像 + 昵称 + 正文都在屏内
+    # 完整：头像 + 昵称 + 正文都在区域内
     return {"state": STATE_COMPLETE,
-            "y_top": max(LC.CONTENT_Y0, int(msg.get("y_top", 0))),
-            "y_bottom": min(LC.INPUT_BAR_Y0, int(msg.get("y_bottom", 0)))}
+            "y_top": max(cy0, int(msg.get("y_top", 0))),
+            "y_bottom": min(cy1, int(msg.get("y_bottom", 0)))}

@@ -64,7 +64,8 @@
 let curGroup = null;
 let page = 1;
 const PAGE_SIZE = 30;
-let lastMaxTs = null;   // 当前最新消息时间戳，用于检测新消息
+let maxCapturedTs = null;   // 当前群已见最大采集时间 ts_captured（增量轮询水位）
+let groupsCache = {};       // name -> {cnt, last_ts, ...}
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -82,7 +83,10 @@ function firstChar(s) { return (s || '?').trim().charAt(0); }
 async function loadGroups() {
   const r = await fetch('/api/messages/groups');
   const d = await r.json();
+  groupsCache = {};
+  for (const g of d.groups) groupsCache[g.name] = g;
   const el = document.getElementById('groups');
+  const scrollTop = el.scrollTop;   // 重建侧栏不重置滚动位置
   el.innerHTML = '';
   for (const g of d.groups) {
     const div = document.createElement('div');
@@ -91,6 +95,7 @@ async function loadGroups() {
     div.onclick = () => selectGroup(g.name);
     el.appendChild(div);
   }
+  el.scrollTop = scrollTop;
 }
 
 async function selectGroup(name) {
@@ -98,8 +103,9 @@ async function selectGroup(name) {
   page = 1;
   document.getElementById('cur-group').textContent = name;
   document.getElementById('msg-list').innerHTML = '<div class="empty">加载中…</div>';
+  await loadGroups();                                  // 先拿最新计数/采集水位
+  maxCapturedTs = groupsCache[name] ? (groupsCache[name].last_ts ?? null) : null;
   await loadMessages(true);
-  await loadGroups();  // 刷新高亮
 }
 
 async function loadMessages(reset) {
@@ -110,7 +116,6 @@ async function loadMessages(reset) {
   document.getElementById('cur-meta').textContent = `共 ${d.total} 条消息`;
   if (reset) {
     document.getElementById('msg-list').innerHTML = '';
-    lastMaxTs = d.messages.length ? d.messages[0].ts_captured : null;
   }
   if (!d.messages.length && reset) {
     document.getElementById('msg-list').innerHTML = '<div class="empty">暂无消息</div>';
@@ -130,6 +135,9 @@ async function loadMessages(reset) {
 function buildMsg(m) {
   const div = document.createElement('div');
   div.className = 'msg' + (m.crop_path ? ' has-crop' : '');
+  // 排序键：发送时间 ts_hint 优先，无锚用采集时间 ts_captured（与 list API 一致）
+  div.dataset.sk = m.ts_hint ?? m.ts_captured;
+  div.dataset.seq = m.seq;
   if (m.crop_path) div.dataset.crop = '/workspace/' + m.crop_path;
   const tag = m.content_type === 'image' || m.content_type === 'multimedia' ? '<span class="tag tag-img">多媒体</span>'
             : m.content_type === 'quote' ? '<span class="tag tag-quote">引用</span>'
@@ -158,28 +166,55 @@ async function loadMore() {
   await loadMessages(false);
 }
 
-// 实时更新：每 4 秒拉最新一页，检测是否有新消息
-async function pollNew() {
-  if (!curGroup) return;
-  try {
-    const r = await fetch(`/api/messages/list?group=${encodeURIComponent(curGroup)}&page=1&page_size=10`);
-    const d = await r.json();
-    if (d.messages.length && d.messages[0].ts_captured !== lastMaxTs) {
-      // 有新消息：追加到底部（最新在底）
-      const newOnes = [];
-      for (const m of d.messages) {
-        if (m.ts_captured === lastMaxTs) break;
-        newOnes.push(m);
+// 把新采集的消息按发送时间插到正确位置（列表 DOM 恒为「旧→新」自上而下）
+function insertNew(messages) {
+  const list = document.getElementById('msg-list');
+  const msgNodes = [...list.querySelectorAll('.msg')];
+  const seenSeqs = new Set(msgNodes.map(n => Number(n.dataset.seq)));
+  for (const m of messages) {
+    if (seenSeqs.has(m.seq)) continue;   // 切群/拉取竞态：已渲染的跳过
+    const sk = m.ts_hint ?? m.ts_captured;
+    const node = buildMsg(m);
+    seenSeqs.add(m.seq);
+    let inserted = false;
+    for (let i = 0; i < msgNodes.length; i++) {
+      const esk = Number(msgNodes[i].dataset.sk);
+      const eseq = Number(msgNodes[i].dataset.seq);
+      if (esk > sk || (esk === sk && eseq > m.seq)) {
+        list.insertBefore(node, msgNodes[i]);
+        msgNodes.splice(i, 0, node);   // 保持 msgNodes 与 DOM 同步
+        inserted = true;
+        break;
       }
-      if (newOnes.length) {
-        renderMessages(newOnes, 'bottom');   // 新消息追加到底部（最新在底）
-        const list = document.getElementById('msg-list');
-        list.scrollTop = list.scrollHeight;
-      }
-      lastMaxTs = d.messages[0].ts_captured;
-      document.getElementById('cur-meta').textContent = `共 ${d.total} 条消息`;
     }
-  } catch (e) {}
+    if (!inserted) {
+      list.appendChild(node);
+      msgNodes.push(node);
+    }
+  }
+  const emptyEl = list.querySelector('.empty');
+  if (emptyEl) emptyEl.remove();
+}
+
+// 实时更新：每 4 秒按采集时间 ts_captured 增量拉新入库消息
+async function pollNew() {
+  if (curGroup) {
+    try {
+      const since = maxCapturedTs ?? 0;
+      const r = await fetch(`/api/messages/latest?group=${encodeURIComponent(curGroup)}&since_ts=${since}&limit=500`);
+      const d = await r.json();
+      if (d.ok && d.messages && d.messages.length) {
+        insertNew(d.messages);
+        if (d.max_ts != null) maxCapturedTs = d.max_ts;
+      }
+    } catch (e) {}
+  }
+  // 侧栏计数始终刷新（未选群时也是"在采"信号），并顺带更新当前群的 meta 计数
+  await loadGroups();
+  const meta = document.getElementById('cur-meta');
+  if (meta && curGroup && groupsCache[curGroup]) {
+    meta.textContent = `共 ${groupsCache[curGroup].cnt} 条消息`;
+  }
 }
 
 loadGroups();

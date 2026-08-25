@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>书签展示 · 全屏 / 内容区裁切</title>
+<style>
+  :root {
+    --canvas: #0d1017; --ink: #d7dce4; --muted: #8b93a3;
+    --panel: #141a24; --elev: #1a2230; --hairline: #2a3140;
+    --accent: #4c8dff; --green: #3fb950; --coral: #ff6b5e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: var(--canvas); color: var(--ink); margin: 0; padding: 24px; line-height: 1.5;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { font-size: 13px; color: var(--muted); margin-bottom: 20px; }
+  a.back { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--hairline); border-radius: 12px;
+    padding: 20px; margin-bottom: 24px;
+  }
+  .card-head {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--hairline); padding-bottom: 10px; margin-bottom: 16px;
+  }
+  .card-head .name { font-size: 16px; font-weight: 600; }
+  .card-head .meta { font-size: 12px; color: var(--muted); }
+  .shots { display: flex; gap: 28px; align-items: flex-start; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 300px; }
+  .col .label { font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 8px;
+                text-transform: uppercase; letter-spacing: .06em; }
+  .col .label b { color: var(--ink); }
+  .imgwrap { position: relative; display: inline-block; }
+  .imgwrap img {
+    display: block; max-width: 380px; height: auto;
+    border: 1px solid var(--hairline); border-radius: 8px;
+    cursor: zoom-in; background: #000;
+  }
+  /* 全屏图上标出内容区裁切范围（置顶条已排除，从内容顶开始） */
+  .crop-region {
+    position: absolute; left: 0; width: 100%; box-sizing: border-box;
+    border: 2px solid var(--green); background: rgba(63, 185, 80, 0.08);
+    pointer-events: none;
+  }
+  .crop-region .tag {
+    position: absolute; left: 0; top: -20px;
+    font-size: 10px; color: var(--green); font-weight: 700; white-space: nowrap;
+    background: rgba(13,16,23,.85); padding: 1px 6px; border-radius: 4px;
+    font-style: normal;
+  }
+  .empty { color: var(--muted); font-size: 14px; padding: 40px 0; text-align: center; }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px;
+           background: rgba(76,141,255,.15); color: var(--accent); margin-left: 6px; }
+</style>
+</head>
+<body>
+<h1>📌 书签展示 <span class="badge">全屏 / 内容区裁切</span> &nbsp;<a class="back" href="/">← 返回控制台</a></h1>
+<div class="subtitle">每个群一张卡片：左=书签页面全屏（绿框=内容区裁切范围，已排除顶部置顶条），右=裁切后的内容区（采集用的书签本体）。点击图片可看原图。</div>
+<div id="cards"></div>
+<div id="empty" class="empty" style="display:none">还没有书签展示副本（运行一次采集后自动生成到 workspace/bookmarks/）。</div>
+
+<script>
+async function load() {
+  const wrap = document.getElementById('cards');
+  const empty = document.getElementById('empty');
+  let data;
+  try {
+    const r = await fetch('/api/bookmarks');
+    data = await r.json();
+  } catch (e) {
+    empty.textContent = '接口请求失败: ' + e;
+    empty.style.display = 'block';
+    return;
+  }
+  const groups = (data && data.groups) || [];
+  if (!groups.length) { empty.style.display = 'block'; return; }
+
+  for (const g of groups) {
+    const cache = '?v=' + encodeURIComponent(g.mtime);
+    const fullSrc = g.full + cache;
+    const cropSrc = g.crop + cache;
+
+    const card = document.createElement('div');
+    card.className = 'card';
+
+    const head = document.createElement('div');
+    head.className = 'card-head';
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = g.group;
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    let metaText = `更新于 ${g.mtime} · 全屏 ${(g.full_bytes/1024).toFixed(0)}KB · 裁切 ${(g.crop_bytes/1024).toFixed(0)}KB`;
+    if (g.crop_top != null && g.crop_bottom != null) {
+      metaText += ` · 内容区 [${g.crop_top} : ${g.crop_bottom}]`;
+    }
+    meta.textContent = metaText;
+    head.append(name, meta);
+    card.appendChild(head);
+
+    const shots = document.createElement('div');
+    shots.className = 'shots';
+
+    // 左列：全屏 + 裁切范围框
+    const colFull = document.createElement('div');
+    colFull.className = 'col';
+    const lFull = document.createElement('div');
+    lFull.className = 'label';
+    lFull.innerHTML = '书签页面 <b>全屏</b>';
+    const wrapFull = document.createElement('div');
+    wrapFull.className = 'imgwrap';
+    const linkFull = document.createElement('a');
+    linkFull.href = g.full;
+    linkFull.target = '_blank';
+    const imgFull = document.createElement('img');
+    imgFull.src = fullSrc;
+    imgFull.alt = g.group + ' 全屏';
+    const region = document.createElement('div');
+    region.className = 'crop-region';
+    region.style.display = 'none';
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent = '内容区';
+    region.appendChild(tag);
+    linkFull.append(imgFull, region);
+    wrapFull.append(linkFull);
+    colFull.append(lFull, wrapFull);
+
+    // 右列：内容区裁切
+    const colCrop = document.createElement('div');
+    colCrop.className = 'col';
+    const lCrop = document.createElement('div');
+    lCrop.className = 'label';
+    lCrop.innerHTML = '内容区 <b>裁切</b>（书签本体）';
+    const wrapCrop = document.createElement('div');
+    wrapCrop.className = 'imgwrap';
+    const linkCrop = document.createElement('a');
+    linkCrop.href = g.crop;
+    linkCrop.target = '_blank';
+    const imgCrop = document.createElement('img');
+    imgCrop.src = cropSrc;
+    imgCrop.alt = g.group + ' 内容区';
+    linkCrop.append(imgCrop);
+    wrapCrop.append(linkCrop);
+    colCrop.append(lCrop, wrapCrop);
+
+    shots.append(colFull, colCrop);
+    card.appendChild(shots);
+    wrap.appendChild(card);
+
+    // 图片加载后按真实尺寸标注裁切范围（内容顶 = crop_top，排除置顶条）
+    Promise.all([imgFull.decode(), imgCrop.decode()]).then(() => {
+      const fh = imgFull.naturalHeight;
+      if (!fh) return;
+      const top = g.crop_top != null ? g.crop_top : 200;
+      const bottom = g.crop_bottom != null ? g.crop_bottom : fh;
+      const topPct = (top / fh) * 100;
+      const hPct = ((bottom - top) / fh) * 100;
+      region.style.top = topPct + '%';
+      region.style.height = hPct + '%';
+      tag.textContent = `内容区 [${top} : ${bottom}]`;
+      region.style.display = 'block';
+    }).catch(() => {});
+  }
+}
+load();
+</script>
+</body>
+</html>

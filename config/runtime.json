@@ -28,6 +28,7 @@
   "friend_auto_accept": true,
   "friend_check_interval": 1800,
   "friend_max_accept": 30,
+  "roster_reconcile": true,
   "decision_provider": "deepseek",
   "decision_model": "deepseek-v4-pro",
   "decision_token_floor": 0,

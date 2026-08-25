@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     latest_seq   INTEGER,
     top_reached  INTEGER DEFAULT 0,
     sync_version INTEGER DEFAULT 0,
+    roster_status INTEGER DEFAULT 0,   -- 花名册/身份信息获取状态：0=未获取 1=已获取 2=失败
     created_ts   REAL
 );
 
@@ -121,6 +122,7 @@ def connect(db_path):
 _MIGRATIONS = (
     ("messages", "media_path", "ALTER TABLE messages ADD COLUMN media_path TEXT DEFAULT ''"),
     ("messages", "crop_path", "ALTER TABLE messages ADD COLUMN crop_path TEXT DEFAULT ''"),
+    ("sessions", "roster_status", "ALTER TABLE sessions ADD COLUMN roster_status INTEGER DEFAULT 0"),
 )
 
 
@@ -176,6 +178,44 @@ def get_session_kind(conn, name):
     row = conn.execute("SELECT is_group FROM sessions WHERE name=?",
                        (name,)).fetchone()
     return bool(row["is_group"]) if row else False
+
+
+# ---------------------------------------------------------------- 花名册状态
+# 花名册/身份信息获取状态（理想态：每个会话只爬一次，凌晨3点扫未获取的）。
+ROSTER_PENDING = 0    # 未获取
+ROSTER_DONE = 1       # 已获取
+ROSTER_FAILED = 2     # 获取失败（可重试）
+
+
+@_locked
+def get_roster_status(conn, name):
+    """查询会话的花名册获取状态。未知会话返回 None。"""
+    row = conn.execute("SELECT roster_status FROM sessions WHERE name=?",
+                       (name,)).fetchone()
+    return row["roster_status"] if row else None
+
+
+@_locked
+def set_roster_status(conn, name, status):
+    """设置会话的花名册获取状态。返回是否更新成功。"""
+    cur = conn.execute("UPDATE sessions SET roster_status=? WHERE name=?",
+                       (int(status), name))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+@_locked
+def list_sessions_needing_roster(conn):
+    """列出所有「信息尚未获取」的会话（含群聊+私信），供凌晨3点休眠后扫描。
+
+    返回 [{"name":..., "is_group":...}, ...]，按 name 排序稳定。
+    仅含 roster_status=0（未获取）与 =2（失败待重试）的会话。
+    """
+    rows = conn.execute(
+        "SELECT name, is_group FROM sessions "
+        "WHERE roster_status != ? ORDER BY name",
+        (ROSTER_DONE,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------- 归一化与对齐键

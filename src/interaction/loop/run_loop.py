@@ -35,13 +35,20 @@ class InteractionLoop:
     """
 
     def __init__(self, scanner, watcher, queue: UnifiedQueue,
-                 journey: JourneyManager, tools, config=None):
+                 journey: JourneyManager, tools, config=None,
+                 maintenance=None, collect=False):
         self._scanner = scanner
         self._watcher = watcher
         self._queue = queue
         self._journey = journey
         self._tools = tools
         self._config = config
+        # 花名册扫描「休眠」信号（threading.Event）：置位时主循环暂停
+        # 正常分发/乱逛，把手机让给凌晨3点的花名册爬取。
+        self._maintenance = maintenance
+        # 采集模式（只读不回话）：丢弃一切 action 条目（历史遗留/任何来源），
+        # notify 正常处理（进会话读消息入库）。
+        self._collect = bool(collect)
 
         self._stop = False
         self._sleep = time.sleep
@@ -80,6 +87,11 @@ class InteractionLoop:
         if self._config:
             return getattr(self._config, 'paused', False)
         return False
+
+    @property
+    def is_maintenance(self):
+        """花名册扫描「休眠」中：手机被凌晨爬取占用，暂停正常活动。"""
+        return bool(self._maintenance and self._maintenance.is_set())
 
     # ------------------------------------------------------------------ 主循环
     def run(self, once: bool = False):
@@ -145,7 +157,8 @@ class InteractionLoop:
 
             # 好友申请兜底巡检（队列空且距上次超过间隔）：
             # 只抓"点开未通过"的残留态，即时识别靠 tab 红点
-            if not self.is_paused and len(self._queue) == 0:
+            if not self.is_paused and not self.is_maintenance \
+                    and len(self._queue) == 0:
                 if self._clock() - self._last_friend_probe >= \
                         self.friend_check_interval:
                     self._last_friend_probe = self._clock()
@@ -153,7 +166,8 @@ class InteractionLoop:
                     self._queue.push_friend(source="probe_backstop")
 
             # 乱逛：队列空时模拟真人随机浏览
-            if not self.is_paused and len(self._queue) == 0:
+            if not self.is_paused and not self.is_maintenance \
+                    and len(self._queue) == 0:
                 self._maybe_wander()
 
     def _run_once(self):
@@ -176,8 +190,8 @@ class InteractionLoop:
     # ------------------------------------------------------------------ Sweep
     def _do_sweep(self):
         """首页扫描：双击微信 Tab → 解析未读 → 入队。"""
-        if self.is_paused:
-            log.debug("paused, skip sweep")
+        if self.is_paused or self.is_maintenance:
+            log.debug("paused/maintenance, skip sweep")
             return
 
         events = self._scanner.sweep()
@@ -199,14 +213,19 @@ class InteractionLoop:
         while not self._stop:
             entry = self._queue.pop_next()
             if entry is not None:
-                if self.is_paused:
+                if self._collect and entry.kind == "action":
+                    # 采集模式：只读不回话，行动（含历史遗留）一律丢弃
+                    log.info("collect mode: drop action %s (只采集不回话)",
+                             entry.session)
+                    self._sleep(min(1.0, max(0.0, deadline - self._clock())))
+                elif self.is_paused or self.is_maintenance:
                     if entry.kind == "action":
-                        # 行动承载着对用户的承诺：暂停时原样放回队列
-                        log.info("paused: requeue action %s (keep position)",
+                        # 行动承载着对用户的承诺：暂停/休眠时原样放回队列
+                        log.info("paused/maintenance: requeue action %s (keep position)",
                                  entry.session)
                         self._queue.reinsert(entry)
                     else:
-                        log.debug("paused: drop notify %s (红点会再触发)",
+                        log.debug("paused/maintenance: drop notify %s (红点会再触发)",
                                   entry.session)
                     # 放回/丢弃后睡到本轮超时，避免暂停时空转
                     self._sleep(min(1.0, max(0.0, deadline - self._clock())))
@@ -223,9 +242,13 @@ class InteractionLoop:
             entry = self._queue.pop_next()
             if entry is None:
                 return
-            if self.is_paused:
+            if self._collect and entry.kind == "action":
+                log.info("collect mode: drop action %s (只采集不回话)",
+                         entry.session)
+                continue
+            if self.is_paused or self.is_maintenance:
                 if entry.kind == "action":
-                    # 行动永不许丢：放回原位，暂停期间不再继续排空
+                    # 行动永不许丢：放回原位，暂停/休眠期间不再继续排空
                     self._queue.reinsert(entry)
                     return
                 continue  # notify 可丢（红点会再触发）

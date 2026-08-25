@@ -127,6 +127,176 @@ def has_chat_buttons(hsv):
     return chat_buttons_state(hsv) is not None
 
 
+def _detect_input_bar_top_buttons(hsv):
+    """兜底：三圆钮（语音/表情/加号）白色描边圆检测输入栏顶。
+
+    扫描三列同 y 取最小值——三钮必须同时是环才可信（内容区头像只影响一列）。
+    返回输入栏顶 y 或 None。
+    """
+    r = LC.CHAT_BTN_R
+    centers = (LC.CHAT_VOICE_CENTER[0], LC.CHAT_EMOJI_CENTER[0],
+               LC.CHAT_PLUS_CENTER[0])
+    best_y, best_score = None, 0.0
+    # 扫描区间：输入栏顶在 [聚焦+引用最高 ~1800, 圆钮下缘 SCREEN_H-r] 之间
+    for cy in range(1800, LC.SCREEN_H - r, 5):
+        score = min(_icon_like_ratio(hsv, (cx - r, cy - r, cx + r, cy + r))
+                    for cx in centers)
+        if score > best_score:
+            best_score, best_y = score, cy
+    if best_y is None or best_score < LC.CHAT_BTN_LIKE_MIN:
+        return None
+    # 圆钮是「白描边环」，占比实测 0.142~0.175；整块白（白输入栏/白头像）占比会
+    # 远高于此（≥0.5）。峰值太亮 = 不是圆环而是整块亮色区域，拒绝，否则会把
+    # 内容区的白头像误判成输入栏。
+    if best_score > 0.5:
+        return None
+    offset = LC.CHAT_VOICE_CENTER[1] - LC.INPUT_BAR_Y0   # 2185 - 2110 = 75
+    return int(best_y - offset)
+
+
+def _pinned_bar_rect(img, gray=None, hsv=None):
+    """复用 chat_parser 的置顶条学习方案：气泡掩膜里的顶部全宽细条。
+
+    灰泡掩膜（低饱和 + 灰阶 [BUBBLE_GRAY_LO, BUBBLE_GRAY_HI]）连通域中
+    w>900、h<170、x<30、y<600 的条 = 置顶消息条。置顶条文字行被灰色底
+    包围，闭运算（close_ksize=9）填洞后是一个完整连通域，bbox 精确覆盖
+    整条（行投影会被文字行凹陷骗到，见 2026-08-14 实测）。
+    返回 (x, y, w, h) 或 None。
+    """
+    if gray is None:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if hsv is None:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    Y0, Y1 = LC.CONTENT_Y0, LC.INPUT_BAR_Y0
+    band = img[Y0:Y1]
+    intense = band.max(axis=2)
+    neutral = (intense.astype(np.int16) - band.min(axis=2)) < 12
+    bm = (neutral & (intense >= LC.BUBBLE_GRAY_LO)
+          & (intense <= LC.BUBBLE_GRAY_HI)).astype(np.uint8)
+    full = np.zeros(gray.shape, np.uint8)
+    full[Y0:Y1] = bm
+    for c in comps_from_mask(full, min_area=LC.BUBBLE_MIN_AREA,
+                             close_ksize=9, min_w=LC.BUBBLE_MIN_W,
+                             min_h=LC.BUBBLE_MIN_H):
+        x, y, w, h, area = c
+        if w > 900 and h < 170 and x < 30 and y < 600:
+            return (int(x), int(y), int(w), int(h))
+    return None
+
+
+def detect_pinned_bar_end(img, gray=None, hsv=None):
+    """聊天页顶部「置顶消息条」的下边界（消息内容区从此开始）。
+
+    深色背景方案（2026-08-14 新聊天背景定稿）：置顶条底部是一条贯穿左右、
+    行内 std≈0 的【纯黑分隔带】（如 y=344~366，mean=17、std=0.00），内容区
+    从该带【结束】位置开始（y=367）。找「最后一个」纯黑带（std<1.5、
+    mean<25、连续≥3 行），返回其结束 y；比旧气泡掩膜方案精确（旧方案返回
+    纯黑带起点 345，把 22px 分隔带误裁进内容区 → 图片间出现间隙）。
+
+    浅色背景回退：气泡掩膜全宽细条（w>900、h<170、x<30、y<600）→ 置顶条
+    rect，返回其下边界 y+h+1。无置顶条返回 None（调用方回退 CONTENT_Y0）。
+    """
+    if gray is None:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if hsv is None:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    row_mean = gray.mean(axis=1).astype(float)
+    row_std = gray.std(axis=1)
+    # 深色背景：最后一个纯黑分隔带（置顶条底部）。
+    # std<3.0（2026-08-15 放宽）：纯黑带尾部常有压缩噪声 std 1.5~1.7，
+    # 旧阈值 1.5 会截断黑带（56 屏真机采样 4 屏顶部误判 361/363）→ 放宽到 3.0
+    # 后 56/56 全部命中 367。
+    bands = []
+    y = LC.CONTENT_Y0 - 50
+    while y < min(900, gray.shape[0]):
+        if row_std[y] < 3.0 and row_mean[y] < 25:
+            e = y
+            while e < gray.shape[0] and row_std[e] < 3.0 and row_mean[e] < 25:
+                e += 1
+            if e - y >= 3:
+                bands.append((y, e))
+            y = e
+        else:
+            y += 1
+    if bands:
+        # 内容区顶 = 最后一个纯黑带【结束位置】。黑带是置顶条底部固定
+        # 分隔带（位置恒定，如 344-366），其后即内容区——内容区首行可能是
+        # 消息泡(mean 60-68)而非背景(91)，不能再要求首行 mean>70。
+        #
+        # 2026-08-15 修黑缝隙：黑带结束行(如 366)本身还是暗过渡行
+        # (mean≈29，黑带残留)，若作为裁切起点，每张 crop 顶部第一行都是
+        # 这条暗线；stitch 拼接时 B1(=prev_crop[0:split]) 的这条暗线会成为
+        # 接缝处的黑缝隙（实测 screen_02 接缝 y=1367 mean=29/dark=100%）。
+        # → 跳过过渡行：从黑带结束+1（第一个内容行，mean 60~110）起裁。
+        e = bands[-1][1]
+        if e + 1 < gray.shape[0] and row_mean[e + 1] > row_mean[e] + 10:
+            return int(e + 1)
+        return int(e)
+    # 浅色背景回退：气泡掩膜全宽细条
+    r = _pinned_bar_rect(img, gray=gray, hsv=hsv)
+    if r is None:
+        return None
+    return int(r[1] + r[3]) + 1
+
+
+def detect_input_bar_top(img, gray=None, hsv=None):
+    """CV 检测聊天页输入栏顶 y（不依赖固定坐标）。
+
+    方案（2026-08-14 用户定稿）：输入栏顶是一条【贯穿屏幕左右的分界线】。
+    输入栏本体（含引用预览条）的每一行「略亮像素」(内容区背景 bg+2 ~ bg+40)
+    占比 ≈100%，而消息泡/卡片最多 ~80%——取「从某行起直到屏幕底部占比都
+    ≥90% 的连续全宽带」的最上沿，即输入栏顶。比三圆钮方案稳：内容区头像
+    （x≈32-108 与语音列重叠）永远凑不出全宽带，不会误判。
+
+    兜底：全宽带检测失败（输入栏底色与内容区背景接近等）时，退回三圆钮
+    白色描边检测（_detect_input_bar_top_buttons，三列同时为环才可信）。
+
+    返回 int 输入栏顶 y；检测不到返回 None，调用方回退固定值。
+    """
+    if gray is None:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if hsv is None:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    bg = estimate_bg(gray, LC.CONTENT_Y0, 2000)      # 内容区背景（深色模式≈92）
+    x0, x1 = LC.DIV_X0, LC.DIV_X1                    # 195..1050 避开左右头像列
+    strip = gray[:, x0:x1].astype(int)
+
+    # ---- 方案 A（亮色背景）：输入栏本体「略亮像素」全宽带 ----
+    bright = ((strip > bg + 2) & (strip < bg + 40)).sum(axis=1)
+    th = int((x1 - x0) * 0.85)                       # 全宽带占比阈值
+    # 输入栏顶 = 从上往下第一条「本行及后续 15 行占比都 ≥85%」的行。
+    # 消息泡/卡片实测最高 678/855≈79% 过不了 85%；输入栏本体 100%、按钮行
+    # ~86%，都能过。从上往下找，先命中输入栏顶（2119），不会扫到底部手势
+    # 导航带（2311，在输入栏下方）。
+    for y in range(1800, LC.SCREEN_H - 15):
+        if int(bright[y:y + 15].min()) >= th:
+            return int(y)
+
+    # ---- 方案 B（深色背景）：输入栏是「均匀暗带」全宽带 ----
+    # 2026-08-14 换深色聊天背景后实测：输入栏纯黑带 mean≈30~41、行内 std≈0，
+    # 与内容区背景(≈92)差异显著，整行贯穿。
+    #   输入栏顶 = 从上往下第一条「本行 mean<50 且本行起连续 15 行 std<4」
+    #   的行。
+    # - mean<50 绝对暗阈值只看【当前行】：内容区背景(mean≈91)均匀也不算，
+    #   底部消息泡(mean≈57-63, std≈22)不过 std<4；
+    # - 连续 15 行 std<4：消息行 std>15 过不了；手势导航带(2311)在输入栏
+    #   下方，从上往下先命中输入栏(2119)。
+    # - 2026-08-15 尾暗约束：消息内容里也有深色均匀块（图片/引用卡，如
+    #   screen_45 的 y1915-1990 mean≈41 std≈2 被误判为输入栏顶）→ 增加
+    #   「从该行直到底部暗像素占比>80%」约束（输入栏+底部导航都是暗，
+    #   消息块下方会回到亮背景）。56 屏真机采样后全部命中 2119。
+    row_std = strip.std(axis=1)
+    row_mean = strip.mean(axis=1)
+    H_g = gray.shape[0]
+    for y in range(1800, H_g - 15):
+        if row_mean[y] < 50 and row_std[y:y + 15].max() < 4.0:
+            tail_dark = float((row_mean[y:H_g] < 60).mean())
+            if tail_dark > 0.8:
+                return int(y)
+
+    return _detect_input_bar_top_buttons(hsv)
+
+
 def detect_miniapp_panel(img, ocr_items, gray=None, hsv=None):
     """小程序面板页（首页第一页继续上滑拉出）。无样本，按已知形态预判：
     强特征 = tab 栏在，但内容区既无会话分割线也无头像列连通域；

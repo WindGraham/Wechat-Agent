@@ -23,6 +23,7 @@ wait_random、open_wechat、_snap）。纯函数不碰设备，可单测。
 """
 
 import logging
+import os
 import random
 import time
 
@@ -321,6 +322,31 @@ def _back_to_friend_list(tools):
     return False
 
 
+def _save_new_contact_profile(tools, name):
+    """好友通过后，若当前停在个人资料页，提取档案并存档 + 打标（Phase 3）。
+
+    复用 profile_extractor.extract_profile + roster_update.save_contact_after_accept。
+    存档 key 用申请人名 name；实际主昵称以资料页提取结果为准。
+    真机验证点：通过好友后是否停在资料页、页面文案（"发消息"/"音视频通话"等）。
+    """
+    try:
+        from ..perception.profile_extractor import extract_profile, is_profile_page
+        from ..perception.roster_update import save_contact_after_accept, ROSTERS_DIR
+        img = tools.dev.capture_bytes()
+        if not is_profile_page(run_ocr(img)):
+            log.info("好友通过后未停在资料页，跳过存档")
+            return
+        avatar_dir = os.path.join(ROSTERS_DIR, name, "avatars")
+        record = extract_profile(tools.dev, avatar_dir, session_name=name)
+        if record is None:
+            log.warning("资料页提取失败，跳过存档")
+            return
+        save_contact_after_accept(name, record)
+        log.info("好友通过存档: %s -> %s", name, record.get("main_nickname"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("好友通过后存档失败: %s", e)
+
+
 def accept_all(tools, max_accept=30, sleep_fn=time.sleep,
                rand_fn=random.uniform):
     """通过全部待处理的好友申请。
@@ -355,6 +381,8 @@ def accept_all(tools, max_accept=30, sleep_fn=time.sleep,
             if _accept_in_detail(tools):
                 result["accepted"].append(name)
                 log.info("  ✓ %s（累计 %d）", name, len(result["accepted"]))
+                # 好友通过 hook：通过后若停在资料页，提取个人档案存档 + 打标
+                _save_new_contact_profile(tools, name)
             else:
                 log.warning("  ✗ %s 通过失败，跳过", name)
                 stall += 1                   # 防同一条死循环

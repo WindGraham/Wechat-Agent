@@ -24,8 +24,8 @@ def test_manifest_and_matcher():
     assert len(rm.avatar_templates) > 0
     print(f"✅ 花名册加载成功，成员数: {len(rm.member_profiles)}，模板数: {len(rm.avatar_templates)}")
 
-    # 模拟双因子匹配
-    tmpl = rm.avatar_templates.get("JY君")
+    # 模拟双因子匹配（avatar_templates 为列表，按 key 查找）
+    tmpl = next((t for t in rm.avatar_templates if t["key"] == "JY君"), None)
     if tmpl:
         crop_img = tmpl["bgr"].copy()
         # 正确 OCR

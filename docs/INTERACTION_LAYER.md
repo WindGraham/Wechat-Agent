@@ -160,6 +160,28 @@ A 的行动清空 → 最后一次日志同步 → 此时才向 Proxy 发 LogUpd
 - 兜底巡检（probe_backstop）与手动接口共用 `probe_pending()`
   （清空后入口文案变"朋友推荐"已兼容）
 
+### 8. 花名册与身份识别（2026-08-25）
+
+群成员花名册落在 `workspace/group_rosters/<群名>/`（members_roster.json +
+圆角头像 PNG + 资料页截图），由 `scripts/run_full_group_spider.py` 全量爬取
+（导航复用生产 `WeChatTools.enter_session`：列表翻屏+搜索兜底+页面类型校验；
+折叠群走 `_enter_via_folded`；小群无「更多群成员」入口时信息页即完整网格）。
+
+- **双因子识别**（`perception/roster_matcher.py`）：头像复合分（归一化 BGR
+  模板 + Hue 直方图抗偏色）≥0.70 且昵称相似度 ≥0.60 → 确认身份；
+  无昵称 OCR 时头像分 ≥0.85 代偿。
+- **鲁棒通道**：快速通道得分落灰区 [0.45, 0.70) 时对 top-10 候选跑
+  多尺度滑窗 + 中心带复核（裁切偏移/截断/缝隙挽救，离线评测 60 人 ×
+  9 种退化 0 误收）；快速通道对原图/修边图各算一次取 max（修边限 10%，
+  防纯色背景头像被误修）。
+- **失配调和闭环**（`perception/roster_update.py`）：`runtime.json` 的
+  `roster_reconcile`（默认 true）开启时，journey 同步（`collect_group_history`
+  reconcile 参数）对双因子失配消息，在其仍在屏上时点头像进资料页，
+  按改名/换头像四规则调和写回花名册；定位不到的成员资料完整则作新成员
+  动态学习入库。坐标映射：union 行 y → 设备行 内容顶+y（线性）；每屏限
+  2 条、每轮采集限 12 条；调和后校验仍在聊天页，否则停止本次采集。
+  已入库消息的 sender 不事后改（align_key 锚定依赖 sender）。
+
 ## 二、明确不做
 
 - 不组装 prompt（只发 LogUpdated + 提供历史/差分读取接口）

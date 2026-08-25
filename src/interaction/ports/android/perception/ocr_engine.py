@@ -14,6 +14,8 @@
 fill_missing_lines/enhance_small_text/ocr_badge_digit。
 """
 
+import logging
+
 import cv2
 import numpy as np
 
@@ -21,6 +23,8 @@ import onnxruntime as _ort
 _ort.set_default_logger_severity(3)  # suppress "No registered plugin EP device" noise on CUDA 13
 
 from . import bubble_model
+
+log = logging.getLogger("perception.ocr_engine")
 
 # ---------------------------------------------------------------- OCR 单例（模块级懒加载）
 _OCR = None
@@ -30,20 +34,47 @@ _OCR_PARAMS = {
     "Global.use_cls": False,          # 微信文字都是正向的，关方向分类省 ~40ms
     "Global.log_level": "error",
 }
+_OCR_PARAMS_CPU = {
+    "EngineConfig.onnxruntime.use_cuda": False,
+    "Global.use_cls": False,
+    "Global.log_level": "error",
+}
+
+_use_cpu = False   # CUDA 后端偶发 CUBLAS/cuDNN 失败后置 True，全进程降级 CPU
+
+
+def _current_params():
+    return _OCR_PARAMS_CPU if _use_cpu else _OCR_PARAMS
+
+
+def _is_cuda_error(e):
+    s = str(e).lower()
+    return any(k in s for k in ("cuda", "cublas", "cudnn", "tensorrt", "cuda_call"))
 
 
 def get_ocr():
     global _OCR
     if _OCR is None:
         from rapidocr import RapidOCR
-        _OCR = RapidOCR(params=_OCR_PARAMS)
+        _OCR = RapidOCR(params=_current_params())
     return _OCR
 
 
 def run_ocr(img_or_path):
     """全图（或整区域）OCR：检测+识别。
     返回 [{'box':(x0,y0,x1,y1), 'cx','cy','h','text','conf'}, ...]"""
-    res = get_ocr()(img_or_path)
+    global _OCR, _use_cpu
+    try:
+        res = get_ocr()(img_or_path)
+    except Exception as e:
+        # CUDA 后端偶发 CUBLAS/cuDNN 失败（GPU 显存紧张/驱动抖动）→ 降级 CPU 重试
+        if not _use_cpu and _is_cuda_error(e):
+            log.warning("CUDA OCR 推理失败，全进程降级 CPU: %s", e)
+            _use_cpu = True
+            _OCR = None
+            res = get_ocr()(img_or_path)
+        else:
+            raise
     items = []
     if res is None or res.boxes is None:
         return items
@@ -92,7 +123,7 @@ def _thread_ocr():
     """每线程一个 RapidOCR 实例（规避 session 线程安全问题）。"""
     if getattr(_tls, "ocr", None) is None:
         from rapidocr import RapidOCR
-        _tls.ocr = RapidOCR(params=_OCR_PARAMS)
+        _tls.ocr = RapidOCR(params=_current_params())
     return _tls.ocr
 
 

@@ -46,7 +46,7 @@ class JourneyManager:
     def __init__(self, queue: UnifiedQueue, session_reader,
                  bundle_sender, port_navigator,
                  on_log_updated: Optional[Callable] = None,
-                 config=None, friend_ops=None):
+                 config=None, friend_ops=None, collect=False):
         self._queue = queue
         self._reader = session_reader
         self._sender = bundle_sender
@@ -56,6 +56,8 @@ class JourneyManager:
         # friend_ops 可注入 {"probe": fn, "accept": fn}（测试用假实现）
         self._config = config
         self._friend_ops = friend_ops
+        # 采集模式（只读不回话）：禁用好友自动通过（避免只读期改状态）
+        self._collect = bool(collect)
 
         self._dirty: set = set()   # 同步失败的会话：下轮循环优先补同步
         # 正在执行的队列条目（其 payload 尚未落地）：SIGTERM 优雅退出时
@@ -128,8 +130,16 @@ class JourneyManager:
             log.info("[%s] 进入后落在好友申请页，转 friend 流程", session)
             return self._process_friend(entry)
 
+        # 采集模式：群聊走滚动差分拼接深采（fling滑动+重叠检测+差分拼接+
+        # 裁图+去重入库），代替常规浅读 sync（无 Proxy，不发 LogUpdated）。
+        if self._collect and is_group:
+            return self._collect_and_exit(session, entry)
+
         # 2. 同步日志（进会话必做，铁律）；失败重试，仍失败 → 标 dirty 退出
-        updated = self._sync_with_retry(session, is_group)
+        # roster_reconcile：双因子失配时点头像进资料页调和（默认开，
+        # runtime.json 可关）
+        reconcile = is_group and bool(self._friend_cfg("roster_reconcile", True))
+        updated = self._sync_with_retry(session, is_group, reconcile=reconcile)
         if updated is None:
             log.warning("[%s] sync failed after retries, exit and mark dirty",
                         session)
@@ -156,7 +166,8 @@ class JourneyManager:
                     log.exception("[%s] 滚底失败", session)
                     break
                 self._sleep(self._rand(0.6, 1.2))
-                retry_updated = self._reader.sync_session(session, is_group)
+                retry_updated = self._reader.sync_session(session, is_group,
+                                                          reconcile=reconcile)
                 if retry_updated is not None:
                     updated = retry_updated
                 if self._last_new_count(session):
@@ -220,6 +231,29 @@ class JourneyManager:
         return sent
 
     # ------------------------------------------------------------------ 内部
+    def _collect_and_exit(self, session, entry):
+        """采集模式深采：进群后滚动差分拼接采集（裁图+去重入库），回首页。
+
+        复用 history_collect.collect_group_history（scroll_stitch 重叠检测/
+        差分拼接 + realtime_scan 滑动/裁图 + 全库指纹去重 + append_incremental）。
+        """
+        try:
+            from .history_collect import collect_group_history
+            dev = getattr(getattr(self._nav, "tools", None), "dev", None)
+            conn = getattr(self._reader, "_conn", None)
+            if dev is None or conn is None:
+                log.error("[%s] collect: 缺 dev/conn，跳过深采", session)
+            else:
+                total = collect_group_history(
+                    dev, conn, session, stop_empty_rounds=2,
+                    reconcile=bool(self._friend_cfg("roster_reconcile", True)))
+                log.info("[%s] collect: 深采入库 %d 条", session, total)
+        except Exception:  # noqa: BLE001
+            log.exception("[%s] collect_group_history failed", session)
+        self._safe_back_home(session)
+        log.info("=== journey end: %s collect-only ===", session)
+        return False
+
     def _last_new_count(self, session):
         """最近一次 sync 的新增条数（reader 不支持时返回 None → 跳过兜底）。"""
         getter = getattr(self._reader, "last_new_count", None)
@@ -260,7 +294,8 @@ class JourneyManager:
         log.info("=== friend journey start (sources=%s) ===",
                  sorted(entry.sources))
         ops = self._load_friend_ops()
-        auto_accept = bool(self._friend_cfg("friend_auto_accept", True))
+        auto_accept = bool(self._friend_cfg("friend_auto_accept", True)) \
+            and not self._collect
         max_accept = int(self._friend_cfg("friend_max_accept", 30))
         tools = self._nav.tools
 
@@ -268,7 +303,8 @@ class JourneyManager:
             if auto_accept:
                 result = ops["accept"](tools, max_accept=max_accept,
                                        sleep_fn=self._sleep)
-                result["probed"] = None      # accept 内部自己数，不单独巡检
+                # accept 内部自己数，不单独巡检；若未提供 probed 则置 None
+                result.setdefault("probed", None)
             else:
                 count, names = ops["probe"](tools, sleep_fn=self._sleep)
                 result = {"ok": count is not None, "accepted": [],
@@ -288,13 +324,16 @@ class JourneyManager:
         log.info("=== friend journey end: %s ===", result)
         return bool(result.get("accepted"))
 
-    def _sync_with_retry(self, session: str, is_group: bool):
+    def _sync_with_retry(self, session: str, is_group: bool,
+                         reconcile: bool = False):
         """同步日志，失败重试 SYNC_MAX_RETRIES 次（随机间隔 1~2s）。
 
+        reconcile=True 时群聊同步顺带做双因子失配的资料页调和。
         返回 LogUpdated；彻底失败返回 None。
         """
         for attempt in range(SYNC_MAX_RETRIES + 1):
-            updated = self._reader.sync_session(session, is_group)
+            updated = self._reader.sync_session(session, is_group,
+                                                reconcile=reconcile)
             if updated is not None:
                 return updated
             if attempt < SYNC_MAX_RETRIES:

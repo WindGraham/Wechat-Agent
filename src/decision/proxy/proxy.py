@@ -97,10 +97,10 @@ class Proxy:
                  cli_backend=None, clock=time.time,
                  watermarks_path=WATERMARKS_PATH, tasks_root=None,
                  emoji_index=None):
+        self._runtime = runtime
         self._providers = ProviderRegistry(provider, self._rt, clock=clock)
         self._reader = reader
         self._submit_bundle = submit_bundle
-        self._runtime = runtime
         self._builder = builder or ContextBuilder(
             owner=getattr(runtime, "get", lambda k, d=None: d)("owner", ""))
         self._policy = policy or Policy(

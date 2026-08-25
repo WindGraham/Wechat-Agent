@@ -51,12 +51,20 @@ log = logging.getLogger("device_ctl")
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
+# ImageReader 快速截图重连冷却（秒）：初始化失败后这段时间内不重复尝试，
+# 避免服务真起不来时每帧都白等 40×0.5s 的连接重试。
+FAST_CAP_RETRY_INTERVAL = 60.0
+# 快速截图总开关：MediaCodec/ffmpeg 链路不稳（超时/解码失败）时置 False，
+# 直接走 screencap 兜底，绕过坏掉的 ImageReader。
+USE_FAST_CAPTURE = False
+
 
 class DeviceCtl:
     def __init__(self):
         self.touch = RandomTouch(self._shell)
         self._cap_lock = threading.Lock()  # 截图串行锁：防止推流线程与 agent 抢 adb
         self._fast_cap = None  # ImageReader 快速截图客户端（懒加载）
+        self._fast_cap_failed_ts = 0.0  # 上次初始化失败时间戳（重连冷却用）
         self.ensure_device()
 
     # ------------------------------------------------------------------ adb
@@ -149,6 +157,12 @@ class DeviceCtl:
                 return cap.capture()
             except Exception as e:
                 log.warning("ImageReader 截图失败，回退 screencap: %s", e)
+                # 服务中途死掉：置回 None 触发下次重连（而非永久持有死连接）
+                self._fast_cap = None
+                try:
+                    cap.close()
+                except Exception:
+                    pass
         # 2) 回退 screencap
         import cv2
         import numpy as np
@@ -169,17 +183,29 @@ class DeviceCtl:
     def _get_fast_capture(self):
         """懒加载 ImageReader 快速截图客户端（首次启动服务约 2~3 秒）。
 
-        成功返回 ScreenCapture；失败返回 False 并缓存（不再重试）。
+        成功返回 ScreenCapture；失败返回 False 并缓存，冷却期内不重试。
+        服务中途死掉时 capture_bytes 会把 _fast_cap 置回 None 触发重连
+        （不再永久持有死连接，每帧空等超时）。
         """
+        if not USE_FAST_CAPTURE:
+            return None
         if self._fast_cap is None:
-            try:
-                from .screen_capture import ScreenCapture
-                self._fast_cap = ScreenCapture()
-                log.info("ImageReader 快速截图已就绪（~50ms/帧）")
-            except Exception as e:
-                log.warning("ImageReader 快速截图不可用，回退 screencap: %s", e)
-                self._fast_cap = False
-        return self._fast_cap or None
+            self._try_fast_capture()
+        elif self._fast_cap is False:
+            if time.time() - self._fast_cap_failed_ts >= FAST_CAP_RETRY_INTERVAL:
+                self._try_fast_capture()
+        return self._fast_cap if self._fast_cap is not False else None
+
+    def _try_fast_capture(self):
+        """尝试初始化 ImageReader 客户端；失败降级为 False 并记录时间戳。"""
+        try:
+            from .screen_capture import ScreenCapture
+            self._fast_cap = ScreenCapture()
+            log.info("ImageReader 快速截图已就绪（~50ms/帧）")
+        except Exception as e:
+            log.warning("ImageReader 快速截图不可用，回退 screencap: %s", e)
+            self._fast_cap = False
+            self._fast_cap_failed_ts = time.time()
 
     # ----------------------------------------------------------------- 触控
     def tap_rect(self, rect, sigma_ratio=0.25):

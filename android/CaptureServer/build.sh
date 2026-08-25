@@ -12,13 +12,16 @@ D8=$(ls "$SDK"/build-tools/*/d8 2>/dev/null | sort -V | tail -1)
 
 echo "1/2 javac 编译..."
 rm -rf build && mkdir -p build/classes
+# -classpath 而非 -bootclasspath：lambda 需要 JDK 真·LambdaMetafactory，
+# android.jar 的 stub 没有 metafactory 方法（bootclasspath 会报 cannot find symbol）。
 javac -source 1.8 -target 1.8 \
-  -bootclasspath "$ANDROID_JAR" \
+  -classpath "$ANDROID_JAR" \
   -d build/classes src/CaptureServer.java
 
 echo "2/2 d8 转 dex..."
+# 把编译出的所有顶层类都打进 dex（漏了会 NoClassDefFoundError）
 "$D8" --lib "$ANDROID_JAR" --release --output build \
-  build/classes/com/wechatagent/capture/CaptureServer.class
+  $(find build/classes -name '*.class')
 
 echo "✅ 编译完成: build/classes.dex"
 ls -la build/classes.dex

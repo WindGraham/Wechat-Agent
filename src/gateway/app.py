@@ -42,6 +42,16 @@ def _load_index_html():
         return "<html><body>页面文件缺失: pages/index.html</body></html>"
 
 
+def _load_page(name):
+    """读取独立演示页（bookmark.html 等，每次读，可热改）。"""
+    path = os.path.join(_PAGES_DIR, name)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return f"<html><body>页面文件缺失: pages/{name}</body></html>"
+
+
 def create_app(project_root=None, proxy=None, supervisor=None,
                agent_callback_url=None, reloader=None):
     """Flask 应用工厂。project_root 指向仓库根（含 config/ 与 workspace/），
@@ -77,6 +87,105 @@ def create_app(project_root=None, proxy=None, supervisor=None,
     @app.route("/")
     def index():
         return _load_index_html()
+
+    @app.route("/bookmark")
+    def bookmark_page():
+        """书签展示页：每个群的书签全屏 + 内容区裁切（workspace/bookmarks/）。"""
+        return _load_page("bookmark.html")
+
+    @app.route("/scroll_replay")
+    def scroll_replay_page():
+        """滚动回放展示页：回溯采集每屏的原图/消息区/分割/重叠遮罩。"""
+        return _load_page("scroll_replay.html")
+
+    @app.route("/scroll_flow")
+    def scroll_flow_page():
+        """滚动连续流：两列蛇形（左偶右奇），从底部向上接，相邻屏重叠对齐。"""
+        return _load_page("scroll_flow.html")
+
+    @app.route("/api/scroll_replay")
+    def api_scroll_replay():
+        """滚动回放：无 ?r= 列出所有 replay；?r=<名字> 返回该 replay 的 manifest。"""
+        import json as _json
+        import time as _time
+        rp_dir = os.path.join(root, "workspace", "replays")
+        name = request.args.get("r", "")
+        if name:
+            p = os.path.join(rp_dir, name)
+            if not os.path.isfile(os.path.join(p, "manifest.json")):
+                return jsonify({"ok": False, "error": "replay 不存在"}), 404
+            with open(os.path.join(p, "manifest.json"), encoding="utf-8") as f:
+                m = _json.load(f)
+            for s in m.get("screens", []):
+                s["full"] = f"/workspace/replays/{name}/{s['full']}"
+                s["crop"] = f"/workspace/replays/{name}/{s['crop']}"
+                if s.get("stitch"):
+                    s["stitch"] = f"/workspace/replays/{name}/{s['stitch']}"
+            m["name"] = name
+            return jsonify({"ok": True, "replay": m})
+        replays = []
+        if os.path.isdir(rp_dir):
+            for n in sorted(os.listdir(rp_dir), reverse=True):
+                p = os.path.join(rp_dir, n, "manifest.json")
+                if not os.path.isfile(p):
+                    continue
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        m = _json.load(f)
+                    replays.append({
+                        "name": n,
+                        "group": m.get("group", ""),
+                        "screens": len(m.get("screens", [])),
+                        "mtime": _time.strftime(
+                            "%Y-%m-%d %H:%M:%S",
+                            _time.localtime(os.path.getmtime(p))),
+                    })
+                except (OSError, ValueError):
+                    continue
+        return jsonify({"ok": True, "replays": replays})
+
+    @app.route("/api/bookmarks")
+    def api_bookmarks():
+        """列出 workspace/bookmarks/<群>/ 下的书签展示副本（full.jpg/crop.jpg）。"""
+        import json as _json
+        import time as _time
+        bm_dir = os.path.join(root, "workspace", "bookmarks")
+        groups = []
+        if os.path.isdir(bm_dir):
+            for name in sorted(os.listdir(bm_dir)):
+                d = os.path.join(bm_dir, name)
+                if not os.path.isdir(d):
+                    continue
+                full = os.path.join(d, "full.jpg")
+                crop = os.path.join(d, "crop.jpg")
+                if not (os.path.exists(full) and os.path.exists(crop)):
+                    continue
+                # 裁切范围元数据（_save_anchor 写入）：供页面在整屏图上标绿框
+                crop_top, crop_bottom, full_h = None, None, None
+                meta_p = os.path.join(d, "meta.json")
+                if os.path.exists(meta_p):
+                    try:
+                        with open(meta_p, encoding="utf-8") as f:
+                            m = _json.load(f)
+                        crop_top = m.get("crop_top")
+                        crop_bottom = m.get("crop_bottom")
+                        full_h = m.get("full_h")
+                    except (OSError, ValueError):
+                        pass
+                groups.append({
+                    "group": name,
+                    "full": f"/workspace/bookmarks/{name}/full.jpg",
+                    "crop": f"/workspace/bookmarks/{name}/crop.jpg",
+                    "full_bytes": os.path.getsize(full),
+                    "crop_bytes": os.path.getsize(crop),
+                    "crop_top": crop_top,
+                    "crop_bottom": crop_bottom,
+                    "full_h": full_h,
+                    "mtime": _time.strftime(
+                        "%Y-%m-%d %H:%M:%S",
+                        _time.localtime(os.path.getmtime(full))),
+                })
+        return jsonify({"ok": True, "groups": groups})
 
     @app.route("/workspace/<path:filename>")
     def workspace_static(filename):

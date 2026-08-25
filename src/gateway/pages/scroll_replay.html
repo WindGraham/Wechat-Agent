@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>滚动回放 · 书签+union 缝合可视化</title>
+<style>
+  :root {
+    --canvas: #0d1017; --ink: #d7dce4; --muted: #8b93a3;
+    --panel: #141a24; --hairline: #2a3140;
+    --accent: #4c8dff; --green: #3fb950; --coral: #ff6b5e; --yellow: #f5c344;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: var(--canvas); color: var(--ink); margin: 0; padding: 24px; line-height: 1.5;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { font-size: 13px; color: var(--muted); margin-bottom: 16px; }
+  a.back { color: var(--accent); text-decoration: none; font-size: 13px; }
+  #picker { margin-bottom: 16px; }
+  #picker a { display: inline-block; margin-right: 8px; padding: 4px 10px; border-radius: 10px;
+              background: var(--panel); border: 1px solid var(--hairline); color: var(--ink);
+              text-decoration: none; font-size: 12px; }
+  #picker a.active { border-color: var(--accent); color: var(--accent); }
+  .card { background: var(--panel); border: 1px solid var(--hairline); border-radius: 12px;
+          padding: 16px 20px; margin-bottom: 24px; }
+  .card-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+               border-bottom: 1px solid var(--hairline); padding-bottom: 8px; margin-bottom: 14px;
+               font-size: 13px; color: var(--muted); }
+  .card-head .si { font-size: 15px; font-weight: 700; color: var(--ink); }
+  .card-head b { color: var(--ink); }
+  .row { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .col { width: 300px; flex-shrink: 0; }
+  .col .label { font-size: 11px; font-weight: 700; color: var(--muted); margin-bottom: 6px;
+                text-transform: uppercase; letter-spacing: .05em; }
+  .col .label b { color: var(--ink); }
+  .imgwrap { position: relative; display: inline-block; }
+  .imgwrap img { display: block; width: 300px; height: auto; background: #000;
+                 border: 1px solid var(--hairline); border-radius: 8px; }
+  /* 重叠遮罩（半透明色块 + 边线） */
+  .mask { position: absolute; left: 0; top: 0; width: 100%; box-sizing: border-box;
+          pointer-events: none; font-size: 10px; font-weight: 700; }
+  .mask .mtag { position: absolute; left: 0; top: 0; background: rgba(13,16,23,.85);
+                padding: 1px 6px; border-radius: 0 0 4px 0; white-space: nowrap; }
+  .mask.prev { background: rgba(76,141,255,.16); border-top: 2px solid var(--accent); }
+  .mask.prev .mtag { color: var(--accent); }
+  .mask.next { background: rgba(255,107,94,.16); border-bottom: 2px solid var(--coral); }
+  .mask.next .mtag { color: var(--coral); }
+  /* 分割残缺块 B(上)/A(下) 分界线 */
+  .split { position: absolute; left: 0; width: 100%; border-top: 2px dashed var(--yellow);
+           pointer-events: none; font-size: 10px; font-weight: 700; }
+  .split .stag { position: absolute; right: 0; top: -16px; color: var(--yellow);
+                 background: rgba(13,16,23,.85); padding: 1px 6px; border-radius: 4px; white-space: nowrap; }
+  .band { position: absolute; left: 0; width: 100%; font-size: 10px; font-weight: 700;
+          pointer-events: none; }
+  .band.b { top: 0; color: var(--coral); background: rgba(255,107,94,.08);
+            padding: 2px 6px; text-align: center; }
+  .band.a { bottom: 0; color: var(--green); background: rgba(63,185,80,.08);
+            padding: 2px 6px; text-align: center; }
+  .empty { color: var(--muted); font-size: 14px; padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<h1>🔄 滚动回放 <span id="title" style="font-size:13px;color:var(--muted)"></span></h1>
+<div class="subtitle">回溯采集每屏一行：<b style="color:var(--accent)">原图</b> · 消息区×2（蓝=与上一张重叠(本屏底部)、红=与下一张重叠(本屏顶部)）· <b style="color:var(--yellow)">分割残缺块</b>（黄虚线=B残缺在上/A完整在下）。</div>
+<div id="picker"></div>
+<div style="margin:6px 0 10px"><a class="back" href="/scroll_flow?r='+encodeURIComponent(new URLSearchParams(location.search).get('r')||'')+'">🪜 切到「滚动连续流」（两列重叠对齐）</a></div>
+<div id="cards"></div>
+<div id="empty" class="empty" style="display:none"></div>
+
+<script>
+const picker = document.getElementById('picker');
+const cards = document.getElementById('cards');
+const empty = document.getElementById('empty');
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function imgWrap(url, alt) {
+  const w = el('div', 'imgwrap');
+  const im = el('img'); im.src = url; im.alt = alt || '';
+  w.appendChild(im);
+  return w;
+}
+
+async function loadPicker() {
+  try {
+    const r = await fetch('/api/scroll_replay');
+    const d = await r.json();
+    const replays = (d && d.replays) || [];
+    if (!replays.length) { showEmpty('还没有滚动回放（先运行 scripts/capture_replay.py）。'); return; }
+    for (const rp of replays) {
+      const a = el('a', null, `${rp.group} · ${rp.screens}屏 · ${rp.mtime}`);
+      a.href = '/scroll_replay?r=' + encodeURIComponent(rp.name);
+      if (new URLSearchParams(location.search).get('r') === rp.name) a.className = 'active';
+      picker.appendChild(a);
+    }
+  } catch (e) { showEmpty('接口失败: ' + e); }
+}
+
+function showEmpty(msg) { empty.textContent = msg; empty.style.display = 'block'; }
+
+async function loadReplay(name) {
+  try {
+    const r = await fetch('/api/scroll_replay?r=' + encodeURIComponent(name));
+    const d = await r.json();
+    if (!d.ok) { showEmpty(d.error || '加载失败'); return; }
+    const m = d.replay;
+    document.getElementById('title').textContent = `· ${m.group} · ${m.screens.length} 屏`;
+    const screens = m.screens;
+    for (let i = 0; i < screens.length; i++) {
+      const s = screens[i];
+      const cropH = s.crop_bottom - s.crop_top;
+      const card = el('div', 'card');
+
+      // 头部：序号 / dy / 裁切范围 / 分割
+      const head = el('div', 'card-head');
+      head.appendChild(el('span', 'si', `screen ${i}`));
+      head.appendChild(el('span', null, `dy=${s.dy.toFixed(0)}px`));
+      head.appendChild(el('span', null, `裁切 [${s.crop_top} : ${s.crop_bottom}] 高${cropH}`));
+      head.appendChild(el('span', null, `首头像(分割) @ ${s.split_y ?? '无'}`));
+      card.appendChild(head);
+
+      const row = el('div', 'row');
+
+      // 1. 原图
+      const colFull = el('div', 'col');
+      colFull.appendChild(el('div', 'label', '原图'));
+      colFull.appendChild(imgWrap(s.full, `screen${i} full`));
+      row.appendChild(colFull);
+
+      // 2. 消息区 copy1 + 与上一张重叠：内容下移 dy，重叠在本屏【底部】[dy, cropH]
+      const colC1 = el('div', 'col');
+      colC1.appendChild(el('div', 'label', '消息区 · 与上一张重叠(底部)'));
+      const w1 = imgWrap(s.crop, `screen${i} crop1`);
+      if (i >= 1) {
+        const dy = screens[i].dy;
+        const topPct = Math.min(100, dy / cropH * 100);
+        const hPct = Math.max(0, (cropH - dy) / cropH * 100);
+        const msk = el('div', 'mask prev');
+        msk.style.top = topPct + '%';
+        msk.style.height = hPct + '%';
+        msk.appendChild(el('span', 'mtag', `与上一张重叠 [${Math.round(dy)} : ${cropH}]`));
+        w1.appendChild(msk);
+      }
+      colC1.appendChild(w1);
+      row.appendChild(colC1);
+
+      // 3. 消息区 copy2 + 与下一张重叠：下一张更旧，重叠在本屏【顶部】[0, cropH-dy]
+      const colC2 = el('div', 'col');
+      colC2.appendChild(el('div', 'label', '消息区 · 与下一张重叠(顶部)'));
+      const w2 = imgWrap(s.crop, `screen${i} crop2`);
+      if (i < screens.length - 1) {
+        const dyNext = screens[i + 1].dy;
+        const hPct = Math.max(0, (cropH - dyNext) / cropH * 100);
+        const msk = el('div', 'mask next');
+        msk.style.height = hPct + '%';
+        msk.appendChild(el('span', 'mtag', `与下一张重叠 [0 : ${Math.round(cropH - dyNext)}]`));
+        w2.appendChild(msk);
+      }
+      colC2.appendChild(w2);
+      row.appendChild(colC2);
+
+      // 4. 分割残缺块 B(上)/A(下)
+      const colS = el('div', 'col');
+      colS.appendChild(el('div', 'label', '分割残缺块 · B(上)/A(下)'));
+      const w3 = imgWrap(s.crop, `screen${i} split`);
+      if (s.split_y != null) {
+        const pct = Math.min(100, Math.max(0, s.split_y / cropH * 100));
+        const sp = el('div', 'split');
+        sp.style.top = pct + '%';
+        sp.appendChild(el('span', 'stag', `首头像顶 y=${s.split_y}`));
+        w3.appendChild(sp);
+        const b = el('div', 'band b'); b.textContent = 'B 顶部残缺（待补全）'; w3.appendChild(b);
+        const a = el('div', 'band a'); a.textContent = 'A 完整段（可入库）'; w3.appendChild(a);
+      }
+      colS.appendChild(w3);
+      row.appendChild(colS);
+
+      card.appendChild(row);
+      cards.appendChild(card);
+    }
+  } catch (e) { showEmpty('加载失败: ' + e); }
+}
+
+const rParam = new URLSearchParams(location.search).get('r');
+if (rParam) loadReplay(rParam);
+loadPicker();
+</script>
+</body>
+</html>

@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>滚动连续流 · 两列重叠对齐</title>
+<style>
+  :root {
+    --canvas: #0d1017; --ink: #d7dce4; --muted: #8b93a3;
+    --panel: #141a24; --hairline: #2a3140;
+    --accent: #4c8dff; --green: #3fb950; --coral: #ff6b5e; --yellow: #f5c344;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: var(--canvas); color: var(--ink); margin: 0; padding: 24px; line-height: 1.5;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { font-size: 13px; color: var(--muted); margin-bottom: 16px; }
+  a.back { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .legend { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+  .legend span { display: inline-block; width: 14px; height: 14px; border-radius: 3px;
+                 vertical-align: -3px; margin-right: 4px; }
+  .flow-scroll { overflow: auto; max-height: 88vh; border: 1px solid var(--hairline);
+                 border-radius: 12px; background: var(--panel); padding: 20px; }
+  #flow { position: relative; margin: 0 auto; }
+  .fimg { position: absolute; border: 1px solid var(--hairline); border-radius: 6px;
+          background: #000; }
+  .fimg .tag { position: absolute; top: -20px; left: 0; font-size: 11px; font-weight: 700;
+               color: var(--ink); background: rgba(13,16,23,.9); padding: 1px 8px;
+               border-radius: 4px; white-space: nowrap; }
+  /* 切分虚线（首头像顶，分割 B 顶部残缺 / A 完整段） */
+  .split { position: absolute; left: 0; width: 100%; border-top: 2px dashed var(--yellow);
+           pointer-events: none; z-index: 4; }
+  .split .stag { position: absolute; right: 0; top: -16px; font-size: 10px; font-weight: 700;
+                 color: var(--yellow); background: rgba(13,16,23,.9); padding: 0 6px;
+                 border-radius: 3px; white-space: nowrap; }
+  /* 消息级裁切：蓝色细虚线（第四列） */
+  .msgline { position: absolute; left: 0; width: 100%; border-top: 1px dashed var(--accent);
+             pointer-events: none; z-index: 4; opacity: .9; }
+  .msgline .mltag { position: absolute; left: 0; top: -14px; font-size: 9px; font-weight: 700;
+                    color: var(--accent); background: rgba(13,16,23,.85); padding: 0 4px;
+                    border-radius: 3px; white-space: nowrap; }
+  /* 第五列：消息卡片 */
+  .msgcards { position: absolute; border: 1px solid var(--hairline); border-radius: 6px;
+              background: rgba(20,26,36,.6); overflow: hidden; }
+  .msgcard { position: absolute; left: 4px; right: 4px; background: rgba(38,48,68,.55);
+             border-radius: 4px; padding: 2px 4px; box-sizing: border-box;
+             border-left: 2px solid var(--hairline); }
+  .msgcard .mtext { font-size: 9px; line-height: 1.35; color: var(--ink);
+                    overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+                    -webkit-line-clamp: 3; -webkit-box-orient: vertical; word-break: break-all; }
+  .msgcard .mscore { color: var(--accent); font-weight: 700; -webkit-line-clamp: 1; }
+  .fac { display: inline-block; font-size: 8px; font-weight: 800; color: #0d1017;
+         padding: 0 4px; border-radius: 3px; margin-bottom: 1px; white-space: nowrap; }
+  .fac.双因子 { background: var(--green); }
+  .fac.单因子 { background: var(--yellow); }
+  .fac.未知 { background: var(--coral); }
+  .fac.时间 { background: #9aa5b5; }
+  .fac.自己 { background: var(--accent); }
+  .band { position: absolute; left: 0; width: 100%; font-size: 9px; font-weight: 700;
+          pointer-events: none; text-align: center; z-index: 3; }
+  .band.b { top: 2px; color: var(--coral); }
+  .band.a { bottom: 2px; color: var(--green); }
+  /* 重叠区标注：全宽横线贯穿左右两列（便于对比同一高度的重叠内容） */
+  .ov { position: absolute; left: 0; width: 100%; height: 0; pointer-events: none;
+        border-top: 3px solid; z-index: 5; }
+  .ov.prev { border-color: var(--accent); }    /* 蓝=与上一张重叠（本屏底部边界） */
+  .ov.next { border-color: var(--coral); }     /* 红=与下一张重叠（本屏顶部边界） */
+  .ov .otag { position: absolute; left: 4px; top: 3px; font-size: 10px; font-weight: 700;
+              background: rgba(13,16,23,.9); padding: 0 6px; border-radius: 3px; white-space: nowrap; }
+  .ov.prev .otag { color: var(--accent); }
+  .ov.next .otag { color: var(--coral); }
+  .empty { color: var(--muted); font-size: 14px; padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<h1>🪜 滚动连续流 <span id="title" style="font-size:13px;color:var(--muted)"></span></h1>
+<div class="subtitle">两列蛇形：左 session0 → 右 session1 → 左 session2 → …，从底部向上接；<b style="color:var(--accent)">蓝线</b>=与上一张重叠（本屏底部边界）、<b style="color:var(--coral)">红线</b>=与下一张重叠（本屏顶部边界）——全宽贯穿左右两列，相邻屏的重叠内容在同一高度便于对比；黄虚线=每屏首头像顶（B 顶部残缺 / A 完整段）；第三列=每页缝合完毕结果（A2 上 + B1 下），黄虚线=裁切线（首头像顶）；第三列无红蓝线、无缝合线；第四列=缝合图的<b style="color:var(--accent)">消息级裁切</b>（蓝色细虚线，每条消息/时间戳的 y 范围）；第五列=每条裁切消息的<b>内容 + 识别方式 + 匹配度</b>（识别方式：双因子/单因子/未知/时间/自己；匹配度：头像分=BGR模板+Hue直方图复合分、昵称分=与花名册昵称的相似度、→候选成员）。</div>
+<div class="legend"><span style="background:var(--accent)"></span>与上一张重叠&nbsp;&nbsp;<span style="background:var(--coral)"></span>与下一张重叠&nbsp;&nbsp;<span id="picker" style="display:inline"></span></div>
+<div class="flow-scroll"><div id="flow"></div></div>
+<div id="empty" class="empty" style="display:none"></div>
+
+<script>
+const flow = document.getElementById('flow');
+const empty = document.getElementById('empty');
+const picker = document.getElementById('picker');
+
+async function loadPicker() {
+  try {
+    const r = await fetch('/api/scroll_replay');
+    const d = await r.json();
+    const replays = (d && d.replays) || [];
+    for (const rp of replays) {
+      const a = document.createElement('a');
+      a.href = '/scroll_flow?r=' + encodeURIComponent(rp.name);
+      a.textContent = `${rp.group} · ${rp.screens}屏`;
+      a.style.cssText = 'color:var(--accent);text-decoration:none;margin:0 8px;font-size:11px;';
+      if (new URLSearchParams(location.search).get('r') === rp.name)
+        a.style.cssText += 'font-weight:800;';
+      picker.appendChild(a);
+    }
+  } catch (e) { /* 无列表时不显示 */ }
+}
+
+async function load(name) {
+  try {
+    const r = await fetch('/api/scroll_replay?r=' + encodeURIComponent(name));
+    const d = await r.json();
+    if (!d.ok) { showEmpty(d.error || '加载失败'); return; }
+    const screens = d.replay.screens;
+    document.getElementById('title').textContent = `· ${d.replay.group} · ${screens.length} 屏`;
+    if (!screens.length) { showEmpty('无屏'); return; }
+    const flowMsgLines = [];   // 消息级蓝虚线（横跨第 4+5 列），画到 flow 容器
+
+    const W = 320, GAP = 28;
+    const imgW = 1080;                      // 截图宽度
+    const s = W / imgW;                     // 显示缩放
+    const H = screens[0].crop_bottom - screens[0].crop_top;
+    const displayH = H * s;
+
+    // 总高 = 一屏高 + 各 dy 之和（每张比上一张高 dy）
+    // dy<0 的屏（滑动异常，stitch 矮）不产生布局位移 → 按 0 处理
+    const dyv = i => Math.max(0, screens[i].dy) * s;
+    let total = displayH;
+    for (let i = 1; i < screens.length; i++) total += dyv(i);
+
+    flow.style.width = (5 * W + 4 * GAP) + 'px';
+    flow.style.height = total + 'px';
+
+    // session0 在底部；每张向上偏移 dy
+    let top0 = total - displayH;
+    for (let i = 0; i < screens.length; i++) {
+      let top = top0;
+      for (let j = 1; j <= i; j++) top -= dyv(j);
+
+      const wrap = document.createElement('div');
+      wrap.className = 'fimg';
+      wrap.style.width = W + 'px';
+      wrap.style.height = displayH + 'px';
+      wrap.style.left = (i % 2 === 0 ? 0 : W + GAP) + 'px';
+      wrap.style.top = top + 'px';
+
+      const tag = document.createElement('div');
+      tag.className = 'tag';
+      tag.textContent = `session${i} · dy=${screens[i].dy.toFixed(0)}`;
+      wrap.appendChild(tag);
+
+      const img = document.createElement('img');
+      img.src = screens[i].crop;
+      img.style.width = W + 'px';
+      img.style.display = 'block';
+      wrap.appendChild(img);
+
+      // 切分虚线：首头像顶（分割 B 顶部残缺 / A 完整段）
+      if (screens[i].split_y != null) {
+        const sp = document.createElement('div');
+        sp.className = 'split';
+        sp.style.top = (screens[i].split_y * s) + 'px';
+        const st = document.createElement('span');
+        st.className = 'stag';
+        st.textContent = `首头像顶 y=${screens[i].split_y}`;
+        sp.appendChild(st);
+        wrap.appendChild(sp);
+        const b = document.createElement('div');
+        b.className = 'band b';
+        b.textContent = 'B 顶部残缺';
+        wrap.appendChild(b);
+        const a = document.createElement('div');
+        a.className = 'band a';
+        a.textContent = 'A 完整段';
+        wrap.appendChild(a);
+      }
+      flow.appendChild(wrap);
+
+      // ---- 第三列：去重+拼接结果（A2 上 + B1 下，与流程同高对齐）
+      if (screens[i].stitch) {
+        const sw = document.createElement('div');
+        sw.className = 'fimg stitch';
+        sw.style.width = W + 'px';
+        sw.style.height = (screens[i].stitch_h * s) + 'px';
+        sw.style.left = (2 * (W + GAP)) + 'px';
+        sw.style.top = (top + (screens[i].stitch_top_rel || 0) * s) + 'px';
+        const stag2 = document.createElement('div');
+        stag2.className = 'tag';
+        stag2.textContent = `缝合 session${i}`;
+        sw.appendChild(stag2);
+        const simg = document.createElement('img');
+        simg.src = screens[i].stitch;
+        simg.style.width = W + 'px';
+        simg.style.display = 'block';
+        sw.appendChild(simg);
+        // 黄色裁切线（首头像顶，与前两列同一视觉语言）：
+        //   顶部 = 本屏首头像裁切处（B 残缺被裁掉，A 完整段从此开始）
+        //   底部 = 上一张首头像裁切处（B1 残缺段到此为止）
+        if (screens[i].split_y != null) {
+          const sl = document.createElement('div');
+          sl.className = 'split';
+          sl.style.top = '0px';
+          const sltag = document.createElement('span');
+          sltag.className = 'stag';
+          sltag.textContent = `裁切 本屏首头像 y=${screens[i].split_y}`;
+          sl.appendChild(sltag);
+          sw.appendChild(sl);
+        }
+        if (i >= 1 && screens[i - 1].split_y != null) {
+          const sl2 = document.createElement('div');
+          sl2.className = 'split';
+          sl2.style.top = (screens[i].stitch_h * s) + 'px';
+          const sl2tag = document.createElement('span');
+          sl2tag.className = 'stag';
+          sl2tag.textContent = `裁切 上一张首头像 y=${screens[i - 1].split_y}`;
+          sl2.appendChild(sl2tag);
+          sw.appendChild(sl2);
+        }
+        flow.appendChild(sw);
+
+        // ---- 第四列：stitch 的【消息级裁切】（蓝色细虚线，每条消息 y 范围）
+        // 蓝虚线横跨第 4+5 列（left=3*(W+GAP), width=2*W+GAP），统一画到 flow
+        // 容器（见下方 flowMsgLines.push），第 5 列卡片必须落在两条线内部。
+        const mw = document.createElement('div');
+        mw.className = 'fimg stitch';
+        mw.style.width = W + 'px';
+        mw.style.height = (screens[i].stitch_h * s) + 'px';
+        mw.style.left = (3 * (W + GAP)) + 'px';
+        mw.style.top = (top + (screens[i].stitch_top_rel || 0) * s) + 'px';
+        const mtag = document.createElement('div');
+        mtag.className = 'tag';
+        mtag.textContent = `消息裁切 session${i}`;
+        mw.appendChild(mtag);
+        const mimg = document.createElement('img');
+        mimg.src = screens[i].stitch;
+        mimg.style.width = W + 'px';
+        mimg.style.display = 'block';
+        mw.appendChild(mimg);
+        flow.appendChild(mw);
+        // 蓝虚线 = 头像上边缘（用户定稿：裁切线只有头像上边缘）
+        // 每条消息 1 条线（分割线），不画 y_bottom（那是下一条的 y_top）
+        for (const ay of (screens[i].avatar_lines || [])) {
+          const my = (top + (screens[i].stitch_top_rel || 0) * s) + (ay || 0) * s;
+          flowMsgLines.push({y: my, tag: `y=${ay}`});
+        }
+
+        // ---- 第五列：每条裁切消息的内容 + 识别方式 ----
+        const cx = document.createElement('div');
+        cx.className = 'msgcards';
+        cx.style.left = (4 * (W + GAP)) + 'px';
+        cx.style.top = (top + (screens[i].stitch_top_rel || 0) * s) + 'px';
+        cx.style.width = W + 'px';
+        cx.style.height = (screens[i].stitch_h * s) + 'px';
+        const ctag = document.createElement('div');
+        ctag.className = 'tag';
+        ctag.textContent = `识别 session${i}`;
+        cx.appendChild(ctag);
+        for (const msg of (screens[i].msgs || [])) {
+          const card = document.createElement('div');
+          card.className = 'msgcard';
+          const y0 = (msg.y_top || 0) * s;
+          const y1 = (msg.y_bottom || 0) * s;
+          card.style.top = y0 + 'px';
+          card.style.height = Math.max(20, (y1 - y0)) + 'px';
+          const fac = document.createElement('span');
+          fac.className = 'fac ' + facClass(msg.factor);
+          fac.textContent = msg.factor;
+          card.appendChild(fac);
+          // 匹配度：头像分 / 昵称分 / 候选昵称
+          if (msg.avatar_score != null || msg.nick_score != null) {
+            const mt = document.createElement('div');
+            mt.className = 'mtext mscore';
+            const parts = [];
+            if (msg.avatar_score != null)
+              parts.push(`头像${(msg.avatar_score * 100).toFixed(0)}%`);
+            if (msg.nick_score != null)
+              parts.push(`昵称${(msg.nick_score * 100).toFixed(0)}%`);
+            if (msg.avatar_cand) parts.push(`→${msg.avatar_cand}`);
+            mt.textContent = parts.join(' · ');
+            card.appendChild(mt);
+          }
+          const txt = document.createElement('div');
+          txt.className = 'mtext';
+          txt.textContent = (msg.content || (msg.type === 'multimedia' ? '[图片/文件]' : ''));
+          card.appendChild(txt);
+          cx.appendChild(card);
+        }
+        flow.appendChild(cx);
+      }
+    }
+
+    // 全宽重叠线（贯穿左右两列，画在 flow 容器上）：
+    //   蓝线（与上一张重叠）= 本屏底部重叠区上边界 y = T_i + dy_i*s
+    //   红线（与下一张重叠）= 本屏顶部重叠区下边界 y = T_i + (H-dy_{i+1})*s
+    for (let i = 0; i < screens.length; i++) {
+      let top = top0;
+      for (let j = 1; j <= i; j++) top -= dyv(j);
+      if (i >= 1) {
+        const o = document.createElement('div');
+        o.className = 'ov prev';
+        o.style.width = (2 * W + GAP) + 'px';
+        o.style.top = (top + dyv(i)) + 'px';
+        o.appendChild(elTag('与上一张重叠 dy=' + screens[i].dy.toFixed(0)));
+        flow.appendChild(o);
+      }
+      if (i < screens.length - 1) {
+        const dyN = dyv(i + 1);
+        const o = document.createElement('div');
+        o.className = 'ov next';
+        o.style.width = (2 * W + GAP) + 'px';
+        o.style.top = (top + displayH - dyN) + 'px';
+        o.appendChild(elTag('与下一张重叠 dy=' + screens[i + 1].dy.toFixed(0)));
+        flow.appendChild(o);
+      }
+    }
+
+    // 消息级蓝虚线：横跨第 4+5 列（left=3*(W+GAP), width=2*W+GAP）
+    for (const ln of flowMsgLines) {
+      const dl = document.createElement('div');
+      dl.className = 'msgline';
+      dl.style.left = (3 * (W + GAP)) + 'px';
+      dl.style.width = (2 * W + GAP) + 'px';
+      dl.style.top = ln.y + 'px';
+      if (ln.tag) {
+        const dlt = document.createElement('span');
+        dlt.className = 'mltag';
+        dlt.textContent = ln.tag;
+        dl.appendChild(dlt);
+      }
+      flow.appendChild(dl);
+    }
+  } catch (e) { showEmpty('加载失败: ' + e); }
+}
+
+function showEmpty(m) { empty.textContent = m; empty.style.display = 'block'; }
+
+function elTag(text) {
+  const t = document.createElement('span');
+  t.className = 'otag';
+  t.textContent = text;
+  return t;
+}
+
+function facClass(f) {
+  return (f === '双因子' || f === '单因子' || f === '未知'
+          || f === '时间' || f === '自己') ? f : '未知';
+}
+
+const r = new URLSearchParams(location.search).get('r');
+loadPicker();
+if (r) load(r); else document.getElementById('empty').textContent = '请从上方选择一个 replay';
+</script>
+</body>
+</html>

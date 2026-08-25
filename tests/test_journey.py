@@ -52,7 +52,7 @@ class FakeReader:
         self.fail_times = fail_times
         self.calls = 0
 
-    def sync_session(self, session, is_group):
+    def sync_session(self, session, is_group, reconcile=False):
         self.calls += 1
         if self.calls <= self.fail_times:
             return None
@@ -127,7 +127,7 @@ class TestIronRuleSync(unittest.TestCase):
         real_sync = reader.sync_session
         state = {"n": 0}
 
-        def sync(session, is_group):
+        def sync(session, is_group, reconcile=False):
             state["n"] += 1
             if state["n"] >= 2:   # 初次成功，末次及重试全失败
                 return None
