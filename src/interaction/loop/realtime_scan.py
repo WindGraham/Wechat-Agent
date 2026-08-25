@@ -18,6 +18,7 @@
 """
 
 import hashlib
+import json
 import os
 import random
 import time
@@ -90,6 +91,28 @@ def _entry_key(e):
     return f"{e.sender}|{e.content_type}|{normalize(e.content)[:30]}"
 
 
+def _media_to_entry(result, m, group, time_hint):
+    """把 MediaHandler 的 MediaResult 转成 message_log 可接受的 entry。
+
+    content_type 用 result.msg_type（media/image/sticker/link/chat_record/...）；
+    media_path 汇总所有中间文件。content 若是 dict 则 JSON 序列化。
+    """
+    is_mine = m.get("side") == "self"
+    sender = "我" if is_mine else (m.get("matched_user_name") or m.get("nickname") or "")
+    content = result.content
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    import re as _re
+    sender = _re.sub(r"有人[@＠]?我.*$", "", sender).strip()
+    return SimpleNamespace(
+        sender=sender, is_mine=is_mine, content=content,
+        content_type=result.msg_type, complete=1,
+        partial_top=False, partial_bottom=False,
+        mentions=[], media_path=";".join(result.raw_files),
+        ocr_conf=None, kind="msg", time_hint=time_hint,
+    )
+
+
 def scroll_to_latest(dev, n=30):
     for _ in range(n):
         dev.swipe(540, 1400, 540, 1100, 150)
@@ -118,7 +141,8 @@ def do_swipe(dev, direction="earlier"):
 
 
 def realtime_scan(conn, group, max_rounds=40, on_new=None, scroll_back=True,
-                  dev=None, stop_empty_rounds=0, reconcile_uncertain=False):
+                  dev=None, stop_empty_rounds=0, reconcile_uncertain=False,
+                  handle_media=False):
     """实时滚动采集：每屏识别 → 全局去重 → 实时入库。返回累计入库消息数。
 
     stop_empty_rounds>0 时：连续 N 屏入库 0 条（已滚到库里已有的历史、即
@@ -127,6 +151,9 @@ def realtime_scan(conn, group, max_rounds=40, on_new=None, scroll_back=True,
     reconcile_uncertain=True 时：识别双因子失配（slice_chat 标 uncertain_entity）
     的消息，会在其仍在屏上时点头像进资料页调和（改名/换头像），再退回聊天页
     继续滚动。默认 False（不打断滚动）。
+
+    handle_media=True 时：对非文本多媒体消息调用 media_handler（点击→处置→
+    返回聊天页→继续），把结果入库。默认 False（保持轻量滚动，不做任何 tap）。
     """
     dev = dev or DeviceCtl()
     rm = RosterMatcher(group)
@@ -165,6 +192,23 @@ def realtime_scan(conn, group, max_rounds=40, on_new=None, scroll_back=True,
                     new_entries.append(e)
                 continue
             if c["state"] == "complete":
+                if handle_media:
+                    from src.interaction.ports.android.perception.media_handler import (
+                        MediaHandler, classify_slice_to_task)
+                    task, label = classify_slice_to_task(img, m, group)
+                    if task is not None:
+                        try:
+                            result = MediaHandler(dev).handle(task)
+                            if result.success:
+                                e = _media_to_entry(result, m, group, cur_divider)
+                                k = _entry_key(e)
+                                if k not in seen:
+                                    seen.add(k)
+                                    e.crop_path = save_crop(img, group, c["y_top"], c["y_bottom"], k)
+                                    new_entries.append(e)
+                        except Exception as em:  # noqa: BLE001
+                            print(f"    [media] {task.msg_type} id={task.msg_id} 处理失败: {em}")
+                        continue
                 e = to_entry(m, group)
                 e.time_hint = cur_divider
                 k = _entry_key(e)

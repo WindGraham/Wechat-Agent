@@ -182,6 +182,32 @@ A 的行动清空 → 最后一次日志同步 → 此时才向 Proxy 发 LogUpd
   2 条、每轮采集限 12 条；调和后校验仍在聊天页，否则停止本次采集。
   已入库消息的 sender 不事后改（align_key 锚定依赖 sender）。
 
+### 9. 多媒体消息处置（2026-08-25）
+
+文字泡之外的图片/表情包/聊天记录转发卡/链接/文件卡/红包，由
+`perception/media_handler.py` 统一处置。同步时对 `slice_chat` 的非 text/quote
+消息，用 `classify_slice_to_task`（内部调 `media_classifier.classify_segment`）
+定类型 → 构造 `MediaTask` → `MediaHandler.handle()` 点击/打开 → 按页面签名
+分流取回内容 → 返回 `MediaResult`（content + raw_files + run_dir）。
+
+- **页面签名**（`_detect_page_signature`，OCR 顶部/底部关键词）：
+  `chat_record` / `webview`(复制链接) / `photo_viewer` / `video_viewer` /
+  `sticker_detail` / `file_card` / `unknown`。
+- **链接**：进 webview → ⋯ → 复制链接 → `DeviceCtl.read_clipboard()` 直读
+  （root+setuid 常驻服务，~10-20ms，见 `tools/clipboard/ClipIOServer.java`）；
+  失败回退「粘贴→底部 OCR→清空」。
+- **聊天记录卡**：`_read_chat_record` 滚动 OCR，`_parse_chat_record_screen`
+  两遍法按时间戳/发送者/内容解析。
+- **图片/视频**：`_save_photo_or_video` 长按保存→pull→删源→返回。
+- **表情包**：`_handle_sticker_detail` 裁上半屏最大非背景块。
+- **文件卡**：`_handle_file`（基础版）OCR 定位「保存/下载」，轮询目录 pull。
+- **红包**：仅记录，不自动点开。
+
+**接入**：`realtime_scan(handle_media=False)` 默认关闭（保持轻量滚动）；置
+True 时对非文本完整消息调用 `MediaHandler`，结果经 `_media_to_entry` 入库。
+所有处置落盘 `workspace/media/{type}/{msg_id}_{ts}/`（含 manifest.json），
+`workspace/media/collect_debug/` 留错误现场；异常统一 `_return_to_chat` 回聊天页。
+
 ## 二、明确不做
 
 - 不组装 prompt（只发 LogUpdated + 提供历史/差分读取接口）

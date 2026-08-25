@@ -17,6 +17,8 @@ import random
 import re
 import shlex
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -46,6 +48,14 @@ ADBKB_APK_URL = "https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKeyboard.ap
 CAPTURE_TMP_DIR = os.path.join(PROJECT_ROOT, "workspace", "runtime", "tmp")
 
 SCREEN_W, SCREEN_H = 1080, 2340
+
+# ---- 剪贴板读取（Android 15 root，见 tools/clipboard/ClipIO.java）----
+# 原理：Android 15 剪贴板读门控 = 读取者必须是「默认 IME」或「聚焦 App」。
+# 以 root 跑 app_process → setuid(聚焦 App 的 uid) → IClipboard.getPrimaryClip。
+# dex 是预编译产物（无需真机 SDK）；源码/构建见 tools/clipboard/。
+CLIP_DEX_SRC = os.path.join(PROJECT_ROOT, "tools", "clipboard", "dex", "clip.dex")
+CLIP_DEX_REMOTE = "/data/local/tmp/clip.dex"
+CLIP_OUT_REMOTE = "/data/local/tmp/clip_read.txt"
 
 log = logging.getLogger("device_ctl")
 
@@ -286,19 +296,110 @@ class DeviceCtl:
         self._input_text_unicode(text)
         self.wait_random(150, 350)
 
-    def get_clipboard(self) -> str:
+    def _ensure_clip_dex(self):
+        """把剪贴板读取器 dex 推到设备（与本地大小一致则跳过）。"""
+        if not os.path.exists(CLIP_DEX_SRC):
+            raise RuntimeError(f"剪贴板 dex 缺失：{CLIP_DEX_SRC}。"
+                               f"请运行 tools/clipboard/build.sh")
+        local_size = os.path.getsize(CLIP_DEX_SRC)
+        try:
+            remote_size = int(self._shell(
+                f"wc -c < {CLIP_DEX_REMOTE} 2>/dev/null").decode(errors="replace").strip() or 0)
+        except ValueError:
+            remote_size = -1
+        if remote_size != local_size:
+            self._run(["push", CLIP_DEX_SRC, CLIP_DEX_REMOTE], timeout=30)
+
+    # ---- 剪贴板常驻服务（daemon，读 ~0ms）----
+    CLIP_PORT = 7001
+
+    @staticmethod
+    def _recv_exact(sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def _clip_ping(self, timeout=0.6):
+        """常驻服务是否真的健在（发 'P' 心跳做完整往返，避免 adb forward 的假连接）。"""
+        try:
+            with socket.create_connection(("127.0.0.1", self.CLIP_PORT), timeout=timeout) as s:
+                s.sendall(b"P")
+                hdr = self._recv_exact(s, 4)
+                if len(hdr) == 4 and struct.unpack(">I", hdr)[0] == 0:
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def _clip_daemon(self):
+        """确保常驻服务已起并已 forward；成功返回 True。"""
+        if self._clip_ping():
+            return True
+        self._ensure_clip_dex()
+        try:
+            self._run(["forward", f"tcp:{self.CLIP_PORT}", f"tcp:{self.CLIP_PORT}"])
+            # su 用双引号、sh -c 用单引号 —— 这样 setsid & 不会让 adb shell 阻塞
+            self._shell(f'su -c "setsid sh -c \'CLASSPATH={CLIP_DEX_REMOTE} '
+                        f'app_process / ClipIOServer >/dev/null 2>&1 &\'"')
+        except Exception as e:  # noqa: BLE001
+            log.warning("clipsrv start failed: %s", e)
+        for _ in range(25):          # 最多等 ~5s
+            if self._clip_ping():
+                return True
+            time.sleep(0.2)
+        return self._clip_ping()
+
+    def _clip_request(self, cmd_byte):
+        """向常驻服务发单个命令并读回复；失败抛异常。"""
+        with socket.create_connection(("127.0.0.1", self.CLIP_PORT), timeout=5) as s:
+            s.sendall(cmd_byte.encode())
+            hdr = self._recv_exact(s, 4)
+            if len(hdr) < 4:
+                raise RuntimeError("clipsrv 无响应")
+            n = struct.unpack(">I", hdr)[0]
+            data = self._recv_exact(s, n)
+        return data.decode("utf-8", errors="replace").strip()
+
+    def read_clipboard(self) -> str:
+        """读取剪贴板文本（Android 15 root：常驻服务 setuid 到聚焦 App 后读）。
+
+        return：剪贴板文本；空串 = 无文本/无法读取。优先走常驻服务（~0ms），
+        服务不可用时回退一次性 app_process（以聚焦 App 身份 getPrimaryClip，
+        ClipData 里所有 item 的 text 拼接）。
         """
-        通过提权方式获取剪贴板文本。
-        依赖：Android 10+ 需要切换到特权 IME，或在此环境中使用 su。
-        """
-        # 目前测试机有 root 权限，直接利用 su 绕过焦点限制提取
-        # 注意: 如果需要兼容非 root 机型，此处后续替换为 ADBKeyBoard 广播
-        out = self._shell('su -c "service call clipboard 2 s16 com.android.shell"')
-        # 简单解析 parcel 返回的 UTF-16 Hex (防截断和特殊字符)
-        # 此处暂时返回占位符或解析逻辑
-        if "Result: Parcel" in out:
-            return "wxid_or_nickname_from_clipboard"
-        return ""
+        try:
+            if self._clip_daemon():
+                return self._clip_request("R")
+        except Exception as e:  # noqa: BLE001
+            log.warning("read_clipboard daemon 失败，回退 one-shot: %s", e)
+        # fallback：一次性 app_process
+        self._ensure_clip_dex()
+        self._shell(f"su -c 'touch {CLIP_OUT_REMOTE} && chmod 666 {CLIP_OUT_REMOTE}'")
+        self._shell(f"su -c 'CLASSPATH={CLIP_DEX_REMOTE} app_process / ClipIO read'")
+        out = self._shell(f"cat {CLIP_OUT_REMOTE}").decode(errors="replace").strip()
+        if out.startswith("ERR["):
+            log.warning("read_clipboard one-shot: %s", out)
+            return ""
+        return out
+
+    def set_clipboard(self, text: str) -> None:
+        """写剪贴板（root，测试/预置用）。优先常驻服务，回退一次性。"""
+        try:
+            if self._clip_daemon():
+                b = text.encode("utf-8")
+                with socket.create_connection(("127.0.0.1", self.CLIP_PORT), timeout=5) as s:
+                    s.sendall(b"S" + struct.pack(">I", len(b)) + b)
+                    self._recv_exact(s, 4)
+                return
+        except Exception as e:  # noqa: BLE001
+            log.warning("set_clipboard daemon 失败，回退 one-shot: %s", e)
+        self._ensure_clip_dex()
+        self._shell(f"su -c 'CLASSPATH={CLIP_DEX_REMOTE} "
+                    f"app_process / ClipIO set {shlex.quote(text)}'")
 
     def _ensure_adb_keyboard(self):
         out = self._shell(f"pm list packages {ADBKB_PKG}").decode(errors="replace")

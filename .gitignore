@@ -14,3 +14,8 @@ assets/emojis/
 nas-backup/
 noVNC/
 vnc_hash.txt
+tools/clipboard/r8.jar
+# 剪贴板读取器构建产物（build.sh 重新生成）
+tools/clipboard/r8.jar
+tools/clipboard/out/
+tools/clipboard/dex/classes.dex
