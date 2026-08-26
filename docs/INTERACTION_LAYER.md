@@ -190,18 +190,30 @@ A 的行动清空 → 最后一次日志同步 → 此时才向 Proxy 发 LogUpd
 定类型 → 构造 `MediaTask` → `MediaHandler.handle()` 点击/打开 → 按页面签名
 分流取回内容 → 返回 `MediaResult`（content + raw_files + run_dir）。
 
-- **页面签名**（`_detect_page_signature`，OCR 顶部/底部关键词）：
+- **页面签名**（`_detect_page_signature`，全帧 OCR + 返回稳定帧）：
   `chat_record` / `webview`(复制链接) / `photo_viewer` / `video_viewer` /
-  `sticker_detail` / `file_card` / `unknown`。
+  `sticker_detail` / `file_card` / `media_viewer` / `unknown`。
+  注意（2026-08-26 真机标定）：文件卡的「文件大小/11.9KB」在屏幕**中部**，
+  顶部+底部双条 OCR 会漏，必须全帧；页面切换的过渡帧是纯黑，会被
+  `media_viewer`（黑像素占比>0.25）误吞——判到黑底时等 ~1s 重截重判一次，
+  后续裁切必须用返回的稳定帧。
 - **链接**：进 webview → ⋯ → 复制链接 → `DeviceCtl.read_clipboard()` 直读
   （root+setuid 常驻服务，~10-20ms，见 `tools/clipboard/ClipIOServer.java`）；
   失败回退「粘贴→底部 OCR→清空」。
 - **聊天记录卡**：`_read_chat_record` 滚动 OCR，`_parse_chat_record_screen`
   两遍法按时间戳/发送者/内容解析。
-- **图片/视频**：`_save_photo_or_video` 长按保存→pull→删源→返回。
+- **图片/视频**：`_save_photo_or_video` 长按出 action sheet，OCR 关键词
+  判定图片/视频（查看器初始界面是无文字标签的 4 图标，无法预先区分）；
+  **同一消息重复保存会弹「已保存过图片到系统相册/再次保存」确认框，需自动点
+  「再次保存」**；取文件用「操作前快照文件名集合 → 等新名字出现」差集法
+  （不能取目录最新文件，会拉到无关旧文件）→ pull → 删手机源文件 → 回会话。
 - **表情包**：`_handle_sticker_detail` 裁上半屏最大非背景块。
-- **文件卡**：`_handle_file`（基础版）OCR 定位「保存/下载」，轮询目录 pull。
+- **文件卡**：`_handle_file` 预览页 → 右上角 ⋯ → 菜单精确匹配「保存」
+  （不支持预览的类型页面只有「用其他应用打开」死路，保存入口只在 ⋯ 菜单）→
+  文件落 `/sdcard/Download/WeiXin/<原文件名>` → 差集法取回 → pull → 删源。
 - **红包**：仅记录，不自动点开。
+- **点击前置校验**：`_verify_in_chat` OCR 顶部标题条确认在目标会话页，
+  不在则拒绝点击（防首页残留状态 + 旧 bbox 乱点进别人会话）。
 
 **接入**：`realtime_scan(handle_media=False)` 默认关闭（保持轻量滚动）；置
 True 时对非文本完整消息调用 `MediaHandler`，结果经 `_media_to_entry` 入库。

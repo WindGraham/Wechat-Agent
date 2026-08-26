@@ -449,20 +449,20 @@ for msg in messages:
 
 - [x] 链接读取：root+setuid 直读剪贴板 `read_clipboard()`（真机返回 URL；见 §2.2.1）；输入框 OCR 保留为回退
 - [x] 链接读取：`media_handler._read_link_from_webview()` 直读剪贴板，OCR 回退；真机 e2e 验证通过（游泳馆群「学生助理招新通知」→ 复制链接 → 常驻读 → 返回 `https://mp.weixin.qq.com/s/GAV9uRX7RivF6calz-RNOw`）；webview 签名漏判已修复（unknown→链接流+OCR找复制链接）
-- [x] 图片处置：`_handle_media`/`_save_photo_or_video`（真机签名探测过；照片保存流待真实照片样本）
-- [x] 视频处置：`_save_photo_or_video(is_video=True)`（代码；视频样本待验证）
+- [x] 图片处置：`_handle_media`/`_save_photo_or_video`（2026-08-26 文件传输助手真机 e2e 通过：点击气泡→黑底查看器（黑像素占比签名 media_viewer）→长按→action sheet OCR 定位「保存图片」→**重复保存确认框「再次保存」自动处理**→差集法认新文件→pull→删手机源文件→回会话）
+- [x] 视频处置：`_save_photo_or_video(is_video=None)` 长按后按 action sheet 关键词自动判定图片/视频（代码就绪；真实视频样本待验证）
 - [x] 表情包处置：`_handle_sticker`/`_handle_sticker_detail`（已真机验证）
 - [x] 聊天记录卡：`_read_chat_record` + 改进版 `_parse_chat_record_screen`（已真机验证，解析按时间/发送者/内容）
-- [x] 文件卡：`_handle_file`（基础版，OCR/CV 定位；语料不足待样本细化）
+- [x] 文件卡：`_handle_file`（2026-08-26 真机 e2e 通过：预览页 → 右上角 ⋯ → 菜单精确匹配「保存」→ `/sdcard/Download/WeiXin/` 差集法取回 → pull → 删源；不支持预览的类型页面只有「用其他应用打开」死路，保存入口只在 ⋯ 菜单）
 - [x] 红包：`_handle_red_packet()`（仅记录）
-- [x] 页面签名库：`_detect_page_signature`（chat_record/webview/photo/video/sticker/file_card 全判，真机验证 chat_record+sticker）
-- [x] 异常回退：`handle()` try/except + `_save_error_shot` + `_return_to_chat`
+- [x] 页面签名库：`_detect_page_signature` 改全帧 OCR + 返回稳定帧（文件卡「文件大小」在屏幕中部，双条带会漏；黑色过渡帧重判防误吞）→ chat_record/webview/photo/video/sticker/file_card/media_viewer 全判
+- [x] 异常回退：`handle()` try/except + `_save_error_shot` + `_return_to_chat` + **点击前 `_verify_in_chat` 校验当前页标题**（防首页残留+旧 bbox 乱点进别人会话，2026-08-26 真机踩过）
 - [x] 接入 `realtime_scan.py`: 新增默认关闭的 `handle_media` 参数 + `classify_slice_to_task` 桥接（避免改变现有轻量扫描）
 - [ ] 接入 `session_reader.py`（`src/interaction/reader/session_reader.py`，未接入）
 - [ ] 接入 `history_collect.py`（未接入）
 - [x] 中间文件落盘：`MediaResult.run_dir` + `_write_manifest`（每个消息写 manifest.json）
-- [x] 单元测试：`tests/test_media_handler.py`（11 项，离线 mock run_ocr）
-- [x] 真机冒烟测试：聊天记录卡/表情包/OCR点击/常驻剪贴板读/**链接复制→常驻读**（游泳馆群公众号文章 e2e 返回 URL）已真机验证；图片保存/文件卡待真实照片/文件消息样本
+- [x] 单元测试：`tests/test_media_handler.py`（14 项，离线 mock run_ocr，全过）
+- [x] 真机冒烟测试：聊天记录卡/表情包/OCR点击/常驻剪贴板读/链接复制→常驻读/**图片保存（含重复保存确认框）**/**文件卡（⋯→保存→差集取回）**全部真机 e2e 通过（文件传输助手自建样本，测试消息保留作回归 fixture）
 - [ ] 更新 `docs/INTERACTION_LAYER.md`
 - [ ] commit push
 

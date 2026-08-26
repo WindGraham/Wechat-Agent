@@ -29,6 +29,7 @@ class _FakeDev:
     def __init__(self):
         self.taps = []
         self.backs = 0
+        self.frame = None          # capture_bytes 返回值（签名重判路径用）
 
     def tap(self, x, y):
         self.taps.append((x, y))
@@ -38,6 +39,9 @@ class _FakeDev:
 
     def back(self):
         self.backs += 1
+
+    def capture_bytes(self):
+        return self.frame
 
 
 class MediaHandlerOffline(unittest.TestCase):
@@ -137,9 +141,33 @@ class MediaHandlerOffline(unittest.TestCase):
         import numpy as np
         big_h, big_w = 2340, 1080
         dummy = np.zeros((big_h, big_w, 3), np.uint8)
+        self.h.dev.frame = dummy
         for sig, text in cases.items():
             self._set_ocr([item(60, int(0.9 * big_h), 400, int(0.9 * big_h) + 40, text)])
-            self.assertEqual(self.h._detect_page_signature(dummy), sig, sig)
+            got, _frame = self.h._detect_page_signature(dummy)
+            self.assertEqual(got, sig, sig)
+
+    def test_detect_page_signature_file_card_midscreen(self):
+        """文件卡的「文件大小/11.9KB」在屏幕中部（不在底部条）也要判 file_card。"""
+        import numpy as np
+        big_h, big_w = 2340, 1080
+        dummy = np.zeros((big_h, big_w, 3), np.uint8)
+        self.h.dev.frame = dummy
+        self._set_ocr([
+            item(300, 700, 700, 750, "标题党耻辱柱.md"),
+            item(300, 820, 640, 870, "文件大小: 11.9KB"),
+        ])
+        got, _frame = self.h._detect_page_signature(dummy)
+        self.assertEqual(got, "file_card")
+
+    def test_detect_page_signature_media_viewer_black(self):
+        """黑底无文字 → media_viewer（全屏图片/视频查看器）。"""
+        import numpy as np
+        dummy = np.zeros((2340, 1080, 3), np.uint8)
+        self.h.dev.frame = dummy
+        self._set_ocr([])
+        got, _frame = self.h._detect_page_signature(dummy)
+        self.assertEqual(got, "media_viewer")
 
     # ------------------------------------------------------------- 桥接（slice -> task）
 

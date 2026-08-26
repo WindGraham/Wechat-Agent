@@ -141,13 +141,21 @@ class MediaHandler:
         try:
             if task.msg_type == "text":
                 result = self._handle_text(task)
-            elif task.msg_type == "link" or task.msg_type == "card":
-                # 先尝试链接，若页面不是 webview 再按聊天记录卡/文件卡处理
-                result = self._handle_link_or_card(task)
-            elif task.msg_type == "media":
-                result = self._handle_media(task)
-            elif task.msg_type == "sticker":
-                result = self._handle_sticker(task)
+            elif task.msg_type in ("link", "card", "media", "sticker"):
+                # 这些类型要点击屏幕：先确认当前就在目标聊天页。
+                # 教训（2026-08-26）：首页残留状态 + 旧 bbox = 乱点进别人会话。
+                if not self._verify_in_chat(task):
+                    result = MediaResult(
+                        msg_id=task.msg_id, msg_type=task.msg_type,
+                        content=None,
+                        error=f"当前不在目标聊天页（期望 {task.group_name}），拒绝点击")
+                elif task.msg_type in ("link", "card"):
+                    # 先尝试链接，若页面不是 webview 再按聊天记录卡/文件卡处理
+                    result = self._handle_link_or_card(task)
+                elif task.msg_type == "media":
+                    result = self._handle_media(task)
+                else:
+                    result = self._handle_sticker(task)
             elif task.msg_type == "red_packet":
                 result = self._handle_red_packet(task)
             else:
@@ -163,6 +171,32 @@ class MediaHandler:
                 content=None, error=str(e))
         self._write_manifest(task, result)
         return result
+
+    def _verify_in_chat(self, task: MediaTask) -> bool:
+        """点击前校验：当前页标题与目标会话名一致（OCR 顶部标题条）。
+
+        标题可能带成员数后缀（如「陈曦猫猫群(9)」），用规范化后双向包含判定。
+        OCR 异常时放行（不阻塞主流程，后续页面签名仍会兜底）。
+        """
+        try:
+            img = self.dev.capture_bytes()
+            h = img.shape[0]
+            top = img[0:int(h * 0.12), :]
+            title = "".join(it["text"] for it in run_ocr(top))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[media] verify_in_chat OCR failed: %s, 放行", e)
+            return True
+
+        def _norm(s):
+            return re.sub(r"[\s　()（）\d]+", "", s or "")
+
+        nt, ng = _norm(title), _norm(task.group_name)
+        ok = bool(nt) and bool(ng) and (ng in nt or nt in ng)
+        if not ok:
+            log.warning("[media] verify_in_chat: title=%r 不含 %r，拒绝点击",
+                        title, task.group_name)
+            self._save_frame(img, task, "not_in_chat")
+        return ok
 
     def _write_manifest(self, task: MediaTask, result: MediaResult):
         """每个消息处置落盘 manifest.json（§5.3）。run_dir 为空则跳过。"""
@@ -212,7 +246,7 @@ class MediaHandler:
         self.dev.wait_random(1200, 1800)
 
         img = self.dev.capture_bytes()
-        sig = self._detect_page_signature(img)
+        sig, img = self._detect_page_signature(img)
         log.info("[media] after tap signature=%s", sig)
 
         if sig == "chat_record":
@@ -349,13 +383,13 @@ class MediaHandler:
         self.dev.wait_random(1500, 2200)
 
         img = self.dev.capture_bytes()
-        sig = self._detect_page_signature(img)
+        sig, img = self._detect_page_signature(img)
         log.info("[media] media after tap signature=%s", sig)
 
-        if sig == "photo_viewer":
-            return self._save_photo_or_video(task, is_video=False)
-        if sig == "video_viewer":
-            return self._save_photo_or_video(task, is_video=True)
+        if sig in ("photo_viewer", "video_viewer", "media_viewer"):
+            # media_viewer（黑底全屏查看器，无文字标签）也要走保存流：
+            # 图片/视频的区分放到长按后的 action sheet（保存图片/保存视频）再定。
+            return self._save_photo_or_video(task, is_video=(sig == "video_viewer"))
         if sig == "sticker_detail":
             return self._handle_sticker_detail(task, img)
         if sig == "webview":
@@ -370,30 +404,83 @@ class MediaHandler:
             content=None, raw_files=[err_path],
             error=f"未知媒体页面 signature={sig}")
 
-    def _save_photo_or_video(self, task: MediaTask, is_video: bool) -> MediaResult:
+    def _save_photo_or_video(self, task: MediaTask, is_video: Optional[bool] = None) -> MediaResult:
+        """全屏查看器（黑底）保存流。
+
+        is_video=None 时不预设类型：长按出 action sheet 后按「保存图片/保存视频」
+        关键词判定（查看器初始界面是无文字标签的 4 图标，OCR 无法区分）。
+        """
         run_dir = _ensure_dir(os.path.join(
-            MEDIA_ROOT, "videos" if is_video else "images",
+            MEDIA_ROOT, "media_saves",
             f"{task.msg_id}_{_ts()}"))
         files: List[str] = []
 
-        # 1) 长按图片/视频中心
+        # 0) 保存前快照目标目录（差集法认新文件，防拉到无关旧文件）；
+        #    此时还不知道是图片还是视频，两个目录都快照。
+        before_img = set(self._list_dir("/sdcard/Pictures/WeiXin"))
+        before_vid = set(self._list_dir("/sdcard/Movies/WeiXin"))
+
+        # 1) 长按图片/视频中心 → action sheet
         self.dev.long_press_rect(Rect(SCREEN_W // 2 - 50, SCREEN_H // 2 - 50, 100, 100))
         self.dev.wait_random(1000, 1500)
 
-        # 2) 点「保存图片」/「保存视频」
-        keyword = "保存视频" if is_video else "保存图片"
-        save_pos = self._find_text_on_screen(keyword, fallback=(111, 1884))
+        # 2) 截图 + OCR action sheet，判定类型并定位「保存图片/保存视频」
+        sheet = self.dev.capture_bytes()
+        sheet_path = os.path.join(run_dir, "action_sheet.png")
+        cv2.imwrite(sheet_path, sheet)
+        files.append(sheet_path)
+        items = run_ocr(sheet)
+        save_pos = None
+        if is_video is None or is_video:
+            save_pos = self._find_text_opt(items, "保存视频")
+            if save_pos is not None:
+                is_video = True
+        if save_pos is None:
+            save_pos = self._find_text_opt(items, "保存图片")
+            if save_pos is not None:
+                is_video = False
+        if save_pos is None:
+            self.dev.back()
+            self.dev.wait_random(600, 1000)
+            return MediaResult(
+                msg_id=task.msg_id, msg_type="media",
+                content=None, raw_files=files,
+                error="长按后 action sheet 未出现「保存图片/保存视频」",
+                run_dir=run_dir)
         self.dev.tap(*save_pos)
-        self.dev.wait_random(1500, 2500)
+        self.dev.wait_random(800, 1200)
 
-        # 3) 轮询手机目录等待文件出现
+        # 2b) 重复保存确认框：微信按消息记忆保存历史，同一消息第二次保存会弹
+        # 「已保存过图片到系统相册 / 再次保存 / 取消」。截图识别，命中则点「再次保存」。
+        after = self.dev.capture_bytes()
+        confirm_path = os.path.join(run_dir, "after_save_tap.png")
+        cv2.imwrite(confirm_path, after)
+        files.append(confirm_path)
+        rep_pos = self._find_text_opt(run_ocr(after), "再次保存")
+        if rep_pos is not None:
+            log.info("[media] repeat-save confirm dialog, tap 再次保存")
+            self.dev.tap(*rep_pos)
+            self.dev.wait_random(800, 1200)
+        else:
+            # 未弹确认框：after_save_tap.png 与 action_sheet 重复，不留垃圾
+            files.remove(confirm_path)
+            try:
+                os.remove(confirm_path)
+            except OSError:
+                pass
+
+        # 3) 轮询手机目录等待文件出现（差集法，只认快照之外的新名字）
         src_dir = "/sdcard/Movies/WeiXin" if is_video else "/sdcard/Pictures/WeiXin"
-        src_path = self._wait_for_new_file(src_dir, timeout=30)
+        src_path = self._wait_for_new_file(
+            src_dir, timeout=30,
+            exclude=before_vid if is_video else before_img)
         if not src_path:
             self.dev.back()
+            self.dev.wait_random(600, 1000)
             return MediaResult(
                 msg_id=task.msg_id, msg_type="video" if is_video else "image",
-                content=None, error=f"未在 {src_dir} 找到保存的文件")
+                content=None, raw_files=files,
+                error=f"未在 {src_dir} 找到保存的文件", run_dir=run_dir)
 
         # 4) pull 到电脑
         ext = os.path.splitext(src_path)[1] or (".mp4" if is_video else ".jpg")
@@ -405,7 +492,7 @@ class MediaHandler:
         # 5) 删除手机源文件
         self.dev._shell(f"rm -f {src_path}")
 
-        # 6) 回会话
+        # 6) 回会话（只按一次 back，按两次会退到首页）
         self.dev.back()
         self.dev.wait_random(800, 1200)
 
@@ -588,11 +675,14 @@ class MediaHandler:
     # ------------------------------------------------------------------ 文件卡
 
     def _handle_file(self, task: MediaTask, first_frame: np.ndarray) -> MediaResult:
-        """文件卡（基础版）：进入预览 → 尝试保存/下载 → pull → 删源 → 返回。
+        """文件卡：预览页 → 右上角 ⋯ → 菜单点「保存」→ /sdcard/Download/WeiXin/ 取回。
 
-        当前语料不足，仅实现基础路径：用一次 OCR 定位「保存到手机/下载/
-        用其他应用打开」按钮（不写死坐标），轮询常见下载目录找新文件并 pull。
-        遇到真实样本再细化（.pdf/.docx 等的预览页布局不同）。
+        真机标定（2026-08-26，.md 样本）：
+        - 不支持预览的类型页面只有「用其他应用打开」（死路，进系统选择器），
+          真正的保存入口在 ⋯ 菜单里（保存/收藏/浮窗/更多打开方式）。
+        - ⋯ → 保存 后文件落 /sdcard/Download/WeiXin/<原文件名>。
+        - 取文件必须用「先快照文件名集合 → 等新名字出现」差集法，不能取
+          目录最新文件（会拉到无关旧文件）。
         """
         run_dir = _ensure_dir(os.path.join(MEDIA_ROOT, "files", f"{task.msg_id}_{_ts()}"))
         files: List[str] = []
@@ -602,22 +692,40 @@ class MediaHandler:
         cv2.imwrite(first_path, first_frame)
         files.append(first_path)
 
-        # 复用同一次 OCR 定位「保存」动作按钮（OCR/CV 定位，勿写死坐标）
-        img = self.dev.capture_bytes()
-        items = run_ocr(img)
-        action = self._find_text_opt(items, ("保存到手机", "下载", "用其他应用打开", "保存"))
-        if action:
-            log.info("[media] file card action at %s", action)
-            self.dev.tap(*action)
-            self.dev.wait_random(1500, 2500)
+        save_dir = "/sdcard/Download/WeiXin"
 
-        # 轮询常见下载目录找新文件
-        src_path = None
-        for d in ("/sdcard/Download", "/sdcard/WeiXin",
-                  "/sdcard/Android/data/com.tencent.mm/MicroMsg/Download"):
-            src_path = self._wait_for_new_file(d, timeout=8)
-            if src_path:
+        # 1) 右上角 ⋯ 菜单
+        self.dev.tap_rect(Rect(950, 95, 110, 110))
+        self.dev.wait_random(800, 1200)
+
+        # 2) OCR 菜单找「保存」（精确匹配，避开「保存图片/保存到手机」类）
+        menu = self.dev.capture_bytes()
+        menu_path = os.path.join(run_dir, "menu.png")
+        cv2.imwrite(menu_path, menu)
+        files.append(menu_path)
+        items = run_ocr(menu)
+        save_pos = None
+        for it in items:
+            if it["text"].strip() == "保存":
+                save_pos = (int(it["cx"]), int(it["cy"]))
                 break
+        if save_pos is None:
+            save_pos = self._find_text_opt(items, ("保存到手机", "保存"))
+
+        if save_pos is None:
+            log.warning("[media] file menu has no 保存 entry")
+            self.dev.back(); self.dev.wait_random(600, 1000)   # 关菜单
+            self.dev.back(); self.dev.wait_random(800, 1200)   # 回聊天页
+            return MediaResult(
+                msg_id=task.msg_id, msg_type="file",
+                content="[文件]", raw_files=files,
+                error="⋯ 菜单未找到「保存」入口", run_dir=run_dir)
+
+        # 3) 先快照目录，再点保存，等新文件名出现
+        before = set(self._list_dir(save_dir))
+        self.dev.tap(*save_pos)
+        self.dev.wait_random(1500, 2500)
+        src_path = self._wait_for_new_file(save_dir, exclude=before, timeout=30)
 
         local_path = None
         if src_path:
@@ -629,45 +737,72 @@ class MediaHandler:
             except Exception as e:  # noqa: BLE001
                 log.warning("[media] file pull failed: %s", e)
 
+        # 4) 返回：保存后菜单自动关，当前在预览页；back 一次回聊天页，
+        #    若仍在预览页（OCR 见「文件大小」）再 back 一次。
         self.dev.back()
         self.dev.wait_random(800, 1200)
+        cur = self.dev.capture_bytes()
+        if self._find_text_opt(run_ocr(cur), "文件大小"):
+            self.dev.back()
+            self.dev.wait_random(800, 1200)
 
         return MediaResult(
             msg_id=task.msg_id, msg_type="file",
             content=local_path or "[文件]",
             raw_files=files,
             success=bool(local_path),
-            error=None if local_path else "未找到保存的文件（文件卡基础版）",
+            error=None if local_path else f"未在 {save_dir} 找到新保存的文件",
             run_dir=run_dir)
 
     # ------------------------------------------------------------------ 页面签名
 
-    def _detect_page_signature(self, img: np.ndarray) -> str:
-        """根据顶部/底部 OCR 关键词判断当前页面类型。"""
-        h, w = img.shape[:2]
-        # 顶部条
-        top = img[0:int(h * 0.12), :]
-        # 底部条
-        bottom = img[int(h * 0.82):h, :]
-        top_text = " ".join(it["text"] for it in run_ocr(top))
-        bottom_text = " ".join(it["text"] for it in run_ocr(bottom))
-        full = top_text + " " + bottom_text
+    def _detect_page_signature(self, img: np.ndarray) -> Tuple[str, np.ndarray]:
+        """判断当前页面类型，返回 (signature, 用于判定的稳定帧)。
+
+        全帧 OCR（文件卡的「文件大小/文件名」在屏幕中部，顶部+底部双条会漏）；
+        页面切换的过渡帧是纯黑，会被黑底查看器规则误吞——判到 media_viewer
+        时等 ~1s 重截重判一次，稳定后再下结论，并把稳定帧一并返回
+        （调用方后续裁切/OCR 必须用返回的帧，不能再用过渡帧）。
+        """
+        sig = self._classify_frame(img)
+        if sig == "media_viewer":
+            self.dev.wait_random(800, 1200)
+            img2 = self.dev.capture_bytes()
+            sig2 = self._classify_frame(img2)
+            if sig2 != "media_viewer":
+                return sig2, img2
+        return sig, img
+
+    def _classify_frame(self, img: np.ndarray) -> str:
+        items = run_ocr(img)
+        h = img.shape[0]
+        full = " ".join(it["text"] for it in items)
+        bottom = " ".join(it["text"] for it in items if it["cy"] > h * 0.82)
 
         if "的聊天记录" in full:
             return "chat_record"
-        if "复制链接" in bottom_text or "在浏览器打开" in bottom_text:
+        if "复制链接" in bottom or "在浏览器打开" in bottom:
             return "webview"
-        if "保存图片" in bottom_text or "编辑" in bottom_text:
+        if "保存图片" in bottom or "编辑" in bottom:
             return "photo_viewer"
-        if "保存视频" in bottom_text:
+        if "保存视频" in bottom:
             return "video_viewer"
-        if "更多表情" in bottom_text or "添加" in bottom_text:
+        if "更多表情" in bottom or "添加" in bottom:
             return "sticker_detail"
-        if ("用其他应用打开" in bottom_text or "保存到手机" in bottom_text
-                or re.search(r"\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt)\b", full, re.I)
+        if ("用其他应用打开" in full or "文件大小" in full
+                or re.search(r"\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt|md)\b", full, re.I)
                 or re.search(r"\d+(?:\.\d+)?\s?(?:KB|MB|GB)\b", full, re.I)):
             return "file_card"
+        # 全屏图片/视频查看器：黑底、底部只有无文字标签的 4 个圆形图标，
+        # OCR 关键词全部落空。黑像素占比区分：查看器 ~0.37，聊天页 ~0.09。
+        if self._is_fullscreen_viewer(img):
+            return "media_viewer"
         return "unknown"
+
+    @staticmethod
+    def _is_fullscreen_viewer(img: np.ndarray) -> bool:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return float(np.mean(gray < 20)) > 0.25
 
     # ------------------------------------------------------------------ OCR 定位辅助
 
@@ -729,18 +864,27 @@ class MediaHandler:
         except Exception:
             pass
 
-    def _wait_for_new_file(self, remote_dir: str, timeout: int = 30) -> Optional[str]:
-        """轮询远程目录，返回最新创建的文件路径。"""
+    def _list_dir(self, remote_dir: str) -> List[str]:
+        """列目录文件名（ls -1，一行一名，中文/空格安全）。"""
+        out = self.dev._shell(f"ls -1 {remote_dir} 2>/dev/null").decode(errors="replace")
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+    def _wait_for_new_file(self, remote_dir: str, timeout: int = 30,
+                           exclude=()) -> Optional[str]:
+        """轮询远程目录，返回新出现的文件路径。
+
+        exclude：操作前的文件名快照集合；只认不在快照里的名字（差集法），
+        避免拉到目录里无关的旧文件。文件名可能含中文/空格，用 ls -1t 整行解析，
+        不能用 ls -l 按空格 split。
+        """
+        excl = set(exclude)
         deadline = time.time() + timeout
-        last_best = None
         while time.time() < deadline:
-            out = self.dev._shell(f"ls -lt {remote_dir} 2>/dev/null | head -5").decode(errors="replace")
-            lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-            if lines:
-                parts = lines[0].split()
-                if len(parts) >= 8:
-                    fn = parts[-1]
-                    return f"{remote_dir}/{fn}"
+            out = self.dev._shell(f"ls -1t {remote_dir} 2>/dev/null").decode(errors="replace")
+            for ln in out.splitlines():
+                n = ln.strip()
+                if n and n not in excl and n not in (".", ".."):
+                    return f"{remote_dir}/{n}"
             time.sleep(0.5)
         return None
 
