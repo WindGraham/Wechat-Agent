@@ -166,6 +166,7 @@ def segment_cutlines(img, roster_matcher=None, min_seg=8, title=""):
         own = [mm for mm in msgs if y0 <= mm["y"] < y1]
         texts = [mm["content"] for mm in own if mm["content"]]
         factor = "未知"
+        seg_type = "text"
         av_s = nk_s = None
         cand = nick = ""
         for mm in own:
@@ -174,6 +175,12 @@ def segment_cutlines(img, roster_matcher=None, min_seg=8, title=""):
                 break
             if mm["factor"] != "未知":
                 factor = mm["factor"]
+            # 类型传播：段内第一条非 text/quote 消息的 slice_chat 类型
+            # （多媒体段打标用；time_divider 已由 factor=="时间" 表达）
+            mt = mm.get("type")
+            if seg_type == "text" and mt \
+                    and mt not in ("text", "quote", "time_divider"):
+                seg_type = mt
             if mm.get("avatar_score") is not None:
                 av_s = mm["avatar_score"]
                 cand = mm.get("avatar_cand") or cand
@@ -185,6 +192,7 @@ def segment_cutlines(img, roster_matcher=None, min_seg=8, title=""):
             "y_top": int(y0), "y_bottom": int(y1),
             "content": "\n".join(texts)[:200],
             "factor": factor,
+            "type": seg_type,
             "avatar_score": av_s, "nick_score": nk_s,
             "avatar_cand": cand, "nickname": nick,
         })

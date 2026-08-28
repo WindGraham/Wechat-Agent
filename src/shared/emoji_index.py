@@ -227,7 +227,7 @@ def format_candidates(emojis, query="", limit=10):
     for e in emojis[:limit]:
         txt = e.get("text_content") or "（无文字）"
         mood = e.get("mood") or "（无情绪标注）"
-        anim = "动图" if (e.get("ext") == ".gif") else "静态"
+        anim = "动图" if (e.get("frames") or 0) > 1 else "静态"
         desc = (e.get("description") or "").replace("\n", " ")[:40]
         lines.append(f"  seq={e['seq']} | 文字:{txt} | 情绪:{mood} | {anim} | {desc}")
     return "\n".join(lines)

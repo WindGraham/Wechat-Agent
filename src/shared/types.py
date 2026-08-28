@@ -25,6 +25,7 @@ class Message:
     mentions: list = field(default_factory=list)  # @ 到的昵称列表
     media_path: Optional[str] = None  # 多媒体裁图归档路径（未标注条目用）
     ts: float = 0.0           # 采集时刻 epoch
+    ts_hint: float = 0.0      # 发送时刻 epoch（时间分割线解析；0=未知，回退 ts）
     seq: int = 0              # 会话内自增序号（唯一、严格递增）
     msg_uid: str = ""         # 幂等键（重复同步不重复入库）
 

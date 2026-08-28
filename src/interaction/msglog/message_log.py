@@ -122,6 +122,7 @@ def connect(db_path):
 _MIGRATIONS = (
     ("messages", "media_path", "ALTER TABLE messages ADD COLUMN media_path TEXT DEFAULT ''"),
     ("messages", "crop_path", "ALTER TABLE messages ADD COLUMN crop_path TEXT DEFAULT ''"),
+    ("messages", "media_status", "ALTER TABLE messages ADD COLUMN media_status TEXT DEFAULT ''"),
     ("sessions", "roster_status", "ALTER TABLE sessions ADD COLUMN roster_status INTEGER DEFAULT 0"),
 )
 
@@ -270,6 +271,36 @@ def update_content(conn, session_id, sender, content, new_content):
                  (new_content, normalize(new_content), target))
     conn.commit()
     return 1
+
+
+@_locked
+def update_media(conn, msg_id, content=None, media_path=None,
+                 media_status=None, content_type=None):
+    """按 id 精确更新媒体字段（媒体处置 pass 写回用）。
+
+    占位符 "[图片]"/"[链接]" 在 update_content 的模糊匹配里会撞车，
+    媒体 pass 持有 DB 行 id，直接按 id 更新。只更新非 None 的字段；
+    content 更新时同步 content_norm。返回更新行数（0/1）。"""
+    sets, vals = [], []
+    if content is not None:
+        sets += ["content=?", "content_norm=?"]
+        vals += [content, normalize(content)]
+    if media_path is not None:
+        sets.append("media_path=?")
+        vals.append(media_path)
+    if media_status is not None:
+        sets.append("media_status=?")
+        vals.append(media_status)
+    if content_type is not None:
+        sets.append("content_type=?")
+        vals.append(content_type)
+    if not sets:
+        return 0
+    vals.append(msg_id)
+    cur = conn.execute(f"UPDATE messages SET {', '.join(sets)} WHERE id=?",
+                       vals)
+    conn.commit()
+    return cur.rowcount
 
 
 def _ratio(a, b):
@@ -520,18 +551,19 @@ def _insert_rows(conn, session_id, entries, first_seq, source, captured_ts,
         mentions = ",".join(getattr(e, "mentions", None) or [])
         media_path = getattr(e, "media_path", None) or ""
         crop_path = getattr(e, "crop_path", None) or ""
+        frame_phash = getattr(e, "frame_phash", None)
         cur = conn.execute(
             "INSERT OR IGNORE INTO messages"
             "(session_id, seq, ts_hint, ts_text, ts_captured, sender,"
             " is_mine, content_type, content, content_norm, complete,"
             " ocr_conf, source, align_key, msg_uid, mentions, media_path,"
-            " crop_path)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " crop_path, frame_phash)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (session_id, seq, ts_hint, ts_text, captured_ts, sender,
              1 if getattr(e, "is_mine", False) else 0, ctype, content,
              content_norm, complete, getattr(e, "ocr_conf", None), source,
              akey, _msg_uid(session_id, seq, akey), mentions, media_path,
-             crop_path))
+             crop_path, frame_phash))
         inserted += cur.rowcount
         min_seq = seq if min_seq is None else min(min_seq, seq)
         max_seq = seq if max_seq is None else max(max_seq, seq)

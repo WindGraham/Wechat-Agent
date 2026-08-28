@@ -118,6 +118,20 @@ def _bubble_comps(img):
         c["is_green"] = bool(ng > nd)
         c["tail_l"] = _tail_score(img, c["box"], "L", c["is_green"])
         c["tail_r"] = _tail_score(img, c["box"], "R", c["is_green"])
+        # 中段行左右缘（2026-08-27 实测：「N条新消息」胶囊是深色药丸，
+        # 调色板命中且与气泡顶部粘连，把 box 撑宽到 924 → 误判非文本；
+        # 取中段 1/3~2/3 行调色板左右缘的【中位数】——胶囊只占少数行，
+        # 中位数落在气泡本体上）
+        lefts, rights = [], []
+        band = mask[y + h // 3: y + max(h // 3 + 1, 2 * h // 3), x:x + w]
+        for row in band:
+            nz = np.nonzero(row)[0]
+            if nz.size:
+                lefts.append(int(nz[0]))
+                rights.append(int(nz[-1]))
+        c["mid_left"] = x + (int(np.median(lefts)) if lefts else 0)
+        c["mid_right"] = x + (int(np.median(rights)) if rights else w - 1) + 1
+        c["mid_span"] = c["mid_right"] - c["mid_left"] if lefts else 0
     return comps, mask
 
 
@@ -130,16 +144,18 @@ def _is_text_bubble(c):
     L 侧（他人）：深色 comp、左缘 ≤176（含抗锯齿边，实体缘 ~169）；
     R 侧（自己）：绿色 comp、右缘 ∈[895,935]（自己的深色文件卡靠
     「非绿色」排除）。
+    宽度与锚定用中段行缘（mid_*）：「N条新消息」胶囊与气泡顶部
+    粘连会把 box 撑宽/撑偏，中段行缘不受影响。
     卡片类（聊天记录/文件/链接）由调用方前置的 OCR 硬标记拦截；
     尖角得分 c["tail_l"]/c["tail_r"] 作为参考信息记录（PNG 原图上
     更可靠，JPEG 留档上因压缩噪声不稳定，不做门槛）。
     """
     x, y, w, h = c["box"]
-    if w > TEXT_MAX_W or c.get("bubble_frac", 0) < 0.45:
+    if c.get("mid_span", w) > TEXT_MAX_W or c.get("bubble_frac", 0) < 0.45:
         return False
     if not c["is_green"]:
-        return x <= 176
-    return 895 <= x + w <= 935
+        return c.get("mid_left", x) <= 176
+    return 895 <= c.get("mid_right", x + w) <= 935
 
 
 def _is_card(c):
@@ -164,6 +180,42 @@ def _nonbg_comps(img):
     diff = np.abs(img.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
     mask = (diff > 18).astype(np.uint8) * 255
     return _comps_of(mask, min_area=1500, min_h=20), bg
+
+
+def _embedded_block(img, box):
+    """调色板气泡内部是否嵌着实体图块（公众号链接卡的缩略图等）。
+
+    深色主题下链接卡与文本气泡同色同形、调色板锚定无法区分
+    （2026-08-27 交流一下实测：AI寒武纪链接卡被判 text）。
+    区分点：文本笔画细、闭运算后填充率低；缩略图是实心大块。
+    返回图块 box（相对整图）或 None。
+    只扫气泡顶部 30% 以下区域：顶部是「N条新消息」胶囊的挂载位
+    （胶囊药丸色与气泡色有偏差，会被误检成嵌入块）。
+    """
+    x, y, w, h = box
+    y0 = y + int(h * 0.3)
+    roi = img[y0:y + h, x:x + w]
+    m = cv2.bitwise_or(_near(roi, SELF_GREEN), _near(roi, BUBBLE_DARK))
+    fg = cv2.bitwise_not(m)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    comps = _comps_of(fg, min_area=8000, min_h=60)
+    bg = _dominant_bg(img)
+    for c in comps:
+        cx, cy, cw, ch = c["box"]
+        if cw < 60:
+            continue
+        fill = c["area"] / (cw * ch)
+        if fill < 0.6:
+            continue
+        # 排除"气泡外的聊天背景"块：胶囊粘连会把 bg 包进组件 box，
+        # bg 灰也是"非气泡色"实心块（2026-08-27 实测 (904,84,176,140)
+        # fill=0.96 的纯 bg 误检）。真缩略图颜色与 bg 有显著差异。
+        block_roi = roi[cy:cy + ch, cx:cx + cw]
+        mean_bgr = block_roi.reshape(-1, 3).mean(axis=0)
+        if float(np.abs(mean_bgr.astype(int) - bg.astype(int)).max()) <= 25:
+            continue
+        return (x + cx, y0 + cy, cw, ch)
+    return None
 
 
 def classify_segment(img, ocr_text=""):
@@ -206,6 +258,11 @@ def classify_segment(img, ocr_text=""):
     if text_bubbles and not img_blocks:
         main = max(text_bubbles, key=lambda c: c["area"])
         my = main["box"][1]
+        # 深色主题链接卡检测：气泡内嵌实心图块（缩略图）→ 卡片不是文本
+        # （2026-08-27 交流一下实测：深色链接卡调色板锚定与文本气泡全同）
+        if _embedded_block(img, main["box"]) is not None:
+            return "card", {"reason": "embedded_thumb", "sub": "link",
+                            "main_box": main["box"]}
         # 引用回复：文本气泡下方还有无锚定的卡片色组件（引用卡）
         has_quote_card = any(
             c is not main and c["box"][1] > my and _is_card(c)

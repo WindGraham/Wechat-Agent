@@ -139,6 +139,7 @@ class JourneyManager:
         # roster_reconcile：双因子失配时点头像进资料页调和（默认开，
         # runtime.json 可关）
         reconcile = is_group and bool(self._friend_cfg("roster_reconcile", True))
+        sync_start = time.time()   # 媒体 pass 只处置本轮采集入库的条目
         updated = self._sync_with_retry(session, is_group, reconcile=reconcile)
         if updated is None:
             log.warning("[%s] sync failed after retries, exit and mark dirty",
@@ -178,6 +179,11 @@ class JourneyManager:
                             session, SCROLL_RESYNC_ROUNDS)
 
         sent = False
+
+        # 2.5 媒体独立处置 pass（2026-08-27）：采集完成后对本轮打标的媒体
+        # 条目逐条定位→点击→取回（链接 URL / 图片视频文件落电脑）写回日志。
+        # 预算内热控，剩下下轮 journey 接着做；结束已滚回最新，不污染书签。
+        self._run_media_pass(session, since_ts=sync_start)
 
         # 3. 执行行动（如果有）
         action_failed = False
@@ -231,6 +237,30 @@ class JourneyManager:
         return sent
 
     # ------------------------------------------------------------------ 内部
+    def _run_media_pass(self, session, since_ts: float = 0):
+        """采集后的媒体独立处置 pass（config 热控；失败只记日志不阻塞旅程）。
+
+        since_ts：只处置本轮采集（ts_captured 不早于此）入库的媒体条目——
+        更老的在书签旧侧，滚 newer 永远找不到。"""
+        if not bool(self._friend_cfg("media_handle_enabled", True)):
+            return
+        dev = getattr(getattr(self._reader, "_pr", None), "dev", None)
+        conn = getattr(self._reader, "_conn", None)
+        if dev is None or conn is None:
+            return
+        try:
+            from .media_pass import run_media_pass
+            stats = run_media_pass(
+                dev, conn, session,
+                max_items=int(self._friend_cfg(
+                    "media_handle_max_per_journey", 5)),
+                timeout_s=int(self._friend_cfg("media_handle_timeout_s", 180)),
+                since_ts=since_ts)
+            if any(stats.values()):
+                log.info("[%s] media pass: %s", session, stats)
+        except Exception:  # noqa: BLE001
+            log.exception("[%s] media pass failed", session)
+
     def _collect_and_exit(self, session, entry):
         """采集模式深采：进群后滚动差分拼接采集（裁图+去重入库），回首页。
 
@@ -244,10 +274,13 @@ class JourneyManager:
             if dev is None or conn is None:
                 log.error("[%s] collect: 缺 dev/conn，跳过深采", session)
             else:
+                t0 = time.time()
                 total = collect_group_history(
                     dev, conn, session, stop_empty_rounds=2,
                     reconcile=bool(self._friend_cfg("roster_reconcile", True)))
                 log.info("[%s] collect: 深采入库 %d 条", session, total)
+                # 深采后同样做媒体独立处置（打标条目已在采集中入库）
+                self._run_media_pass(session, since_ts=t0)
         except Exception:  # noqa: BLE001
             log.exception("[%s] collect_group_history failed", session)
         self._safe_back_home(session)

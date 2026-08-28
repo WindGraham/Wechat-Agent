@@ -18,6 +18,7 @@ from .message_log import (
     merge_stack,
     append_incremental,
     update_content,
+    update_media,
     export_text_log,
     normalize,
     fuzzy_eq,

@@ -208,6 +208,8 @@ A 的行动清空 → 最后一次日志同步 → 此时才向 Proxy 发 LogUpd
   「再次保存」**；取文件用「操作前快照文件名集合 → 等新名字出现」差集法
   （不能取目录最新文件，会拉到无关旧文件）→ pull → 删手机源文件 → 回会话。
 - **表情包**：`_handle_sticker_detail` 裁上半屏最大非背景块。
+  签名有两种变体：单曲详情页（底部「更多表情/添加」）与艺术家专辑页
+  （中部「添加」+「展开全部/更多作品/艺术家主页」，2026-08-27 实测补充）。
 - **文件卡**：`_handle_file` 预览页 → 右上角 ⋯ → 菜单精确匹配「保存」
   （不支持预览的类型页面只有「用其他应用打开」死路，保存入口只在 ⋯ 菜单）→
   文件落 `/sdcard/Download/WeiXin/<原文件名>` → 差集法取回 → pull → 删源。
@@ -215,13 +217,37 @@ A 的行动清空 → 最后一次日志同步 → 此时才向 Proxy 发 LogUpd
 - **点击前置校验**：`_verify_in_chat` OCR 顶部标题条确认在目标会话页，
   不在则拒绝点击（防首页残留状态 + 旧 bbox 乱点进别人会话）。
 
-**接入**：`realtime_scan(handle_media=False)` 默认关闭（保持轻量滚动）；置
-True 时对非文本完整消息调用 `MediaHandler`，结果经 `_media_to_entry` 入库。
-`history_collect` 用 union 缝合，中途 tap 媒体会打断连续缝合/配准，**不宜内联**——
-其媒体处置应走独立 pass（采集完成后逐条回到消息位置处理），坐标需由 union 行 y
-映射回设备行（`_screen_bounds`/缝合偏移），暂未内联接入。
-所有处置落盘 `workspace/media/{type}/{msg_id}_{ts}/`（含 manifest.json），
-`workspace/media/collect_debug/` 留错误现场；异常统一 `_return_to_chat` 回聊天页。
+**接入（2026-08-27 定稿，已入轮询主链路）**：分两步——
+- **内联打标（采集中，零点击）**：裁切线分段把 slice_chat 的类型传播到段
+  （`cutline_segment` segs 带 `type`），`history_collect` 对非文本段用
+  `classify_segment` 细分入库：content_type ∈ link/image/chat_record/file/
+  red_packet，content = 占位符（"[图片]"/"[链接]"…），media_path = 裁图路径，
+  `media_status=''`（messages 表新列，'' / done / failed）。无 OCR 内容的
+  媒体段不再丢弃。媒体去重靠段裁图 aHash（frame_phash 列，汉明 ≤6 判同图）——
+  占位符无区分度，同一发送者多张图不再互相误杀，同图跨 union 仍判重。
+- **独立处置 pass（采集后，`loop/media_pass.py`）**：缝合采集中途 tap 会打断
+  配准，故采集完成、屏幕停在书签处后，对待处置条目（seq 升序）用
+  **存档裁图对当前屏 matchTemplate** 定位（阈值 0.85，裁图 >400px 取头部
+  子条；不做 union→device 线性坐标映射）→ MediaTask → MediaHandler.handle()
+  → `update_media` 按 id 精确写回（链接 URL 进 content；图片/视频/文件的
+  本地路径进 media_path；聊天记录卡解析文本进 content；红包只标 done 不点击）。
+  处理顺序 **seq 降序**（采集逐屏向更旧滚、逐屏 append：seq 越小物理越新，
+  从书签旧侧向最新滚必须降序才顺路——seq418 实测升序会把旧目标落在身后）。
+  点击位置取条带内**主内容块**中心（整行条带几何中心会落在灰底上，
+  点灰底不开页——seq417 实测）。只处置**本轮采集入库**的条目
+  （journey 传 since_ts=同步开始时刻；更老的在书签旧侧，滚 newer 永远找不到）。定位鲁棒性（2026-08-27 猫猫群实测
+  修复）：每个位置双截屏防 fling 糊帧漏检（单截屏错过目标屏后目标沉入
+  输入栏裁切区 conf 只剩 0.4）；屏面连续 2 次不变判到底提前放弃。
+  单条 8 屏未命中标 failed；预算热控 `media_handle_enabled` /
+  `media_handle_max_per_journey`(5) / `media_handle_timeout_s`(180)，
+  剩余下轮 journey 继续。结束后 scroll_to_latest 回滚——收尾 sync 以
+  「当前屏=最新屏」存书签，停在中段会污染书签。
+  接入点：journey 首次 sync 成功后（动作执行前）+ collect 模式深采后。
+
+`realtime_scan(handle_media=...)` 钩子仍在但 realtime_scan 无调用者（死代码，
+待清理）。所有处置落盘 `workspace/media/{type}/{msg_id}_{ts}/`（含
+manifest.json），`workspace/media/collect_debug/` 留错误现场；测试期不自动
+删除；异常统一 `_return_to_chat` 回聊天页。
 
 ## 二、明确不做
 

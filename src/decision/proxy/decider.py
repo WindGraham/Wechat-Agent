@@ -148,6 +148,24 @@ class Decider:
                         if not getattr(m, "is_mine", False)
                         and getattr(m, "content_type", "text")
                         not in ("time_divider", "system")]
+            # 超龄消息不作回复触发（2026-08-27 218 事故：重启深采把 8/11
+            # 的 231 条积压当新消息，回复了两周前的 @我）。判定用发送时刻
+            # ts_hint（时间分割线解析），缺失回退采集时刻；超龄消息仍进
+            # 历史/记忆，只是不触发回复。阈值热控 reply_max_age_h（默认 6h）。
+            max_age_s = float(self._rt("reply_max_age_h", 6)) * 3600
+            now = self._clock()
+            fresh = []
+            n_stale = 0
+            for m in new_msgs:
+                mt = getattr(m, "ts_hint", 0) or getattr(m, "ts", 0)
+                if mt and now - mt > max_age_s:
+                    n_stale += 1
+                else:
+                    fresh.append(m)
+            if n_stale:
+                log.info("[%s] %d 条超龄消息（>%.0fh）不作回复触发",
+                         session, n_stale, max_age_s / 3600)
+            new_msgs = fresh
             if extra_msgs:
                 new_msgs = new_msgs + list(extra_msgs)
 
@@ -157,12 +175,17 @@ class Decider:
                 log.info("[%s] 无新消息，跳过", session)
                 return
 
-            n_targets = sum(1 for m in new_msgs
-                            if self._media.needs_convert(m))
-            n_converted = self._media.convert_all(session, new_msgs)
-            if n_targets:
-                self._journal("media_convert", session=session,
-                              ok=n_converted, total=n_targets)
+            if self._rt("prompt_attach_images", True):
+                # 图片直发多模态（_llm_loop 里 media_enrich 附带 image_url），
+                # 不再做 vision→文字描述写回（2026-08-27 用户定稿）
+                pass
+            else:
+                n_targets = sum(1 for m in new_msgs
+                                if self._media.needs_convert(m))
+                n_converted = self._media.convert_all(session, new_msgs)
+                if n_targets:
+                    self._journal("media_convert", session=session,
+                                  ok=n_converted, total=n_targets)
 
             history = self._reader.get_context(
                 session, n=self._rt("history_size", 200))
@@ -195,6 +218,15 @@ class Decider:
                     session, history, new_msgs)
 
     # ================================================================== LLM 循环
+    @staticmethod
+    def _supports_image_chat(provider) -> bool:
+        """provider 的 chat 是否支持 OpenAI content 数组（image_url 直发图片）。
+
+        GeminiProvider 走 generateContent（content 数组不支持）→ False；
+        Kimi/DeepSeek 等 OpenAI 兼容 provider（provider.base 模块）→ True。
+        """
+        return type(provider).__module__.endswith("provider.base")
+
     def _llm_loop(self, session, is_group, trigger, history, new_msgs) -> bool:
         """LLM 调用循环：生成 → 解析 → 路由；tool 块回灌续生成。"""
         tool_feedback = ""
@@ -209,6 +241,19 @@ class Decider:
                         if opts["include_memory"] else "")
         hist_prompt = history if opts["include_history"] else []
         known_sessions = self.known_sessions()
+
+        # prompt 多媒体增强（2026-08-27 用户定稿）：链接正文追加到 prompt
+        # 尾部（带磁盘缓存）；图片以 image_url 直发多模态模型。
+        from .media_enrich import enrich, attach_images
+        tail_text, image_paths = enrich(hist_prompt, new_msgs, self._rt)
+        attach_ok = bool(self._rt("prompt_attach_images", True)) \
+            and bool(image_paths) and self._supports_image_chat(provider)
+
+        def _call(msgs):
+            if hasattr(provider, "chat_full"):
+                return provider.chat_full(msgs)
+            return provider.chat(msgs), ""
+
         for _round in range(MAX_TOOL_CALLS + 2):
             messages = self._builder.build(
                 session, is_group, trigger, hist_prompt, new_msgs,
@@ -217,22 +262,50 @@ class Decider:
                 memory_block=memory_block,
                 known_sessions=known_sessions,
                 goal=opts["goal"])
+            if tail_text:
+                messages[-1]["content"] = \
+                    (messages[-1].get("content") or "") + "\n\n" + tail_text
+            attached = 0
+            if attach_ok:
+                messages, attached = attach_images(messages, image_paths)
             self._journal("prompt", session=session, round=_round,
                           system=self._clip("\n\n".join(
                               m.get("content", "") for m in messages
                               if m.get("role") == "system")),
                           user=self._clip("\n\n".join(
                               m.get("content", "") for m in messages
-                              if m.get("role") == "user")))
+                              if m.get("role") == "user"
+                              and isinstance(m.get("content"), str))))
             try:
-                if hasattr(provider, "chat_full"):
-                    out, thinking = provider.chat_full(messages)
-                else:
-                    out, thinking = provider.chat(messages), ""
+                out, thinking = _call(messages)
             except Exception as e:  # noqa: BLE001
-                log.warning("[%s] LLM 调用失败: %s: %s",
-                            session, type(e).__name__, e)
-                return replied
+                if attached:
+                    # 非多模态模型/图片超限：去图重建降级重试一次，
+                    # 本次决策后续 round 不再带图
+                    log.warning("[%s] 带图调用失败(%s: %s)，去图降级重试",
+                                session, type(e).__name__, e)
+                    attach_ok = False
+                    messages = self._builder.build(
+                        session, is_group, trigger, hist_prompt, new_msgs,
+                        tool_feedback=tool_feedback,
+                        running_tasks=self._ledger.running_for(session),
+                        memory_block=memory_block,
+                        known_sessions=known_sessions,
+                        goal=opts["goal"])
+                    if tail_text:
+                        messages[-1]["content"] = \
+                            (messages[-1].get("content") or "") \
+                            + "\n\n" + tail_text
+                    try:
+                        out, thinking = _call(messages)
+                    except Exception as e2:  # noqa: BLE001
+                        log.warning("[%s] LLM 调用失败: %s: %s",
+                                    session, type(e2).__name__, e2)
+                        return replied
+                else:
+                    log.warning("[%s] LLM 调用失败: %s: %s",
+                                session, type(e).__name__, e)
+                    return replied
             self._providers.note_cache(provider)
             self._journal("llm_output", session=session, round=_round,
                           output=self._clip(out),

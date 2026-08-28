@@ -42,6 +42,20 @@ RUNTIME_FIELDS = {
     "extract_provider": str,
     "extract_model": (str, type(None)),
     "special_prompts": dict,
+    # 多媒体处置 pass（journey 内热控）
+    "media_handle_enabled": bool,
+    "media_handle_max_per_journey": int,
+    "media_handle_timeout_s": int,
+    # prompt 多媒体增强（proxy 内热控）
+    "prompt_attach_images": bool,
+    "prompt_attach_images_max": int,
+    "prompt_crawl_links": bool,
+    "link_crawl_per_prompt": int,
+    "link_crawl_max_chars": int,
+    # 回复触发的新鲜度窗口（超龄积压消息不触发回复）
+    "reply_max_age_h": (int, float),
+    # 采集中间文件全量留档（截图/裁切/拼接/单条裁切/manifest）
+    "collect_debug_enabled": bool,
 }
 
 # [min, max] 数值区间字段（二元数组，元素为数值且非 bool）

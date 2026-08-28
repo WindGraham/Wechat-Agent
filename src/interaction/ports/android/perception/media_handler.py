@@ -525,7 +525,7 @@ class MediaHandler:
         h, w = img.shape[:2]
         upper = img[0:int(h * 0.65), :]
         sticker_path = os.path.join(run_dir, "sticker.png")
-        extracted = self._extract_largest_non_bg(upper, bg_bgr=(92, 92, 92), tol=20)
+        extracted = self._extract_largest_non_bg(upper, tol=20)
         if extracted is not None and extracted.size > 0:
             cv2.imwrite(sticker_path, extracted)
             files = [detail_path, sticker_path]
@@ -544,9 +544,17 @@ class MediaHandler:
             success=sticker_path is not None,
             run_dir=run_dir)
 
-    def _extract_largest_non_bg(self, img: np.ndarray, bg_bgr: Tuple[int, int, int],
+    def _extract_largest_non_bg(self, img: np.ndarray, bg_bgr: Tuple[int, int, int] = None,
                                 tol: int = 20) -> Optional[np.ndarray]:
-        """提取最大非背景连通块（表情包详情页用）。"""
+        """提取最大非背景连通块（表情包详情页用）。
+
+        bg_bgr=None 时取整图中位色——详情页有浅色(92,92,92)和深色(~43)
+        两种主题（2026-08-27 实测：深色页用写死的浅灰底会把整页当一块）。
+        最大块面积 >60% 整页视为提取失败（返回 None，调用方只留整图）。
+        """
+        if bg_bgr is None:
+            bg_bgr = tuple(int(v) for v in np.median(
+                img.reshape(-1, 3), axis=0))
         bg = np.array(bg_bgr, dtype=np.uint8)
         mask = cv2.inRange(img, bg - tol, bg + tol)
         fg = cv2.bitwise_not(mask)
@@ -554,7 +562,8 @@ class MediaHandler:
         if not contours:
             return None
         cnt = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(cnt) < 1000:
+        area = cv2.contourArea(cnt)
+        if area < 1000 or area > 0.6 * img.shape[0] * img.shape[1]:
             return None
         x, y, w, h = cv2.boundingRect(cnt)
         return img[y:y + h, x:x + w]
@@ -787,7 +796,11 @@ class MediaHandler:
             return "photo_viewer"
         if "保存视频" in bottom:
             return "video_viewer"
-        if "更多表情" in bottom or "添加" in bottom:
+        if ("更多表情" in bottom or "添加" in bottom
+                # 艺术家专辑页变体（2026-08-27 猫猫群实测）：「添加」按钮在
+                # 屏幕中部，底部是「展开全部/更多作品/艺术家主页」
+                or ("添加" in full and any(
+                    k in full for k in ("展开全部", "更多作品", "艺术家主页")))):
             return "sticker_detail"
         if ("用其他应用打开" in full or "文件大小" in full
                 or re.search(r"\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|txt|md)\b", full, re.I)

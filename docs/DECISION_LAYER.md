@@ -84,6 +84,25 @@ Proxy 决定是否升级为任务。
 原则：**会话旅程不被视觉识别拖慢**（打标即走）；**LLM 永远看到文字**
 （转换在 prompt 构建前完成）；同一条目只转换一次（日志写回即持久化）。
 
+**prompt 多媒体增强（2026-08-27 定稿，默认开启后取代②的 vision 写回）：**
+
+聊天日志里的多媒体只存 URL / 本地路径（交互层媒体 pass 写回：
+链接 content=`[链接] <url>`，图片/视频/文件 media_path=本地路径）。
+决策构造 prompt 时（`proxy/media_enrich.py`）扫描最近窗口
+（history 200 条 + 新消息）：
+- **链接**：取最新 `link_crawl_per_prompt`(3) 条唯一 URL →
+  `search/web_fetch.py` 抓取正文（requests + HTML 文本抽取，磁盘缓存
+  `workspace/media/link_cache/`，同链接不重抓）→【链接内容】块追加到
+  user prompt 尾部（`link_crawl_max_chars` 截断，默认 3000）；
+- **图片**：取最新 `prompt_attach_images_max`(4) 张本地文件 → 缩放 ≤768px
+  base64，以 OpenAI image_url content 数组**直发多模态模型**
+  （仅 OpenAI 兼容 provider；Gemini 不支持 content 数组自动跳过）。
+  带图调用失败 → 去图降级重试一次，本次决策后续不再带图。
+
+热控：`prompt_attach_images`（默认 true；**开启时跳过②的 vision→文字
+写回**，图片直接进 prompt）、`prompt_crawl_links`（默认 true）。
+②的 MediaConverter 保留为 `prompt_attach_images=false` 时的降级路径。
+
 Proxy 职责清单：
 
 1. **出向路由**：解析 LLM 输出——文本/图片/文件动作 → 交互层 `execute()`；

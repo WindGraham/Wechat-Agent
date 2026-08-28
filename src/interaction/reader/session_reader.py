@@ -21,6 +21,20 @@ from ...shared.types import Message, LogUpdated
 
 log = logging.getLogger("interaction.reader")
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+
+
+def _collect_debug_enabled() -> bool:
+    """读 config/runtime.json 的 collect_debug_enabled（默认 True，热读）。"""
+    try:
+        import json
+        with open(os.path.join(_PROJECT_ROOT, "config", "runtime.json"),
+                  encoding="utf-8") as f:
+            return bool(json.load(f).get("collect_debug_enabled", True))
+    except (OSError, ValueError):
+        return True
+
 
 class SessionReader:
     """会话读取器：封装端口感知 + 消息日志，提供统一读取接口。
@@ -126,6 +140,16 @@ class SessionReader:
 
         # 使用滚动裁切方案做消息同步
         try:
+            # 中间文件全量留档（用户 2026-08-26 定：测试期不自动删除）：
+            # 截图原图/一次裁切/一次拼接/二次裁切/单条信息裁切/识别结果
+            # → workspace/collect_debug/<群>/<时间戳>/（含 manifest.json）
+            debug_dir = None
+            if _collect_debug_enabled():
+                safe = "".join(
+                    ch if ch.isalnum() or ch in "_-" else "_" for ch in session)
+                debug_dir = os.path.join(
+                    _PROJECT_ROOT, "workspace", "collect_debug", safe,
+                    time.strftime("%Y%m%d_%H%M%S"))
             total = collect_group_history(
                 self._pr.dev, self._conn, session,
                 max_rounds=40,
@@ -133,6 +157,7 @@ class SessionReader:
                 stop_at_anchor=True,
                 use_cutlines=True,
                 reconcile=reconcile and is_group,
+                debug_dir=debug_dir,
             )
         except Exception:
             log.exception("[%s] collect_group_history failed", session)
@@ -278,6 +303,7 @@ class SessionReader:
             mentions=(row.get("mentions") or "").split(",") if row.get("mentions") else [],
             media_path=row.get("media_path") or None,
             ts=row.get("ts_captured", 0.0),
+            ts_hint=row.get("ts_hint") or 0.0,
             seq=row.get("seq", 0),
             msg_uid="",
         )

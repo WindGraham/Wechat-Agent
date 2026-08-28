@@ -206,14 +206,14 @@ class _FakeResult:
 
 class ProxyTest(unittest.TestCase):
 
-    def _proxy(self, outputs, msgs, submitted):
+    def _proxy(self, outputs, msgs, submitted, **runtime_kw):
         provider = _FakeProvider(outputs)
         reader = _FakeReader(msgs)
         tmp = tempfile.mkdtemp()
         proxy = Proxy(provider=provider, reader=reader,
                       submit_bundle=lambda s, x: (submitted.append((s, x)),
                                                   _FakeResult())[-1],
-                      runtime=_FakeRuntime(),
+                      runtime=_FakeRuntime(**runtime_kw),
                       watermarks_path=os.path.join(tmp, "wm.json"),
                       tasks_root=os.path.join(tmp, "tasks"))
         return proxy, provider
@@ -280,16 +280,63 @@ class ProxyTest(unittest.TestCase):
         self.assertIn("在的", submitted[0][1])       # 兜底话术
 
     def test_media_conversion_before_prompt(self):
-        """未标注多媒体先转换再决策。"""
+        """未标注多媒体先转换再决策（prompt_attach_images 关闭时的 legacy 路径）。"""
         submitted = []
         m = _msg(content="[图片]待识别", seq=1)
         m.content_type = "multimedia"
         m.media_path = __file__           # 路径存在即可（假 provider 不看内容）
-        proxy, _ = self._proxy(["<silent/>"], [m], submitted)
+        proxy, _ = self._proxy(["<silent/>"], [m], submitted,
+                               prompt_attach_images=False)
         proxy.notify_log_updated(LogUpdated(session="特高课", version=1))
         proxy.run_once()
         self.assertTrue(proxy._reader.writes)            # 写回了
         self.assertIn("一只猫", proxy._reader.writes[0][2])
+
+    def test_media_attach_skips_conversion(self):
+        """prompt_attach_images 默认开：图片直发多模态，不做 vision 写回。"""
+        submitted = []
+        m = _msg(content="[图片]", seq=1)
+        m.content_type = "image"
+        m.media_path = __file__
+        proxy, _ = self._proxy(["<silent/>"], [m], submitted)
+        proxy.notify_log_updated(LogUpdated(session="特高课", version=1))
+        proxy.run_once()
+        self.assertEqual(proxy._reader.writes, [])       # 无 vision 描述写回
+
+    def test_stale_backlog_no_reply(self):
+        """超龄积压消息（ts_hint 超过 reply_max_age_h）不触发回复。
+
+        2026-08-27 218 事故：重启深采把 8/11 的积压当新消息，
+        回复了两周前的 @我。"""
+        import time as _time
+        submitted = []
+        old = _time.time() - 14 * 24 * 3600            # 两周前
+        m_old = _msg(content="@陈曦 我是谁", mentions=["陈曦"], seq=1,
+                     ts=old, ts_hint=old)
+        m_new = _msg(content="刚发的", seq=2, ts=_time.time())
+        proxy, provider = self._proxy(
+            ['<reply session="特高课" ref="m1"><text>新鲜回复</text></reply>'],
+            [m_old, m_new], submitted)
+        proxy.notify_log_updated(LogUpdated(session="特高课", version=1,
+                                            mention_hint=True))
+        proxy.run_once()
+        # 超龄 @我 被过滤后只剩 1 条新消息进 prompt（m1=刚发的），
+        # 回复正常发出且 ref 不重排
+        self.assertEqual(len(submitted), 1)
+        self.assertIn("新鲜回复", submitted[0][1])
+
+    def test_stale_only_backlog_silent(self):
+        """全是超龄积压 → 不决策（无 LLM 调用）。"""
+        import time as _time
+        submitted = []
+        old = _time.time() - 14 * 24 * 3600
+        m_old = _msg(content="@陈曦 我是谁", mentions=["陈曦"], seq=1,
+                     ts=old, ts_hint=old)
+        proxy, provider = self._proxy(["<silent/>"], [m_old], submitted)
+        proxy.notify_log_updated(LogUpdated(session="特高课", version=1))
+        proxy.run_once()
+        self.assertEqual(provider.calls, 0)            # 没有调 LLM
+        self.assertEqual(submitted, [])
 
     def test_watermark_no_reprocess(self):
         """同一批消息不会重复决策。"""

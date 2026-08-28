@@ -19,3 +19,11 @@ tools/clipboard/r8.jar
 tools/clipboard/r8.jar
 tools/clipboard/out/
 tools/clipboard/dex/classes.dex
+
+# 个人信息 / 敏感数据（绝不进 git）
+被打信科2026游泳馆_花名册_500成员.zip
+*.zip
+*.xlsx
+*.xls
+chatlogs/
+workspace/chatlogs/

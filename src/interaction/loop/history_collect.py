@@ -161,15 +161,33 @@ def _key_of(sender, content_type, content):
 
 
 def _key(e):
+    dh = getattr(e, "dedup_hash", None)
+    if dh is not None:
+        # 媒体条目：占位符大家都一样，去重键带段裁图哈希（裁图文件名也因此唯一）
+        from ..msglog.message_log import normalize
+        return _key_of(e.sender, e.content_type,
+                       f"{normalize(e.content)}#{dh:016x}")
     return _key_of(e.sender, e.content_type, e.content)
 
 
-def _known(e, existing, existing_keys, seen, seen_keys):
+def _hamming(a, b):
+    return bin(a ^ b).count("1")
+
+
+MEDIA_DEDUP_HAMMING = 6   # 同一媒体跨 union 重渲染的容差（aHash 64bit）
+
+
+def _known(e, existing, existing_keys, seen, seen_keys, media_hashes=()):
     """OCR 鲁棒去重：先精确(full content_norm)，后 fuzzy(同 content_type)。
 
     OCR 会把同一句读成「2600小登」/「26ee小登」这种变体，精确键失配，
     需 fuzzy_eq(ratio>=0.85) 兜底；time_divider 只走精确（避免模糊误杀时间戳）。
+    媒体条目（带 dedup_hash）：占位符内容无区分度，按段裁图 aHash 的
+    汉明距离判同图（<=MEDIA_DEDUP_HAMMING 视为已见）。
     """
+    dh = getattr(e, "dedup_hash", None)
+    if dh is not None:
+        return any(_hamming(dh, h) <= MEDIA_DEDUP_HAMMING for h in media_hashes)
     from ..msglog.message_log import fuzzy_eq
     k = _key(e)
     if k in existing_keys or k in seen_keys:
@@ -186,12 +204,62 @@ def _known(e, existing, existing_keys, seen, seen_keys):
     return False
 
 
+# 媒体段占位符（2026-08-27）：细分 content_type → 入库占位文本。
+# 细分只为打标准确——真机处置时 MediaHandler 按页面签名会再判一次
+# （图片/视频/表情包、链接/聊天记录/文件都自动分流）。
+_MEDIA_PLACEHOLDER = {
+    "image": "[图片]", "link": "[链接]", "chat_record": "[聊天记录]",
+    "file": "[文件]", "red_packet": "[红包]",
+}
+
+
+def _phash(img):
+    """平均哈希（64bit int）：媒体段去重身份（跨 union 同图同 hash）。"""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(g, (8, 8), interpolation=cv2.INTER_AREA)
+    avg = float(g.mean())
+    bits = 0
+    for v in g.flatten():
+        bits = (bits << 1) | int(v >= avg)
+    return bits
+
+
+def _classify_media_seg(rec_img, sg):
+    """媒体段 → (content_type, placeholder, phash)；unknown/system → (None, None, None)。
+
+    用调色板锚定分类器在段裁图上细分；分类器认为是文本的（slice_chat
+    粗判媒体的误检）按文本入库。phash 是媒体条目的去重身份。
+    """
+    from ..ports.android.perception.media_classifier import classify_segment
+    y0, y1 = int(sg["y_top"]), int(sg["y_bottom"])
+    crop = rec_img[max(0, y0):y1]
+    if crop.size == 0:
+        return None, None, None
+    ph = _phash(crop)
+    try:
+        label, detail = classify_segment(crop, sg.get("content") or "")
+    except Exception:  # noqa: BLE001
+        label, detail = "media", {}
+    if label == "card":
+        sub = (detail or {}).get("sub")
+        ctype = {"chat_record": "chat_record", "file": "file"}.get(sub, "link")
+    elif label == "red_packet":
+        ctype = "red_packet"
+    elif label == "media":
+        ctype = "image"
+    elif label in ("text", "quote"):
+        return "text", sg["content"], None
+    else:
+        return None, None, None
+    return ctype, _MEDIA_PLACEHOLDER[ctype], ph
+
+
 def collect_group_history(dev, conn, group, max_rounds=40,
                           stop_empty_rounds=2, on_new=None,
                           stop_when=None, stop_at_anchor=True,
                           use_cutlines=True, debug_dir=None,
                           reconcile=False, reconcile_max_per_round=2,
-                          reconcile_max_total=12):
+                          reconcile_max_total=12, low_conf_retries=0):
     """进群后从最新屏向更早翻，union 缝合识别，滚到上次书签即停（增量新消息）。
 
     dev: DeviceCtl；conn: msglog 连接；group: 群名（有花名册则双因子识别）。
@@ -221,11 +289,22 @@ def collect_group_history(dev, conn, group, max_rounds=40,
         os.makedirs(debug_dir, exist_ok=True)
         debug_manifest = {"group": group, "screens": []}
 
-    # 全库已有消息（sender, content_type, content），供模糊去重
-    existing = [(r["sender"], r["content_type"], r["content"])
-                for r in conn.execute(
-                    "SELECT sender, content_type, content FROM messages "
-                    "WHERE session_id=?", (session_id,)).fetchall()]
+    # 全库已有消息（sender, content_type, content），供模糊去重；
+    # 媒体条目的 frame_phash 供同图去重（占位符无区分度）
+    existing = []
+    media_hashes = []
+    for r in conn.execute(
+            "SELECT sender, content_type, content, frame_phash FROM messages "
+            "WHERE session_id=?", (session_id,)).fetchall():
+        existing.append((r["sender"], r["content_type"], r["content"]))
+        if r["frame_phash"]:
+            try:
+                media_hashes.append(int(r["frame_phash"], 16))
+            except (TypeError, ValueError):
+                try:
+                    media_hashes.append(int(r["frame_phash"]))
+                except (TypeError, ValueError):
+                    pass
     existing_keys = {_key_of(s, ct, c) for (s, ct, c) in existing}
 
     anchor = _load_anchor(group)   # 上次会话进入时的最新屏（内容区）→ 新消息起点
@@ -259,17 +338,29 @@ def collect_group_history(dev, conn, group, max_rounds=40,
                 img = dev.capture_bytes()
                 cur_c, _, _ = _content_crop_bounds(img)
                 dy, conf = find_overlap_dy(prev_c, cur_c)
-                if conf < 0.5:
-                    # 停止前最后检查一次书签（可能已滚过书签位置但 conf 低）
-                    if stop_at_anchor and anchor is not None and prev_img is not None:
-                        st_last = stitch_union(prev_img, img, dy)
-                        if st_last is not None:
-                            aconf = _anchor_in_union(anchor, st_last[0])
-                            if aconf >= ANCHOR_COVER_SUM:
-                                print(f"  [rnd{rnd + 1}] 重叠置信低(conf={conf:.2f})但命中书签(conf={aconf:.2f})，停止")
-                                break
-                    print(f"  [rnd{rnd + 1}] 重叠置信过低(conf={conf:.2f})，停止")
-                    break
+            # dy<40 且 conf 低：多半已到缓存顶（空滚/回弹），走懒加载分支；
+            # dy>=40 但 conf 低才是真·内容变化/糊帧。
+            if dy >= 40 and conf < 0.5:
+                if low_conf_retries > 0:
+                    # 深采模式：真·低置信时重滑续采而非停止。
+                    # 重滑后 dy=两次滑动合计位移，仍 < 内容区高则可正常
+                    # 缝合不丢消息；超过则 stitch_union 回退单屏（有缝）。
+                    low_conf_retries -= 1
+                    print(f"  [rnd{rnd + 1}] 重叠置信低(conf={conf:.2f})，重滑续采"
+                          f"（剩 {low_conf_retries} 次）")
+                    RS.do_swipe(dev, "earlier")
+                    time.sleep(2.0)
+                    continue
+                # 停止前最后检查一次书签（可能已滚过书签位置但 conf 低）
+                if stop_at_anchor and anchor is not None and prev_img is not None:
+                    st_last = stitch_union(prev_img, img, dy)
+                    if st_last is not None:
+                        aconf = _anchor_in_union(anchor, st_last[0])
+                        if aconf >= ANCHOR_COVER_SUM:
+                            print(f"  [rnd{rnd + 1}] 重叠置信低(conf={conf:.2f})但命中书签(conf={aconf:.2f})，停止")
+                            break
+                print(f"  [rnd{rnd + 1}] 重叠置信过低(conf={conf:.2f})，停止")
+                break
             # dy<40：滑到顶或懒加载卡顿 → 再滑一次确认。
             # 微信旧消息懒加载：滚到缓存尽头时滑动会"空滚"(dy≈0)，要等它把
             # 更早的消息渲染出来才能继续滚：等 3s + 再滑一次。
@@ -320,27 +411,57 @@ def collect_group_history(dev, conn, group, max_rounds=40,
                 if segs:
                     seg_entries = []
                     for sg in segs:
-                        if sg["factor"] == "时间" or not sg["content"]:
-                            if sg["factor"] == "时间":
-                                cur_divider = sg["content"] or cur_divider
+                        if sg["factor"] == "时间":
+                            cur_divider = sg["content"] or cur_divider
+                            continue
+                        seg_type = sg.get("type") or "text"
+                        if seg_type == "text" and not sg["content"]:
                             continue
                         sender = sg.get("avatar_cand") or sg.get("nickname") or ""
                         if not sender and sg["factor"] in ("未知",):
                             sender = "未知"
+                        # 多媒体打标（2026-08-27）：非文本段用调色板锚定分类器
+                        # 细分类型，入库占位符 + 裁图路径（打标即走，不点击；
+                        # 真机处置由采集后的 media_pass 独立完成）。
+                        ctype = "text"
+                        content = sg["content"]
+                        ph = None
+                        if seg_type != "text":
+                            ctype, content, ph = _classify_media_seg(
+                                rec_img, sg)
+                            if ctype is None:
+                                continue   # unknown/system 段仍跳过
+                        elif content and len(content.strip()) <= 3:
+                            # 超短文本二次核验（2026-08-27 218 群事故：
+                            # 猫咪表情包小细节被 OCR 幻读成 "R"/"B"，
+                            # agent 回复了根本不存在的消息）。
+                            # 真·短文本气泡分类器会判 text，不受影响。
+                            ct2, _, ph2 = _classify_media_seg(rec_img, sg)
+                            if ct2 not in (None, "text"):
+                                ctype = ct2
+                                content = _MEDIA_PLACEHOLDER[ct2]
+                                ph = ph2
                         e = SimpleNamespace(
                             sender=sender, is_mine=False,
-                            content=sg["content"], content_type="text",
+                            content=content, content_type=ctype,
                             complete=1, partial_top=False,
                             partial_bottom=False, mentions=[],
                             media_path="", ocr_conf=None,
                             kind="msg")
+                        if ph is not None:
+                            e.dedup_hash = ph
+                            # 64bit 无符号 int 超 SQLite INTEGER 上限，存 hex
+                            e.frame_phash = f"{ph:016x}"
                         e.time_hint = cur_divider
                         e.match_factor = sg["factor"]
                         e.avatar_score = sg.get("avatar_score")
                         e.nick_score = sg.get("nick_score")
-                        if not _known(e, existing, existing_keys, seen, seen_keys):
+                        if not _known(e, existing, existing_keys, seen,
+                                      seen_keys, media_hashes):
                             seen.append((e.sender, e.content_type, e.content))
                             seen_keys.add(_key(e))
+                            if ph is not None:
+                                media_hashes.append(ph)
                             e.crop_path = RS.save_crop(
                                 rec_img, group, sg["y_top"], sg["y_bottom"], _key(e))
                             seg_entries.append(e)
@@ -371,7 +492,26 @@ def collect_group_history(dev, conn, group, max_rounds=40,
             if c["state"] == "complete":
                 e = RS.to_entry(m, group)
                 e.time_hint = cur_divider
-                if not _known(e, existing, existing_keys, seen, seen_keys):
+                # 媒体分型（与裁切线路径同一套规则）：slice_chat 粗类型
+                # 非文本 → 细分；超短文本 → 二次核验防 OCR 幻读
+                c0 = e.content_type or "text"
+                if c0 not in ("text", "quote", "time_divider") or \
+                        (c0 == "text" and e.content
+                         and len(e.content.strip()) <= 3):
+                    sg = {"y_top": c["y_top"], "y_bottom": c["y_bottom"],
+                          "content": e.content}
+                    ct2, content2, ph2 = _classify_media_seg(rec_img, sg)
+                    if ct2 is None:
+                        if c0 not in ("text", "quote", "time_divider"):
+                            continue   # unknown/system 跳过
+                    else:
+                        e.content_type = ct2
+                        e.content = content2
+                        if ph2 is not None:
+                            e.dedup_hash = ph2
+                            e.frame_phash = f"{ph2:016x}"
+                if not _known(e, existing, existing_keys, seen, seen_keys,
+                              media_hashes):
                     seen.append((e.sender, e.content_type, e.content))
                     seen_keys.add(_key(e))
                     e.crop_path = RS.save_crop(
@@ -405,6 +545,9 @@ def collect_group_history(dev, conn, group, max_rounds=40,
             for e in new_entries:
                 existing.append((e.sender, e.content_type, e.content))
                 existing_keys.add(_key(e))
+                dh = getattr(e, "dedup_hash", None)
+                if dh is not None:
+                    media_hashes.append(dh)
             if on_new and n:
                 on_new(new_entries)
         print(f"  [rnd{rnd + 1}] {rec_hint} dy={dy:5.0f} conf={conf:.2f} "
@@ -467,6 +610,7 @@ def collect_group_history(dev, conn, group, max_rounds=40,
                         "y_bottom": sg["y_bottom"],
                         "content": sg["content"][:50],
                         "factor": sg["factor"],
+                        "type": sg.get("type"),
                         "avatar_score": sg.get("avatar_score"),
                         "nick_score": sg.get("nick_score"),
                         "avatar_cand": sg.get("avatar_cand"),
