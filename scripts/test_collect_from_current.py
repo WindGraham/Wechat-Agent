@@ -7,7 +7,7 @@
   次屏起两屏拼 union 识别，union 完整包含上次书签（N0）即停。
 
 用法：
-    ~/.venvs/wechat-agent/bin/python scripts/test_collect_from_current.py [群名]
+    .venv/bin/python（项目内 venv） scripts/test_collect_from_current.py [群名]
 """
 
 import argparse

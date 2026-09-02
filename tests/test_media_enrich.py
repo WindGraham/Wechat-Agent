@@ -62,7 +62,8 @@ class CollectMediaTest(unittest.TestCase):
         ]
         _, imgs = me.collect_media(msgs, [], image_limit=4)
         # 不存在的文件被跳过；两条指向同一文件 → 去重后只有 1 张
-        self.assertEqual(imgs, [self.img])
+        # （最新优先：seq3 的表情包先入，标签取它）
+        self.assertEqual(imgs, [(self.img, "张三发的表情包")])
 
     def test_non_link_types_ignored(self):
         msgs = [_Msg("看看 https://a.com 这个", "text", seq=1)]
@@ -110,7 +111,7 @@ class EnrichTest(unittest.TestCase):
     def test_images_collected_regardless_of_crawl(self):
         msgs = [_Msg("[图片]", "image", media_path=self.img, seq=1)]
         _, imgs = me.enrich(msgs, [], _rt({"prompt_crawl_links": False}))
-        self.assertEqual(imgs, [self.img])
+        self.assertEqual(imgs, [(self.img, "张三发的图片")])
 
 
 class AttachImagesTest(unittest.TestCase):
@@ -141,6 +142,18 @@ class AttachImagesTest(unittest.TestCase):
         out, n = me.attach_images(messages, ["/nonexistent.jpg"])
         self.assertEqual(n, 0)
         self.assertEqual(out[0]["content"], "文本")
+
+    def test_labeled_images_get_caption_blocks(self):
+        """(path, label) 输入：每张图前插图注文本块（防多图混淆新旧）。"""
+        messages = [{"role": "system", "content": "sys"},
+                    {"role": "user", "content": "文本"}]
+        out, n = me.attach_images(messages, [(self.img, "张三发的图片")])
+        self.assertEqual(n, 1)
+        content = out[1]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "文本"})
+        self.assertEqual(content[1],
+                         {"type": "text", "text": "【图1：张三发的图片】"})
+        self.assertEqual(content[2]["type"], "image_url")
 
     def test_downscale(self):
         b64 = me.encode_image_b64(self.img, max_px=600)

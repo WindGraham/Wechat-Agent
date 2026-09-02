@@ -56,9 +56,11 @@ def _image_abs(m):
 
 def collect_media(history, new_msgs, link_limit=3, image_limit=4,
                   image_types=IMAGE_TYPES):
-    """从窗口消息里选出要增强的链接 URL 与图片路径（时间序，最新优先截断）。
+    """从窗口消息里选出要增强的链接 URL 与图片（时间序，最新优先截断）。
 
-    返回 (urls, image_paths)：均为旧→新顺序，最多 link_limit / image_limit 条。
+    返回 (urls, images)：urls 为 URL 字符串列表；images 为
+    [(path, label)]，label 形如「风图发的图片」（2026-09-01：不带标签时
+    多图混排，视觉模型分不清哪张是新图，把新图说成旧图——实测）。
     """
     msgs = list(history or []) + list(new_msgs or [])
     urls, seen_url = [], set()
@@ -69,11 +71,14 @@ def collect_media(history, new_msgs, link_limit=3, image_limit=4,
             if u and u not in seen_url:
                 seen_url.add(u)
                 urls.append(u)
-        if len(images) < image_limit \
-                and getattr(m, "content_type", "") in image_types:
+        ct = getattr(m, "content_type", "")
+        if len(images) < image_limit and ct in image_types:
             p = _image_abs(m)
-            if p and p not in images:
-                images.append(p)
+            if p and p not in [i[0] for i in images]:
+                sender = getattr(m, "sender", "") or "对方"
+                kind = {"image": "图片", "sticker": "表情包",
+                        "video": "视频"}.get(ct, "媒体")
+                images.append((p, f"{sender}发的{kind}"))
     urls.reverse()
     images.reverse()
     return urls, images
@@ -141,14 +146,24 @@ def encode_image_b64(path: str, max_px: int = 768):
 
 def attach_images(messages, image_paths, max_px: int = 768) -> tuple:
     """把最后一条 user 消息的 content 转成 OpenAI content 数组
-    （text + image_url×N），图片直发多模态模型。
+    （text + （图注 + image_url）×N），图片直发多模态模型。
 
+    image_paths 元素可为 str（无图注）或 (path, label)——带图注时
+    每张图前插一条文本块标注来源（「图2：风图发的图片」），让模型
+    能把图和消息对应起来（2026-09-01：无标注多图混排，模型把新发
+    的图当成旧图描述）。
     返回 (new_messages, n_attached)；无可用图片/无 user 消息时原样返回 0。
     """
     img_parts = []
-    for p in image_paths:
+    n = 0
+    for item in image_paths:
+        p, label = (item if isinstance(item, tuple) else (item, None))
         b64 = encode_image_b64(p, max_px=max_px)
         if b64:
+            n += 1
+            if label:
+                img_parts.append({"type": "text",
+                                  "text": f"【图{n}：{label}】"})
             img_parts.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}",
@@ -162,5 +177,5 @@ def attach_images(messages, image_paths, max_px: int = 768) -> tuple:
             if not isinstance(text, str):
                 return messages, 0
             out[i]["content"] = [{"type": "text", "text": text}] + img_parts
-            return out, len(img_parts)
+            return out, n
     return messages, 0

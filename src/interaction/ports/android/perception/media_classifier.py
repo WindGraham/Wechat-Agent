@@ -165,13 +165,26 @@ def _is_card(c):
 
 
 def _dominant_bg(img):
-    """背景色估计（仅用于图片段的内容提取）：边缘众数，失败退全图中位数。"""
-    edges = np.concatenate([img[0].reshape(-1, 3), img[-1].reshape(-1, 3),
-                            img[:, 0].reshape(-1, 3), img[:, -1].reshape(-1, 3)])
-    vals, counts = np.unique(edges.reshape(-1, 3), axis=0, return_counts=True)
-    i = counts.argmax()
-    if counts[i] / len(edges) >= 0.5:
-        return vals[i]
+    """背景色估计：四角 40×40 色块各取中位数，最相近的一对求平均。
+
+    旧实现（边缘众数→全图中位数回退）在气泡/卡片顶天立地时失效
+    （2026-09-02 Leisure 长文本事故：高气泡占满整图，全图中位数落到
+    气泡色 [45,45,45]，右侧纯背景块与"假背景"色差 44 被误判成链接卡
+    缩略图）。四角采样容忍头像/胶囊/气泡各占一角——至少还有两个角是
+    真背景，最相近的一对必是它们。图太小退全图中位数。"""
+    h, w = img.shape[:2]
+    s = 40
+    if h >= s * 2 and w >= s * 2:
+        corners = (img[:s, :s], img[:s, w - s:], img[h - s:, :s],
+                   img[h - s:, w - s:])
+        meds = [np.median(c.reshape(-1, 3), axis=0) for c in corners]
+        best, best_d = None, None
+        for i in range(4):
+            for j in range(i + 1, 4):
+                d = float(np.abs(meds[i] - meds[j]).max())
+                if best_d is None or d < best_d:
+                    best, best_d = (meds[i] + meds[j]) / 2, d
+        return np.asarray(best, dtype=np.uint8)
     return np.median(img.reshape(-1, 3), axis=0).astype(np.uint8)
 
 
@@ -207,12 +220,26 @@ def _embedded_block(img, box):
         fill = c["area"] / (cw * ch)
         if fill < 0.6:
             continue
+        # 真缩略图是右侧小方块（实测 ~152×153，卡宽 ~690，宽占比 0.22）；
+        # 深色木纹等伪气泡里"嵌入块"会横贯整个伪气泡（宽占比 1.0），
+        # 用宽度占比 + 位置右半区排除（2026-09-01 华为水杯照实测误检）。
+        if cw > w * 0.4 or cx + cw / 2 < w * 0.55:
+            continue
         # 排除"气泡外的聊天背景"块：胶囊粘连会把 bg 包进组件 box，
         # bg 灰也是"非气泡色"实心块（2026-08-27 实测 (904,84,176,140)
-        # fill=0.96 的纯 bg 误检）。真缩略图颜色与 bg 有显著差异。
+        # fill=0.96 的纯 bg 误检）。
+        # 判据=低方差+均值近 bg 双条件（2026-09-02 两轮事故修复）：
+        # ① 只看均值色差会误杀深色缩略图（睡眠障碍卡：夜景照片均值
+        #    与中灰聊天背景 [92,92,92] 差仅 16）；
+        # ② 只看方差会漏带 JPEG 边缘噪声的纯 bg 块（std≈10，
+        #    「有人@我」胶囊粘连把右侧 bg 包进 box）。
+        # 纯 bg 块 std≤11，真缩略图有纹理 std≥26，阈值取 15。
         block_roi = roi[cy:cy + ch, cx:cx + cw]
-        mean_bgr = block_roi.reshape(-1, 3).mean(axis=0)
-        if float(np.abs(mean_bgr.astype(int) - bg.astype(int)).max()) <= 25:
+        flat = block_roi.reshape(-1, 3)
+        mean_bgr = flat.mean(axis=0)
+        std_max = float(flat.std(axis=0).max())
+        if std_max < 15 and \
+                float(np.abs(mean_bgr.astype(int) - bg.astype(int)).max()) <= 25:
             continue
         return (x + cx, y0 + cy, cw, ch)
     return None
@@ -303,3 +330,31 @@ def classify_segment(img, ocr_text=""):
         return "system", {"reason": "no_component"}
     return "unknown", {"reason": "ambiguous",
                        "main_box": max(others, key=lambda c: c["area"])["box"]}
+
+
+def classify_text_suspect(img, ocr_text=""):
+    """已被 slice_chat 判为 text 的段的复核：只抓伪装成文本的卡片。
+
+    2026-09-02 链接卡漏检事故：公众号链接卡标题被 OCR 成长文本，
+    粗判 text 直接入库，URL 永远丢。但全量 classify_segment 的
+    nonbg_block 媒体路径会误伤正常文本（自己绿气泡+右侧头像、
+    「N条新消息」胶囊压气泡——全量 crops 回归实测），所以文本段
+    复核只认卡片硬证据：
+      - OCR 整行标记：聊天记录卡（xxx的聊天记录）/ 文件卡（11.9 KB）
+      - 气泡内嵌实心缩略图（链接卡，embedded_thumb）
+    认不出就维持 text，绝不把文本翻成媒体。"""
+    if img is None or img.size == 0:
+        return "text", {"reason": "empty"}
+    t = ocr_text or ""
+    if _CHAT_RECORD_RE.search(t):
+        return "card", {"reason": "ocr_marker", "sub": "chat_record"}
+    if _FILE_SIZE_RE.search(t):
+        return "card", {"reason": "ocr_marker", "sub": "file"}
+    bubbles, _mask = _bubble_comps(img)
+    text_bubbles = [c for c in bubbles if _is_text_bubble(c)]
+    if text_bubbles:
+        main = max(text_bubbles, key=lambda c: c["area"])
+        if _embedded_block(img, main["box"]) is not None:
+            return "card", {"reason": "embedded_thumb", "sub": "link",
+                            "main_box": main["box"]}
+    return "text", {"reason": "suspect_clear"}

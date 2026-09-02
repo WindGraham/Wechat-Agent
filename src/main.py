@@ -25,6 +25,11 @@ import sys
 import threading
 import time
 
+# CV 线程上限必须在任何 numpy/cv2 import 之前设置（BLAS 环境变量
+# 只在 numpy 首次 import 时读取一次）——保持在所有包内 import 之上。
+from .shared.cpu_limit import apply as _apply_cpu_limit
+_apply_cpu_limit()
+
 from .shared.runtime import RuntimeConfig
 from .interaction.msglog import message_log
 from .interaction.loop.unified_queue import UnifiedQueue

@@ -7,7 +7,7 @@ capture_scroll_live.py 只存 full+crop（新背景验证阶段不写识别逻�
   - split_y：本屏裁切内第一条完整头像顶
   - stitch：A2(本屏[split:dy]) + B1(上一张[0:split])，screen0 = A1[split:]
 用法：
-    ~/.venvs/wechat-agent/bin/python scripts/backfill_replay_stitch.py <replay名>
+    .venv/bin/python（项目内 venv） scripts/backfill_replay_stitch.py <replay名>
 """
 import json, os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))

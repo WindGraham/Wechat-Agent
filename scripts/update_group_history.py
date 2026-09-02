@@ -6,7 +6,7 @@
 停在「上一次采集的位置」，不会把旧消息误当新消息重复入库。
 
 用法：
-    ~/.venvs/wechat-agent/bin/python scripts/update_group_history.py 陈曦猫猫群
+    .venv/bin/python（项目内 venv） scripts/update_group_history.py 陈曦猫猫群
 """
 
 import sys

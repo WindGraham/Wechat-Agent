@@ -115,7 +115,7 @@
 
 ### 2.4 路线 B 的 OCR 选型
 
-当前主 venv（`~/.venvs/wechat-agent/bin/python`）无 easyocr / pytesseract。需要先确认项目 OCR 入口：
+当前主 venv（`.venv/bin/python（项目内 venv）`）无 easyocr / pytesseract。需要先确认项目 OCR 入口：
 
 - `src/interaction/ports/android/perception/ocr_engine.py`
 - 若项目 OCR 使用 Gemini / 本地 cv2 / 其他模型，直接复用该入口。

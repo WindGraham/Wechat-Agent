@@ -257,20 +257,25 @@ class UnifiedQueue:
             return entry
 
     # ------------------------------------------------------------------ 出队
-    def pop_next(self) -> Optional[QueueEntry]:
+    def pop_next(self, exclude=frozenset()) -> Optional[QueueEntry]:
         """取出下一条待处理条目。
 
         优先级：@我/主人 > 按入队时间 FIFO。
-        取出即从队列中移除。
+        取出即从队列中移除。exclude：本轮已挂起的 session 不再弹出
+        （白名单模式防挂起的 priority action 反复堵队首，2026-09-01
+        实测：两个挂起的 priority action 把猫猫群普通 action 饿死在队里）。
         """
         with self._lock:
             if not self._entries:
                 return None
             # 排序：priority first, then FIFO
             entries = sorted(
-                self._entries.values(),
+                (e for e in self._entries.values()
+                 if e.session not in exclude),
                 key=lambda e: (0 if e.is_priority else 1, e.ts),
             )
+            if not entries:
+                return None
             entry = entries[0]
             del self._entries[entry.session]
             self._persist()

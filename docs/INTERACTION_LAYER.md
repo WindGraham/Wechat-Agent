@@ -214,35 +214,63 @@ A 的行动清空 → 最后一次日志同步 → 此时才向 Proxy 发 LogUpd
   （不支持预览的类型页面只有「用其他应用打开」死路，保存入口只在 ⋯ 菜单）→
   文件落 `/sdcard/Download/WeiXin/<原文件名>` → 差集法取回 → pull → 删源。
 - **红包**：仅记录，不自动点开。
+- **分类规则补充（`media_classifier.classify_segment`，2026-09-01）**：
+  深色主题下链接卡与文本气泡同色同形，调色板锚定无法区分
+  （2026-08-27 交流一下 seq65 误判 text 事故）→ 调色板判 text 前先查
+  `embedded_thumb`：气泡顶部 30% 以下区域有实心块（min_area 8000 /
+  min_h 60 / w≥60 / fill≥0.6）即判 card/link。三重排除：
+  顶部 30% 不扫（「N条新消息」胶囊挂载位，药丸色偏差会成假块）；
+  块均色与聊天背景最大通道差 ≤25 排除（胶囊粘连把气泡外灰底包进
+  box 的假块）；块宽 >40% 泡宽或中心不在右半区排除（真缩略图是右侧
+  ~152×152 小方块、宽占比 0.22；深色木纹照片/深色西装表情包的伪
+  气泡里假块横贯整个伪气泡）。已知遗留边界：深色纹理图（木纹/
+  深色西装）的伪气泡仍会落 text——伪气泡与真短文本气泡纯形状不可分，
+  生产侧靠 OCR 文本兜底，未加面积/填充率门槛（真一字气泡同样小）。
+  真图回归固化在 `tests/test_media_classifier.py`（依赖
+  workspace/crops 留档，缺失自动 skip）。
+- **文本段「卡片嫌疑复核」（`classify_text_suspect`，2026-09-02）**：
+  链接卡标题被 OCR 成长文本时 slice_chat 粗判 text，旧管线直接入库
+  （新智元/无文册两卡漏检，URL 丢失事故）→ history_collect 两条采集
+  路径对所有带内容文本段都过一遍复核。复核只认卡片硬证据：OCR 整行
+  标记（聊天记录卡/文件卡）+ 气泡内嵌实心缩略图；**不走 nonbg_block
+  媒体路径**（自己绿气泡+右侧头像、「有人@我/新消息」胶囊压气泡会被
+  误翻成媒体，全量 crops 回归实测）。配套两处分类器修复：
+  ① `_embedded_block` 背景排除改「方差<15 且均值近背景」双条件
+  （纯背景块 std≤11 带 JPEG 边缘噪声；深色夜景缩略图均值虽贴脸灰
+  背景但 std≥26 有纹理）；② `_dominant_bg` 改四角 40×40 中位数
+  最相近对求平均（旧边缘众数/全图中位在高气泡顶天立地时估成气泡色，
+  把右侧真背景块当缩略图）。回归用例见 SUSPECT_CARDS / SUSPECT_TEXTS。
 - **点击前置校验**：`_verify_in_chat` OCR 顶部标题条确认在目标会话页，
   不在则拒绝点击（防首页残留状态 + 旧 bbox 乱点进别人会话）。
 
-**接入（2026-08-27 定稿，已入轮询主链路）**：分两步——
-- **内联打标（采集中，零点击）**：裁切线分段把 slice_chat 的类型传播到段
+**接入（2026-09-01 改定：内联处置为主，media pass 兜底）**：
+- **内联处置（采集中，主路径）**：裁切线分段把 slice_chat 的类型传播到段
   （`cutline_segment` segs 带 `type`），`history_collect` 对非文本段用
   `classify_segment` 细分入库：content_type ∈ link/image/chat_record/file/
   red_packet，content = 占位符（"[图片]"/"[链接]"…），media_path = 裁图路径，
-  `media_status=''`（messages 表新列，'' / done / failed）。无 OCR 内容的
-  媒体段不再丢弃。媒体去重靠段裁图 aHash（frame_phash 列，汉明 ≤6 判同图）——
+  `media_status=''`（messages 表新列，'' / done / failed）。**本屏完整露出
+  的媒体段当屏立即处置**：分段坐标直接映射设备坐标点击（不需要模板匹配），
+  取完校验仍在原屏再继续滑动；交接处半显段本轮不入库不点，下一屏完整露出
+  再采+处置；处置后位置漂移则停止采集（已入库数据保留，下轮 journey 从
+  书签覆盖空洞）。预算热控 `media_handle_inline_enabled`(默认 true) /
+  `media_handle_max_per_journey`(5) / `media_handle_timeout_s`(180)。
+  媒体去重靠段裁图 aHash（frame_phash 列，汉明 ≤6 判同图）——
   占位符无区分度，同一发送者多张图不再互相误杀，同图跨 union 仍判重。
-- **独立处置 pass（采集后，`loop/media_pass.py`）**：缝合采集中途 tap 会打断
-  配准，故采集完成、屏幕停在书签处后，对待处置条目（seq 升序）用
+- **media pass（采集后兜底，`loop/media_pass.py`）**：只捡内联没处理掉的
+  条目（media_status=''，如超预算剩余）：缝合采集中途 tap 曾打断配准的
+  老方案，现作为兜底保留。对待处置条目（**seq 降序**=物理旧→新顺路）用
   **存档裁图对当前屏 matchTemplate** 定位（阈值 0.85，裁图 >400px 取头部
-  子条；不做 union→device 线性坐标映射）→ MediaTask → MediaHandler.handle()
-  → `update_media` 按 id 精确写回（链接 URL 进 content；图片/视频/文件的
-  本地路径进 media_path；聊天记录卡解析文本进 content；红包只标 done 不点击）。
-  处理顺序 **seq 降序**（采集逐屏向更旧滚、逐屏 append：seq 越小物理越新，
-  从书签旧侧向最新滚必须降序才顺路——seq418 实测升序会把旧目标落在身后）。
+  子条）→ MediaTask → MediaHandler.handle() → `update_media` 按 id 精确
+  写回（链接 URL 进 content；图片/视频/文件的本地路径进 media_path；
+  聊天记录卡解析文本进 content；红包只标 done 不点击）。
   点击位置取条带内**主内容块**中心（整行条带几何中心会落在灰底上，
-  点灰底不开页——seq417 实测）。只处置**本轮采集入库**的条目
-  （journey 传 since_ts=同步开始时刻；更老的在书签旧侧，滚 newer 永远找不到）。定位鲁棒性（2026-08-27 猫猫群实测
-  修复）：每个位置双截屏防 fling 糊帧漏检（单截屏错过目标屏后目标沉入
-  输入栏裁切区 conf 只剩 0.4）；屏面连续 2 次不变判到底提前放弃。
-  单条 8 屏未命中标 failed；预算热控 `media_handle_enabled` /
-  `media_handle_max_per_journey`(5) / `media_handle_timeout_s`(180)，
-  剩余下轮 journey 继续。结束后 scroll_to_latest 回滚——收尾 sync 以
-  「当前屏=最新屏」存书签，停在中段会污染书签。
-  接入点：journey 首次 sync 成功后（动作执行前）+ collect 模式深采后。
+  点灰底不开页——seq417 实测）。定位鲁棒性：每个位置双截屏防 fling
+  糊帧漏检（seq417 实测单截屏会错过目标屏）；屏面连续 2 次不变判到底
+  提前放弃；单条 8 屏未命中标 failed。只处置**本轮采集入库**的条目
+  （journey 传 since_ts=同步开始时刻；更老的在书签旧侧，滚 newer 永远
+  找不到）。结束后 scroll_to_latest 回滚——收尾 sync 以「当前屏=最新屏」
+  存书签，停在中段会污染书签。接入点：journey 首次 sync 成功后（动作
+  执行前）+ collect 模式深采后。
 
 `realtime_scan(handle_media=...)` 钩子仍在但 realtime_scan 无调用者（死代码，
 待清理）。所有处置落盘 `workspace/media/{type}/{msg_id}_{ts}/`（含

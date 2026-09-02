@@ -63,6 +63,37 @@ class ProviderRegistry:
                 "token_floor": getattr(p, "_token_floor", 0),
                 "token_ceiling": getattr(p, "_token_ceiling", 0)}
 
+    # ---------------------------------------------------------------- 多模态 fallback
+    def mm_provider(self):
+        """多模态决策 provider（懒创建缓存）：主 provider 不支持图片而
+        本轮窗口里有图时使用（2026-09-01：DeepSeek 文本模型吃图必 400，
+        官方视觉模型 deepseek-v4-flash-vision-exp 上线后走它）。
+
+        runtime 热控：decision_provider_mm（默认 deepseek）/
+        decision_model_mm（默认 deepseek-v4-flash-vision-exp）。
+        创建失败返回 None（调用方回退去图降级）。
+        """
+        prov = (self._rt("decision_provider_mm", "deepseek") or "").strip()
+        model = (self._rt("decision_model_mm",
+                          "deepseek-v4-flash-vision-exp") or "").strip()
+        key = (prov, model)
+        with self._session_prov_lock:
+            p = self._session_providers.get(key)
+        if p is not None:
+            return p
+        try:
+            from ..provider.factory import create_provider
+            p = create_provider(prefer=prov, model=model)
+            p.set_token_limits(self._rt("decision_token_floor", 0),
+                               self._rt("decision_token_ceiling", 0))
+        except Exception as e:  # noqa: BLE001
+            log.warning("多模态 provider(%s/%s) 创建失败: %s", prov, model, e)
+            return None
+        with self._session_prov_lock:
+            self._session_providers[key] = p
+        log.info("多模态决策 provider: %s/%s", prov, model)
+        return p
+
     # ---------------------------------------------------------------- 提取 provider
     def set_extract_provider(self, provider):
         """设置记忆提取专用 provider（通常用便宜模型）。不设置回退主 provider。"""

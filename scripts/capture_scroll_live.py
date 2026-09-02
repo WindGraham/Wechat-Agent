@@ -7,7 +7,7 @@
   3) 持续运行直到外部喊停（job_kill / Ctrl-C）
 
 用法：
-    ~/.venvs/wechat-agent/bin/python scripts/capture_scroll_live.py [群名]
+    .venv/bin/python（项目内 venv） scripts/capture_scroll_live.py [群名]
 """
 
 import argparse

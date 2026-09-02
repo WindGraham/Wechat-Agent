@@ -116,10 +116,44 @@
 | `WECHAT_AGENT_GATEWAY_HOST` | 127.0.0.1 | 绑定地址 |
 | `WECHAT_AGENT_GATEWAY_PORT` | 13014 | 端口 |
 | `WECHAT_AGENT_GATEWAY_TOKEN` | 无 | 设置后所有请求需 `Authorization: Bearer <token>` |
-| `WECHAT_AGENT_PYTHON` | ~/.venvs/wechat-agent/bin/python | agent 解释器路径 |
+| `WECHAT_AGENT_PYTHON` | .venv/bin/python（项目内 venv） | agent 解释器路径 |
 | `WECHAT_AGENT_WORKSPACE` | 无 | 传给 agent 的 --workspace |
 | `WECHAT_AGENT_CONFIG` | 无 | 传给 agent 的 --config |
 | `WECHAT_AGENT_CALLBACK_PORT` | 13015 | agent 侧 task_done 回调端口 |
+
+### Python 虚拟环境（项目内 .venv）
+
+venv 放在项目目录内：`.venv/bin/python`（run.sh / install.sh /
+systemd 服务 / gateway supervisor 统一用这个路径）。
+**不要放在 ~ 所在盘**（2026-09-01 起的新约定，说明见
+`~/.venvs/README_venv位置说明.txt`）。
+
+注意 `/media/data_old` 是 **exFAT 分区，不支持符号链接**，直接
+`python3 -m venv .venv` 会在创建 lib64 软链时报
+`Operation not permitted`。重建步骤（先在 ext4 位置构建再整体拷贝）：
+
+```bash
+python3 -m venv --copies /tmp/wxa_venv_build
+cp -rL /tmp/wxa_venv_build /media/data_old/Wechat-Agent/.venv
+rm -rf /tmp/wxa_venv_build
+cd /media/data_old/Wechat-Agent
+.venv/bin/python -m pip install opencv-python numpy requests \
+    pyyaml flask jieba rapidocr onnxruntime pillow pytest
+```
+
+（activate 脚本里的 VIRTUAL_ENV 路径已在拷贝后修正为项目内路径。）
+
+**拷贝后必须修 shebang**：`bin/` 下的 console script（pip/pytest/flask
+等）首行指向构建时的临时路径，逐个改成项目内路径，否则 `.venv/bin/pip`
+直接执行会报解释器不存在（`.venv/bin/python -m pip` 不受影响）：
+
+```bash
+cd /media/data_old/Wechat-Agent/.venv/bin
+for f in *; do
+  head -1 "$f" 2>/dev/null | grep -q '^#!.*wxa_venv_build' && \
+    sed -i "1s|.*|#!/media/data_old/Wechat-Agent/.venv/bin/python|" "$f"
+done
+```
 
 ### 热重启 / 刷新网关
 

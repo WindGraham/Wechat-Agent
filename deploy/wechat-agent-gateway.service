@@ -30,14 +30,21 @@ Type=simple
 User=AsusGraham
 # 换成仓库实际路径
 WorkingDirectory=/media/data_old/Wechat-Agent
-# 换成 venv 实际路径（run.sh 依赖自检同样会执行）
-ExecStart=/home/AsusGraham/.venvs/wechat-agent/bin/python -m src.gateway
+# venv 在项目目录内（exFAT 盘不支持符号链接，--copies 创建）
+ExecStart=/media/data_old/Wechat-Agent/.venv/bin/python -m src.gateway
 Restart=always
 RestartSec=3
 # 只杀网关主进程，不连带 agent 子进程（agent 由网关控制台管理，独立存活）
 KillMode=process
 # 可选：网关鉴权 token（设置后网页需 Authorization）
 # Environment=WECHAT_AGENT_GATEWAY_TOKEN=your_token_here
+# CV/BLAS 线程上限（默认 6 核，网关与 agent 子进程都继承；
+# agent 入口 main.py 里还有一层保险）
+Environment=OMP_NUM_THREADS=6
+Environment=OPENBLAS_NUM_THREADS=6
+Environment=MKL_NUM_THREADS=6
+Environment=NUMEXPR_NUM_THREADS=6
+Environment=VECLIB_MAXIMUM_THREADS=6
 
 [Install]
 WantedBy=multi-user.target

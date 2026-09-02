@@ -11,7 +11,7 @@
 停止：union 完整包含上次书签（新消息采完）/ 滑到顶 / --max-screens。
 
 用法：
-    ~/.venvs/wechat-agent/bin/python scripts/capture_replay.py [群名] [--max-screens 12]
+    .venv/bin/python（项目内 venv） scripts/capture_replay.py [群名] [--max-screens 12]
 """
 
 import argparse

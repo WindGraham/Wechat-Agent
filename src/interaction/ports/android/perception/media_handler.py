@@ -846,6 +846,11 @@ class MediaHandler:
         """尽最大努力回到微信聊天页。"""
         for _ in range(5):
             act = self.dev.get_current_activity()
+            if act == "com.tencent.mm/.ui.chatting.ChattingUI":
+                # 已在聊天页：立即停（2026-09-01 #11184：unknown 签名时
+                # 实际还在聊天页，多 back 一次冲到了首页，后续 sync 把
+                # 首页列表当聊天采出 3 条假消息）
+                return
             if act == "com.tencent.mm/.ui.LauncherUI":
                 # 可能在首页，需要重新进入会话（由接入层负责）
                 break
@@ -878,8 +883,12 @@ class MediaHandler:
             pass
 
     def _list_dir(self, remote_dir: str) -> List[str]:
-        """列目录文件名（ls -1，一行一名，中文/空格安全）。"""
-        out = self.dev._shell(f"ls -1 {remote_dir} 2>/dev/null").decode(errors="replace")
+        """列目录文件名（ls -1，一行一名，中文/空格安全）。
+        目录不存在时 ls 退出码非零、_shell 会抛异常——`|| true` 兜底
+        返回空列表（2026-09-01 实测：/sdcard/Movies/WeiXin 不存在
+        导致图片保存流整体失败）。"""
+        out = self.dev._shell(
+            f"ls -1 {remote_dir} 2>/dev/null || true").decode(errors="replace")
         return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
     def _wait_for_new_file(self, remote_dir: str, timeout: int = 30,
@@ -893,7 +902,9 @@ class MediaHandler:
         excl = set(exclude)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            out = self.dev._shell(f"ls -1t {remote_dir} 2>/dev/null").decode(errors="replace")
+            out = self.dev._shell(
+                f"ls -1t {remote_dir} 2>/dev/null || true").decode(
+                errors="replace")
             for ln in out.splitlines():
                 n = ln.strip()
                 if n and n not in excl and n not in (".", ".."):

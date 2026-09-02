@@ -9,6 +9,7 @@ InteractionLoop 暂停正常分发/乱逛（=「休眠」）；扫描结束释�
 """
 
 import logging
+import os
 import threading
 import time
 
@@ -33,6 +34,23 @@ def should_sweep(now_ts, last_sweep_day, hour=ROSTER_SWEEP_HOUR):
     return _today_key(now_ts) != last_sweep_day
 
 
+def _sweep_enabled():
+    """runtime.json roster_sweep_enabled（默认 True，热读）。
+
+    测试模式（session_allowlist 期间）关 False：sweep 占用手机会阻塞
+    白名单会话的 journey，且未完成时重启会从头重爬。
+    """
+    try:
+        import json
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))),
+            "config", "runtime.json")
+        with open(p, encoding="utf-8") as f:
+            return bool(json.load(f).get("roster_sweep_enabled", True))
+    except (OSError, ValueError):
+        return True
+
+
 class RosterSweep:
     """凌晨3点花名册扫描线程（daemon）。"""
 
@@ -53,8 +71,8 @@ class RosterSweep:
                  self._sweep_hour, self._check_interval)
         while not self._stop.is_set():
             try:
-                if should_sweep(self._clock(), self._last_sweep_day,
-                                self._sweep_hour):
+                if _sweep_enabled() and should_sweep(
+                        self._clock(), self._last_sweep_day, self._sweep_hour):
                     summary = self.sweep_once()
                     log.info("roster sweep done: %s", summary)
             except Exception:

@@ -220,11 +220,15 @@ class Decider:
     # ================================================================== LLM 循环
     @staticmethod
     def _supports_image_chat(provider) -> bool:
-        """provider 的 chat 是否支持 OpenAI content 数组（image_url 直发图片）。
+        """provider 的 chat 是否支持 image_url 直发图片。
 
-        GeminiProvider 走 generateContent（content 数组不支持）→ False；
-        Kimi/DeepSeek 等 OpenAI 兼容 provider（provider.base 模块）→ True。
+        两层判定：① 模型能力标记 supports_images（DeepSeek 全系 False——
+        接受 OpenAI content 数组格式但模型拒绝必 400，2026-09-01 实测）；
+        ② API 格式：GeminiProvider 走 generateContent（content 数组不支持）
+        → False；Kimi 等 OpenAI 兼容 provider（provider.base 模块）→ True。
         """
+        if getattr(provider, "supports_images", True) is False:
+            return False
         return type(provider).__module__.endswith("provider.base")
 
     def _llm_loop(self, session, is_group, trigger, history, new_msgs) -> bool:
@@ -246,6 +250,15 @@ class Decider:
         # 尾部（带磁盘缓存）；图片以 image_url 直发多模态模型。
         from .media_enrich import enrich, attach_images
         tail_text, image_paths = enrich(hist_prompt, new_msgs, self._rt)
+        # 主 provider 不支持图片而窗口里有图 → 切多模态 provider
+        # （2026-09-01：DeepSeek 文本模型吃图必 400，官方视觉模型
+        # deepseek-v4-flash-vision-exp 上线后走它；见 providers.mm_provider）
+        if image_paths and not self._supports_image_chat(provider):
+            mm = self._providers.mm_provider()
+            if mm is not None and self._supports_image_chat(mm):
+                log.info("[%s] 窗口含 %d 张图，决策切多模态 provider (%s)",
+                         session, len(image_paths), getattr(mm, "model", "?"))
+                provider = mm
         attach_ok = bool(self._rt("prompt_attach_images", True)) \
             and bool(image_paths) and self._supports_image_chat(provider)
 

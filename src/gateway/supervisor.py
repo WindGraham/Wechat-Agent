@@ -29,7 +29,11 @@ import time
 log = logging.getLogger("gateway.supervisor")
 
 # 默认值（可在 AgentSupervisor 构造时覆盖，供测试注入假路径）
-DEFAULT_PYTHON = os.path.expanduser("~/.venvs/wechat-agent/bin/python")
+# venv 在项目目录内（/media/data_old 是 exFAT 不支持符号链接，
+# 用 python3 -m venv --copies 创建；重建见 docs/GATEWAY.md）
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+DEFAULT_PYTHON = os.path.join(_REPO_ROOT, ".venv", "bin", "python")
 DEFAULT_MAIN = ["-m", "src.main"]
 
 # 日志轮转：保留最近 KEEP_LOG_ROTATIONS 份历史

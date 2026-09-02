@@ -22,8 +22,8 @@
 set -e
 cd "$(dirname "$0")"
 
-PYTHON=~/.venvs/wechat-agent/bin/python
-[ -x "$PYTHON" ] || { echo "venv 不存在: $PYTHON" >&2; exit 1; }
+PYTHON="$(pwd)/.venv/bin/python"
+[ -x "$PYTHON" ] || { echo "venv 不存在: $PYTHON（项目内 .venv，见 docs/GATEWAY.md）" >&2; exit 1; }
 
 SERVICE_NAME="wechat-agent-gateway"
 ROOT="$(pwd)"
@@ -50,6 +50,12 @@ RestartSec=3
 Environment=PATH=$CLI_BIN_DIR:/usr/local/bin:/usr/bin
 Environment=WECHAT_AGENT_GATEWAY_HOST=127.0.0.1
 Environment=WECHAT_AGENT_GATEWAY_PORT=13014
+# CV/BLAS 线程上限（默认 6 核；agent 入口 main.py 里还有一层保险）
+Environment=OMP_NUM_THREADS=6
+Environment=OPENBLAS_NUM_THREADS=6
+Environment=MKL_NUM_THREADS=6
+Environment=NUMEXPR_NUM_THREADS=6
+Environment=VECLIB_MAXIMUM_THREADS=6
 # 只杀网关主进程，不连带 agent 子进程（agent 由网关控制台管理，独立存活）
 KillMode=process
 # 可选：网关鉴权 token（设置后网页需 Authorization）
@@ -84,6 +90,12 @@ RestartSec=3
 Environment=PATH=$CLI_BIN_DIR:/usr/local/bin:/usr/bin
 Environment=WECHAT_AGENT_GATEWAY_HOST=127.0.0.1
 Environment=WECHAT_AGENT_GATEWAY_PORT=13014
+# CV/BLAS 线程上限（默认 6 核；agent 入口 main.py 里还有一层保险）
+Environment=OMP_NUM_THREADS=6
+Environment=OPENBLAS_NUM_THREADS=6
+Environment=MKL_NUM_THREADS=6
+Environment=NUMEXPR_NUM_THREADS=6
+Environment=VECLIB_MAXIMUM_THREADS=6
 KillMode=process
 # Environment=WECHAT_AGENT_GATEWAY_TOKEN=your_token_here
 

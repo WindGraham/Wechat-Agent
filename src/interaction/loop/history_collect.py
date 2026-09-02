@@ -44,6 +44,17 @@ log = logging.getLogger("interaction.history_collect")
 
 PROJECT_ROOT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "..", ".."))
+
+
+def _runtime_cfg(key, default):
+    """读 config/runtime.json（热读，文件缺失/损坏时用默认值）。"""
+    try:
+        import json
+        with open(os.path.join(PROJECT_ROOT, "config", "runtime.json"),
+                  encoding="utf-8") as f:
+            return json.load(f).get(key, default)
+    except (OSError, ValueError):
+        return default
 ANCHOR_DIR = os.path.join(PROJECT_ROOT, "workspace", "runtime")
 ANCHOR_COVER_SUM = 0.8   # union 完整包含书签的匹配置信度（设计 §10 初值，真机校准）
 # 书签展示副本（网关 /workspace/ 图片路由可读；runtime/ 被路由禁止，故放 bookmarks/）
@@ -224,6 +235,30 @@ def _phash(img):
     return bits
 
 
+def _classify_text_suspect(rec_img, sg):
+    """文本段复核 → (content_type, phash)；维持文本 → ("text", None)。
+
+    只抓伪装成文本的卡片（链接卡/聊天记录卡/文件卡），不碰
+    nonbg_block 媒体路径——那会误伤正常文本（自己绿气泡+头像、
+    新消息胶囊压气泡，2026-09-02 全量回归实测）。
+    """
+    from ..ports.android.perception.media_classifier import (
+        classify_text_suspect)
+    y0, y1 = int(sg["y_top"]), int(sg["y_bottom"])
+    crop = rec_img[max(0, y0):y1]
+    if crop.size == 0:
+        return "text", None
+    try:
+        label, detail = classify_text_suspect(crop, sg.get("content") or "")
+    except Exception:  # noqa: BLE001
+        return "text", None
+    if label == "card":
+        sub = (detail or {}).get("sub")
+        ctype = {"chat_record": "chat_record", "file": "file"}.get(sub, "link")
+        return ctype, _phash(crop)
+    return "text", None
+
+
 def _classify_media_seg(rec_img, sg):
     """媒体段 → (content_type, placeholder, phash)；unknown/system → (None, None, None)。
 
@@ -259,7 +294,9 @@ def collect_group_history(dev, conn, group, max_rounds=40,
                           stop_when=None, stop_at_anchor=True,
                           use_cutlines=True, debug_dir=None,
                           reconcile=False, reconcile_max_per_round=2,
-                          reconcile_max_total=12, low_conf_retries=0):
+                          reconcile_max_total=12, low_conf_retries=0,
+                          handle_media=True, media_max=None,
+                          media_timeout_s=None, media_handler=None):
     """进群后从最新屏向更早翻，union 缝合识别，滚到上次书签即停（增量新消息）。
 
     dev: DeviceCtl；conn: msglog 连接；group: 群名（有花名册则双因子识别）。
@@ -272,6 +309,13 @@ def collect_group_history(dev, conn, group, max_rounds=40,
     reconcile=True：双因子失配消息在其仍在屏上时点头像进资料页调和
     （改名/换头像按 roster_update 四规则写回花名册；新成员动态学习入库），
     每屏最多 reconcile_max_per_round 条、每次采集最多 reconcile_max_total 条。
+    handle_media=True（2026-09-01 用户定稿）：滚动中识别到本屏有完整露出的
+    多媒体消息就立即点击处置（链接取 URL / 图片视频文件存电脑 / 表情包抠图），
+    取完校验仍在原位置再继续滑动。交接处半显的媒体段本轮跳过不采，下一屏
+    完整露出时才入库+处置。位置漂移则停止采集（已入库数据保留，下轮 journey
+    从书签覆盖空洞）。media_max/media_timeout_s 为每次采集的处置预算，
+    None 时读 runtime.json 的 media_handle_max_per_journey(5)/
+    media_handle_timeout_s(180)；media_handler 供测试注入假实现。
     返回累计入库条数。
     """
     from ..msglog import message_log
@@ -282,6 +326,17 @@ def collect_group_history(dev, conn, group, max_rounds=40,
 
     session_id = message_log.get_or_create_session(conn, group, is_group=True)
     rm = RosterMatcher(group)
+
+    # 开采前校验：当前页必须是目标聊天页（OCR 顶部标题含群名）。
+    # 2026-09-01 事故：媒体处置 _return_to_chat 过冲落到首页后，下一轮
+    # sync 把首页会话列表当聊天采出 3 条假消息（联系人头像→[图片]）。
+    probe0 = run_ocr(dev.capture_bytes())
+    in_chat0 = any(group[:4] in i.get("text", "") and i.get("cy", 9999) < 220
+                   for i in probe0)
+    if not in_chat0:
+        log.warning("[%s] 采集前校验：当前页标题不含群名，放弃本次采集"
+                    "（防止把非聊天页当聊天采）", group)
+        return 0
 
     # 调试落盘目录（测试时期不启动自动删除）
     if debug_dir is not None:
@@ -317,6 +372,17 @@ def collect_group_history(dev, conn, group, max_rounds=40,
     prev_img = None
     reconciled = set()             # 本 run 已点头像调和过的昵称（防重复点）
     reconcile_done = 0             # 本 run 已调和次数（上限 reconcile_max_total）
+    # 内联媒体处置状态（2026-09-01 用户定稿：滚动中识别到就处置）
+    if handle_media:
+        handle_media = bool(_runtime_cfg("media_handle_inline_enabled", True))
+    if media_max is None:
+        media_max = int(_runtime_cfg("media_handle_max_per_journey", 5))
+    if media_timeout_s is None:
+        media_timeout_s = int(_runtime_cfg("media_handle_timeout_s", 180))
+    media_deadline = time.time() + media_timeout_s
+    media_handled = 0              # 本 run 已处置条数（预算计数）
+    media_drift_stop = False       # 处置后位置漂移 → 停止采集
+    media_handler_inst = None      # MediaHandler 惰性单例（media_handler 参数可注入假实现）
 
     for rnd in range(max_rounds):
         img = dev.capture_bytes()
@@ -402,6 +468,28 @@ def collect_group_history(dev, conn, group, max_rounds=40,
         # ---- 统一裁切线分段（2026-08-15 自动化接入）：优先用「头像上边缘 +
         # 时间戳边沿」分段（不依赖气泡完整性，跨接缝消息正确处理），每段带
         # 匹配度。失败（无有效段）回退 slice_chat 消息路径。----
+        # 当前屏可见内容区（内联媒体处置的坐标映射基准；union 行 y_u →
+        # 设备行 top_c + y_u，与 reconcile 同一映射）
+        top_c = bottom_c = None
+        if handle_media:
+            from ..ports.android.perception.page_detector import (
+                detect_input_bar_top, detect_pinned_bar_end)
+            top_c = detect_pinned_bar_end(img) or CONTENT_Y0
+            bottom_c = detect_input_bar_top(img) or INPUT_BAR_Y0
+
+        def _seg_dev_y(sg):
+            """段 rec_img 坐标 → 设备坐标 (y_top, y_bottom)。"""
+            if st is None:
+                return int(sg["y_top"]), int(sg["y_bottom"])
+            return top_c + int(sg["y_top"]), top_c + int(sg["y_bottom"])
+
+        def _seg_fully_visible(sg):
+            """段完整露出在当前屏可点区域（上下留边排除半显交接段）。"""
+            if top_c is None:
+                return False
+            yt, yb = _seg_dev_y(sg)
+            return yt >= top_c + 20 and yb <= bottom_c - 20
+
         seg_entries = None
         segs = None
         if use_cutlines:
@@ -417,9 +505,19 @@ def collect_group_history(dev, conn, group, max_rounds=40,
                         seg_type = sg.get("type") or "text"
                         if seg_type == "text" and not sg["content"]:
                             continue
-                        sender = sg.get("avatar_cand") or sg.get("nickname") or ""
-                        if not sender and sg["factor"] in ("未知",):
-                            sender = "未知"
+                        # 自己的消息（右侧气泡）：cutline 分段已识别
+                        # factor=="自己"，这里必须落成 sender="我"/is_mine=True，
+                        # 否则群里自己发的消息无头像/昵称因子 → sender=""，
+                        # 查重 fuzzy_eq 先比 sender，"我"对""永远不等，
+                        # journey 重扫把自己的回复当匿名新消息重复入库
+                        # （2026-09-01 猫猫群每条回复记两遍的事故）。
+                        is_mine = sg["factor"] == "自己"
+                        if is_mine:
+                            sender = "我"
+                        else:
+                            sender = sg.get("avatar_cand") or sg.get("nickname") or ""
+                            if not sender and sg["factor"] in ("未知",):
+                                sender = "未知"
                         # 多媒体打标（2026-08-27）：非文本段用调色板锚定分类器
                         # 细分类型，入库占位符 + 裁图路径（打标即走，不点击；
                         # 真机处置由采集后的 media_pass 独立完成）。
@@ -431,18 +529,31 @@ def collect_group_history(dev, conn, group, max_rounds=40,
                                 rec_img, sg)
                             if ctype is None:
                                 continue   # unknown/system 段仍跳过
-                        elif content and len(content.strip()) <= 3:
-                            # 超短文本二次核验（2026-08-27 218 群事故：
-                            # 猫咪表情包小细节被 OCR 幻读成 "R"/"B"，
-                            # agent 回复了根本不存在的消息）。
-                            # 真·短文本气泡分类器会判 text，不受影响。
-                            ct2, _, ph2 = _classify_media_seg(rec_img, sg)
+                            # 半显媒体段不采（2026-09-01 内联处置）：交接处
+                            # 残段点不中/裁不全，下一屏完整露出时才入库+处置
+                            if ctype != "text" and handle_media \
+                                    and not _seg_fully_visible(sg):
+                                continue
+                        elif content:
+                            # 文本段复核分长短两路（2026-09-02 定稿）：
+                            # - ≤3 字短文本 → 全量分类（防 OCR 幻读：
+                            #   表情包细节/图表被幻读成 "R"/"B"/"T"，
+                            #   需要 nonbg_block 媒体检测才能揪出）；
+                            # - 长文本 → 只过卡片嫌疑复核（链接卡标题是
+                            #   长文本会粗判 text 漏检；nonbg_block 会
+                            #   误伤正常文本：绿气泡+头像/胶囊压气泡）。
+                            if len(content.strip()) <= 3:
+                                ct2, _, ph2 = _classify_media_seg(rec_img, sg)
+                            else:
+                                ct2, ph2 = _classify_text_suspect(rec_img, sg)
                             if ct2 not in (None, "text"):
+                                if handle_media and not _seg_fully_visible(sg):
+                                    continue   # 半显媒体段同上不采
                                 ctype = ct2
                                 content = _MEDIA_PLACEHOLDER[ct2]
                                 ph = ph2
                         e = SimpleNamespace(
-                            sender=sender, is_mine=False,
+                            sender=sender, is_mine=is_mine,
                             content=content, content_type=ctype,
                             complete=1, partial_top=False,
                             partial_bottom=False, mentions=[],
@@ -456,6 +567,7 @@ def collect_group_history(dev, conn, group, max_rounds=40,
                         e.match_factor = sg["factor"]
                         e.avatar_score = sg.get("avatar_score")
                         e.nick_score = sg.get("nick_score")
+                        e.ybounds = (int(sg["y_top"]), int(sg["y_bottom"]))
                         if not _known(e, existing, existing_keys, seen,
                                       seen_keys, media_hashes):
                             seen.append((e.sender, e.content_type, e.content))
@@ -492,24 +604,42 @@ def collect_group_history(dev, conn, group, max_rounds=40,
             if c["state"] == "complete":
                 e = RS.to_entry(m, group)
                 e.time_hint = cur_divider
-                # 媒体分型（与裁切线路径同一套规则）：slice_chat 粗类型
-                # 非文本 → 细分；超短文本 → 二次核验防 OCR 幻读
+                e.ybounds = (int(c["y_top"]), int(c["y_bottom"]))
+                # 媒体分型（与裁切线路径同一套规则，2026-09-02 定稿）：
+                # slice_chat 粗类型非文本 → 全量细分；带内容文本分长短：
+                # ≤3 字 → 全量复核（防 OCR 幻读 "R"/"B"/"T"）；
+                # 长文本 → 卡片嫌疑复核（只抓伪装成文本的卡片）。
                 c0 = e.content_type or "text"
-                if c0 not in ("text", "quote", "time_divider") or \
-                        (c0 == "text" and e.content
-                         and len(e.content.strip()) <= 3):
+                if c0 == "text" and e.content:
+                    sg = {"y_top": c["y_top"], "y_bottom": c["y_bottom"],
+                          "content": e.content}
+                    if len(e.content.strip()) <= 3:
+                        ct2, content2, ph2 = _classify_media_seg(rec_img, sg)
+                        if ct2 is not None and ct2 != "text":
+                            e.content_type = ct2
+                            e.content = content2
+                            if ph2 is not None:
+                                e.dedup_hash = ph2
+                                e.frame_phash = f"{ph2:016x}"
+                    else:
+                        ct2, ph2 = _classify_text_suspect(rec_img, sg)
+                        if ct2 != "text":
+                            e.content_type = ct2
+                            e.content = _MEDIA_PLACEHOLDER[ct2]
+                            if ph2 is not None:
+                                e.dedup_hash = ph2
+                                e.frame_phash = f"{ph2:016x}"
+                elif c0 not in ("text", "quote", "time_divider"):
                     sg = {"y_top": c["y_top"], "y_bottom": c["y_bottom"],
                           "content": e.content}
                     ct2, content2, ph2 = _classify_media_seg(rec_img, sg)
                     if ct2 is None:
-                        if c0 not in ("text", "quote", "time_divider"):
-                            continue   # unknown/system 跳过
-                    else:
-                        e.content_type = ct2
-                        e.content = content2
-                        if ph2 is not None:
-                            e.dedup_hash = ph2
-                            e.frame_phash = f"{ph2:016x}"
+                        continue   # unknown/system 跳过
+                    e.content_type = ct2
+                    e.content = content2
+                    if ph2 is not None:
+                        e.dedup_hash = ph2
+                        e.frame_phash = f"{ph2:016x}"
                 if not _known(e, existing, existing_keys, seen, seen_keys,
                               media_hashes):
                     seen.append((e.sender, e.content_type, e.content))
@@ -526,7 +656,30 @@ def collect_group_history(dev, conn, group, max_rounds=40,
                 e.time_hint = cur_divider
                 if e.sender and e.content.strip() \
                         and e.content_type in ("text", "quote"):
-                    if not _known(e, existing, existing_keys, seen, seen_keys):
+                    # 底部截断段也过卡片嫌疑复核（2026-09-02：最新消息是
+                    # 链接卡时被输入栏截断 → 走本分支存成 text，URL 永久丢
+                    # ——截断文本与完整卡 fuzzy 比不中，完整版永远不会再采）。
+                    # 截断卡不当屏点击（可能点不中/页面状态不全），标对类型
+                    # 落 media_status=''，留给 media_pass / 下一屏完整露出。
+                    sg = {"y_top": c["y_top"], "y_bottom": c["y_bottom"],
+                          "content": e.content}
+                    if len(e.content.strip()) <= 3:
+                        # 短文本全量复核（防 OCR 幻读 "R"/"B"/"T"）
+                        ct2, _, ph2 = _classify_media_seg(rec_img, sg)
+                        if ct2 in (None, "text"):
+                            ct2, ph2 = "text", None
+                    else:
+                        ct2, ph2 = _classify_text_suspect(rec_img, sg)
+                    if ct2 != "text":
+                        e.content_type = ct2
+                        e.content = _MEDIA_PLACEHOLDER[ct2]
+                        e.no_inline = True   # 截断卡不当屏点击（可能点不中），
+                                             # 留给 media_pass/下一屏完整露出
+                        if ph2 is not None:
+                            e.dedup_hash = ph2
+                            e.frame_phash = f"{ph2:016x}"
+                    if not _known(e, existing, existing_keys, seen, seen_keys,
+                                  media_hashes):
                         seen.append((e.sender, e.content_type, e.content))
                         seen_keys.add(_key(e))
                         e.crop_path = RS.save_crop(
@@ -621,6 +774,91 @@ def collect_group_history(dev, conn, group, max_rounds=40,
             with open(os.path.join(debug_dir, "manifest.json"), "w",
                       encoding="utf-8") as f:
                 json.dump(debug_manifest, f, ensure_ascii=False, indent=1)
+
+        # ---- 多媒体内联处置（2026-09-01 用户定稿）：滚动中识别到本屏有
+        # 完整露出的多媒体消息 → 立即点击处置（链接取 URL / 图片视频文件
+        # 存电脑 / 表情包抠图），取完校验仍在原位置再继续滑动。交接处半显
+        # 段本轮未入库不点（上面分段时已跳过，下一屏完整露出再采+处置）。
+        # 处置后位置漂移则停止采集：已入库数据保留，下轮 journey 从书签
+        # 覆盖空洞。预算热控 media_handle_inline_enabled /
+        # media_handle_max_per_journey / media_handle_timeout_s，超预算的
+        # 条目留 media_status='' 由采集后 media_pass 兜底。
+        if handle_media and new_entries and media_handled < media_max \
+                and time.time() < media_deadline:
+            media_todo = [e for e in new_entries
+                          if getattr(e, "content_type", "text")
+                          in _MEDIA_PLACEHOLDER
+                          and not getattr(e, "no_inline", False)]
+            if media_todo:
+                from .media_pass import (
+                    _apply_result, _content_block, _msg_type_of)
+                from ..ports.android.perception.media_handler import (
+                    MediaHandler, MediaTask)
+                if media_handler is None and media_handler_inst is None:
+                    media_handler_inst = MediaHandler(dev)
+                h = media_handler or media_handler_inst
+                for e in media_todo:
+                    if media_handled >= media_max \
+                            or time.time() >= media_deadline:
+                        break
+                    row = conn.execute(
+                        "SELECT id FROM messages WHERE session_id=?"
+                        " AND crop_path=? ORDER BY id DESC LIMIT 1",
+                        (session_id,
+                         getattr(e, "crop_path", "") or "")).fetchone()
+                    if row is None:
+                        continue
+                    mid = row["id"]
+                    # 红包：不点击（用户定的，避免资金/社交风险），直接标 done
+                    if e.content_type == "red_packet":
+                        message_log.update_media(conn, mid, media_status="done")
+                        media_handled += 1
+                        continue
+                    yt, yb = _seg_dev_y(
+                        {"y_top": e.ybounds[0], "y_bottom": e.ybounds[1]})
+                    strip = (0, yt, img.shape[1], yb - yt)
+                    screen_now = dev.capture_bytes()
+                    tap_bbox = _content_block(screen_now, strip) \
+                        if screen_now is not None else strip
+                    task = MediaTask(msg_id=str(mid),
+                                     msg_type=_msg_type_of(e.content_type),
+                                     bbox=tap_bbox, screen_path="",
+                                     group_name=group)
+                    pre_c, _, _ = _content_crop_bounds(img)
+                    try:
+                        result = h.handle(task)
+                    except Exception:  # noqa: BLE001
+                        log.exception("[%s] 媒体 #%s 内联处置异常", group, mid)
+                        message_log.update_media(conn, mid,
+                                                 media_status="failed")
+                        media_handled += 1
+                        continue
+                    _apply_result(conn, mid, result)
+                    media_handled += 1
+                    log.info("[%s] 媒体 #%s (%s→%s) 内联处置%s", group, mid,
+                             e.content_type, result.msg_type,
+                             "完成" if result.success
+                             else f"失败: {result.error}")
+                    # 位置校验：处置返回后应仍在原屏（微信从详情页返回一般
+                    # 恢复滚动位置）。漂移（conf 低/有位移）→ 重截一次复核，
+                    # 仍漂移则停止采集。
+                    time.sleep(0.5)
+                    now = dev.capture_bytes()
+                    now_c, _, _ = _content_crop_bounds(now)
+                    dyv, confv = find_overlap_dy(pre_c, now_c)
+                    if confv < 0.5 or dyv >= 40:
+                        time.sleep(1.0)
+                        now = dev.capture_bytes()
+                        now_c, _, _ = _content_crop_bounds(now)
+                        dyv, confv = find_overlap_dy(pre_c, now_c)
+                    if confv < 0.5 or dyv >= 40:
+                        log.warning("[%s] 媒体处置后位置漂移(dy=%.0f,"
+                                    "conf=%.2f)，停止本次采集",
+                                    group, dyv, confv)
+                        media_drift_stop = True
+                        break
+            if media_drift_stop:
+                break
 
         # ---- 双因子失配调和（2026-08-25 用户定稿：融入日常 journey 流水）。
         # 识别失配（uncertain_entity）的消息仍在屏上时，点其头像进资料页，

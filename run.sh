@@ -13,8 +13,17 @@
 set -e
 cd "$(dirname "$0")"
 
-PYTHON=~/.venvs/wechat-agent/bin/python
-[ -x "$PYTHON" ] || { echo "venv 不存在: $PYTHON" >&2; exit 1; }
+# venv 在项目目录内（/media/data_old 是 exFAT 不支持符号链接，
+# 用 python3 -m venv --copies 创建；重建见 docs/GATEWAY.md）
+PYTHON=.venv/bin/python
+[ -x "$PYTHON" ] || { echo "venv 不存在: $PYTHON（项目内 .venv，见 docs/GATEWAY.md）" >&2; exit 1; }
+
+# CV/BLAS 线程上限（默认 6 核，2026-09-02）：export 给网关及其拉起的
+# agent 子进程继承；agent 入口 main.py 里还有一层保险。改核数用
+# WECHAT_AGENT_CV_THREADS=N ./run.sh
+_T=${WECHAT_AGENT_CV_THREADS:-6}
+export OMP_NUM_THREADS=$_T OPENBLAS_NUM_THREADS=$_T MKL_NUM_THREADS=$_T \
+       NUMEXPR_NUM_THREADS=$_T VECLIB_MAXIMUM_THREADS=$_T
 
 # 依赖快速自检（缺啥报啥，不要等 import 崩溃）
 "$PYTHON" - <<'EOF'
@@ -23,7 +32,7 @@ missing = [m for m in ("jieba", "cv2", "numpy", "requests", "yaml", "flask")
            if not importlib.util.find_spec(m)]
 if missing:
     sys.exit(f"缺少依赖: {', '.join(missing)}\n"
-             f"安装: ~/.venvs/wechat-agent/bin/pip install {' '.join(missing)}")
+             f"安装: .venv/bin/python -m pip install {' '.join(missing)}")
 EOF
 
 mkdir -p logs

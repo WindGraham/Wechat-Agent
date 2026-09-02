@@ -3,7 +3,7 @@
 一直往回采到「滑到没变化」（滚到可见历史顶部）为止。
 
 用法：
-    ~/.venvs/wechat-agent/bin/python scripts/collect_group_to_join.py 被打信科2026游泳馆
+    .venv/bin/python（项目内 venv） scripts/collect_group_to_join.py 被打信科2026游泳馆
 
 停止条件：
     1. 滑到没变化：相邻两屏重叠位移 dy 过小（<40px）→ 已到顶，停；

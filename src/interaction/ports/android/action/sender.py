@@ -11,6 +11,7 @@
 
 import logging
 import math
+import os
 import random
 import re
 import time
@@ -24,6 +25,20 @@ SEG_DELAY_K = 1.2             # 段间 log(词数+1) 系数
 SEG_DELAY_MAX = 8.0           # 段间延迟上限（秒）
 MAX_SEGMENTS = 3              # 最多分段数，超出合并进最后一段
 _SEG_SPLIT_RE = re.compile(r"(?<=[。！？!?；;\n])")
+
+
+def _runtime_float(key, default):
+    """runtime.json 热读发送节奏（测试期用户要求缩短到 2-5s，
+    2026-09-01）：send_first_delay_max_s / send_seg_delay_max_s。"""
+    try:
+        import json
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
+            "config", "runtime.json")
+        with open(p, encoding="utf-8") as f:
+            return float(json.load(f).get(key, default))
+    except (OSError, ValueError, TypeError):
+        return default
 
 
 class Sender:
@@ -42,7 +57,9 @@ class Sender:
         """向会话发送回复，成功返回 True，重试后仍失败抛 RuntimeError。"""
         reply = reply_text or ""
         segments = self._split_segments(reply)
-        delay = min(FIRST_DELAY_MAX,
+        first_max = _runtime_float("send_first_delay_max_s", FIRST_DELAY_MAX)
+        seg_max = _runtime_float("send_seg_delay_max_s", SEG_DELAY_MAX)
+        delay = min(first_max,
                     self.rand_fn(2, 6) + len(reply) * self.rand_fn(0.1, 0.25))
         log.info("[%s] sending %d segment(s), first delay %.1fs",
                  session, len(segments), delay)
@@ -52,7 +69,7 @@ class Sender:
         for i, seg in enumerate(segments):
             if i > 0:                       # 段间停顿：像人换行再打下一句
                 words = len(jieba.lcut(seg))
-                gap = min(SEG_DELAY_MAX,
+                gap = min(seg_max,
                           math.log(words + 1) * SEG_DELAY_K + self.rand_fn(0, 0.5))
                 self.sleep_fn(gap)
             self._send_once(seg)

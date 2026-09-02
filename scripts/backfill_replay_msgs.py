@@ -9,7 +9,7 @@
 每段（相邻裁切线之间）输出：内容 + 识别方式（双因子/单因子/未知/时间/自己）。
 
 用法：
-    ~/.venvs/wechat-agent/bin/python scripts/backfill_replay_msgs.py <replay名>
+    .venv/bin/python（项目内 venv） scripts/backfill_replay_msgs.py <replay名>
 """
 import json
 import os

@@ -54,6 +54,7 @@ class InteractionLoop:
         self._sleep = time.sleep
         self._rand = random.uniform
         self._clock = time.time
+        self._hold_log_ts = {}       # allowlist 挂起日志节流（session → 上次打印时刻）
         # 好友申请兜底巡检时间戳；0 = 启动后第一个空闲周期立刻巡检一次
         self._last_friend_probe = 0.0
 
@@ -92,6 +93,32 @@ class InteractionLoop:
     def is_maintenance(self):
         """花名册扫描「休眠」中：手机被凌晨爬取占用，暂停正常活动。"""
         return bool(self._maintenance and self._maintenance.is_set())
+
+    def _pending_blocking(self) -> int:
+        """会阻塞首页 sweep 的队列条目数。
+
+        白名单测试模式下只算白名单会话的条目——挂起的非白名单 action
+        永远在队列里，若计入会把 sweep 永久饿死、首页红点停更
+        （2026-09-01 实测：猫猫群新消息完全检测不到）。
+        """
+        allow = self.session_allowlist
+        if allow:
+            return sum(1 for e in self._queue.snapshot()
+                       if e.session in allow)
+        return len(self._queue)
+
+    @property
+    def session_allowlist(self):
+        """测试模式会话白名单（runtime.json session_allowlist，默认 []=不限）。
+
+        非空时只 journey 白名单内的会话：其他会话的 notify 丢弃（红点会再
+        触发）、action 挂起不丢（放回原位）；乱逛/好友巡检同时停止——
+        手机只服务白名单会话（2026-09-01 用户定的猫猫群测试模式）。
+        """
+        if self._config:
+            return getattr(self._config, 'get', lambda k, d=None: d)(
+                'session_allowlist', []) or []
+        return []
 
     # ------------------------------------------------------------------ 主循环
     def run(self, once: bool = False):
@@ -144,10 +171,11 @@ class InteractionLoop:
 
             now = self._clock()
             if now >= next_sweep:
-                if len(self._queue) > 0:
-                    # 队列未清空不开轮询（用户规则 2026-08-08）：
-                    # 旅程优先，sweep 顺延到下一周期
-                    log.debug("队列未清空（%d），sweep 顺延", len(self._queue))
+                # 队列未清空不开轮询（用户规则 2026-08-08）：
+                # 旅程优先，sweep 顺延到下一周期。
+                n_block = self._pending_blocking()
+                if n_block > 0:
+                    log.debug("队列未清空（%d），sweep 顺延", n_block)
                 else:
                     try:
                         self._do_sweep()
@@ -158,6 +186,7 @@ class InteractionLoop:
             # 好友申请兜底巡检（队列空且距上次超过间隔）：
             # 只抓"点开未通过"的残留态，即时识别靠 tab 红点
             if not self.is_paused and not self.is_maintenance \
+                    and not self.session_allowlist \
                     and len(self._queue) == 0:
                 if self._clock() - self._last_friend_probe >= \
                         self.friend_check_interval:
@@ -167,6 +196,7 @@ class InteractionLoop:
 
             # 乱逛：队列空时模拟真人随机浏览
             if not self.is_paused and not self.is_maintenance \
+                    and not self.session_allowlist \
                     and len(self._queue) == 0:
                 self._maybe_wander()
 
@@ -210,8 +240,10 @@ class InteractionLoop:
         action 条目永不许丢，必须原样重新入队（保持原位置）。
         """
         deadline = self._clock() + timeout
+        held = set()   # 本轮已挂起的 session：pop_next 跳过它们，
+                       # 防挂起的 priority action 反复堵队首饿死其他条目
         while not self._stop:
-            entry = self._queue.pop_next()
+            entry = self._queue.pop_next(exclude=held)
             if entry is not None:
                 if self._collect and entry.kind == "action":
                     # 采集模式：只读不回话，行动（含历史遗留）一律丢弃
@@ -230,8 +262,28 @@ class InteractionLoop:
                     # 放回/丢弃后睡到本轮超时，避免暂停时空转
                     self._sleep(min(1.0, max(0.0, deadline - self._clock())))
                 else:
-                    self._dispatch(entry)
-                    return
+                    allow = self.session_allowlist
+                    if allow and entry.session not in allow:
+                        # 测试模式（白名单）：只跑白名单会话。
+                        # action 挂起不丢（承载对用户的承诺），notify 丢弃
+                        if entry.kind == "action":
+                            # 挂起日志节流：同一会话 60s 只打一条（否则
+                            # 暂停态每 2s 刷屏，2026-09-01 实测 23 分钟 713 行）
+                            now = self._clock()
+                            last = self._hold_log_ts.get(entry.session, 0.0)
+                            if now - last >= 60:
+                                log.info("allowlist: hold action %s（只跑 %s）",
+                                         entry.session, allow)
+                                self._hold_log_ts[entry.session] = now
+                            held.add(entry.session)   # 本轮不再弹出（防堵队首）
+                            self._queue.reinsert(entry)
+                        else:
+                            log.debug("allowlist: drop notify %s",
+                                      entry.session)
+                        self._sleep(min(1.0, max(0.0, deadline - self._clock())))
+                    else:
+                        self._dispatch(entry)
+                        return
             if self._clock() >= deadline:
                 return
             self._sleep(min(1.0, max(0.0, deadline - self._clock())))

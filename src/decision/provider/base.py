@@ -204,14 +204,24 @@ class DeepSeekProvider(LLMProvider):
 
     注意：v4 系列（deepseek-v4-pro/flash，1M 上下文）是 always_thinking
     思考型模型，reasoning 会消耗 max_tokens——与 k3 同一个坑。
-    max_tokens 不设小上限（走基类默认 8192），仅保 token_floor 下限防空。"""
+    max_tokens 不设小上限（走基类默认 8192），仅保 token_floor 下限防空。
+
+    supports_images=False：DeepSeek 文本模型吃 image_url 必 400
+    （"This model does not support image"，2026-09-01 猫猫群实测每次
+    都触发"带图调用失败→去图降级重试"，白付一次调用）。
+    视觉模型（名字含 vision，如 deepseek-v4-flash-vision-exp）按官方
+    文档支持图片（仅 user 消息、单边 ≤8192px、服务端自动缩到
+    ~800×800/384 token 上限）→ 实例级 supports_images=True。"""
 
     MIN_MAX_TOKENS = 256
+    supports_images = False
 
     def __init__(self, api_key: str, model: str = "deepseek-chat", **kw):
         super().__init__(api_key, model,
                          "https://api.deepseek.com", **kw)
         self._token_floor = self.MIN_MAX_TOKENS
+        if "vision" in (model or ""):
+            self.supports_images = True
 
     def chat(self, messages, max_tokens=8192, temperature=0.8) -> str:
         return super().chat(messages, max_tokens=max_tokens,
