@@ -205,19 +205,42 @@ checkpointer（历史存储），但通道适配要自己搭。
 
 ---
 
-## 六、横向对比表
+## 六、横向对比表（修正版）
+
+> 本表基于**逐行读代码核实**（非文档/文件名推断）。标注规则：
+> ✅✅ 完整实现 · ✅ 有实现 · ⚠️ 部分/需自建 · ❌ 无 · ❓ 未核实（因仓库过大未逐读）
 
 | 维度 | hermes-agent | clawbolt | AgentScope | Mem0 | LangGraph |
 |------|-------------|----------|------------|------|-----------|
 | **语言** | Python | Python | Python | Python | Python |
-| **多通道接收** | ✅ 超全(微信/QQ/Telegram...) | ✅ 5+通道 | ✅ 3+通道 | ❌ 无 | ⚠️ 需自建 |
-| **每通道一份配置** | ✅✅ `ChannelOverride` | ✅ 通道state | ✅✅ schema注册 | ⚠️ 仅metadata | ⚠️ 仅config |
-| **统一消息总线** | ✅ gateway | ✅✅ `MessageBus` | ✅ dispatcher | ❌ | ❌ 无 |
-| **历史存储** | ✅ session/state | ✅ DB | ✅ DB | ✅ 记忆库 | ✅✅ checkpointer |
-| **存完整对话原文** | ✅ | ✅ | ✅ | ❌ 只留记忆 | ✅ checkpoint |
-| **跨通道投递** | ✅ delivery | ✅ bus | ✅ routing | ❌ | ⚠️ send边 |
-| **热插拔加通道** | ✅ 加适配器 | ✅✅ register() | ✅ register(schema) | n/a | 需自建 |
-| **完成度** | 生产级 | 成熟 | 成熟 | 生产级(记忆) | 引擎成熟/通道弱 |
+| **多通道接收** | ✅✅ 微信/QQ/元宝/Telegram/Signal/Discord... | ✅ 5+通道 | ✅ feishu/discord/dingtalk | ❌ 无 agent | ❌ 无通道概念 |
+| **每通道一份配置** | ✅✅ `ChannelOverride`(system_prompt/model/provider) | ✅ 每通道state | ✅✅ schema 注册 | ⚠️ 仅 metadata | ⚠️ 仅 config |
+| **统一消息总线** | ✅ gateway | ✅✅ `MessageBus`(inbound/outbound) | ✅ dispatcher | ❌ | ❌ 无 |
+| **历史存储** | ❓ 有 session/state 未逐读 | ⚠️ DB 未逐读证实 | ✅✅ messages 表 | ✅ 记忆库 | ✅✅ checkpointer |
+| **存完整对话原文** | ❓ 未核实 | ⚠️ 未核实 | ✅ messages 存完整消息 | ❌ 只留提炼记忆 | ✅ checkpoint 存状态 |
+| **跨通道投递** | ⚠️ 有 delivery 未证实"主动转发" | ⚠️ 半自动：bus 按 channel 路由，但默认只回`ctx.channel` | ❌ 只有入站路由(resolve→agent/session) | ❌ | ❌ 无通道概念(`Send`是图内node路由) |
+| **热插拔加通道** | ✅ 加适配器(未逐读) | ✅✅ `BaseChannel.register()` | ✅ `register(schema)` | n/a | 需自建 |
+| **完成度** | 生产级(未逐读) | 成熟 | 成熟 | 生产级(记忆) | 引擎成熟/通道弱 |
+
+### 本次核实的关键修正（诚实说明）
+
+此前版本有几格是**基于文件名/目录推断**，这次逐行读代码后修正：
+
+1. **clawbolt 跨通道投递 ⚠️ 半自动**：`OutboundMessage.channel` 由 agent 构造
+   （`router.py:574` 用 `channel=ctx.channel`），`manager.py:155` 按
+   `self._channels.get(outbound.channel)` 路由。**技术上 agent 可指定任意 channel，
+   但默认逻辑只回"收到的那个 channel"**——"a口主动投b口"需 agent 改写 channel。
+2. **AgentScope 跨通道投递 ❌**：`routing.py resolve()` 是把入站 event 解析成
+   `(agent_id, session_id)`，**不是跨渠道转发**。`(channel, agent, scope_key)` 是给
+   会话分片生成稳定 id。
+3. **LangGraph 跨通道投递 ❌**：`Send`（types.py:704）是图的条件边里**向某个 node
+   发消息**（map-reduce 并行），**不是消息通道投递**；LangGraph 压根没有"消息通道"
+   概念。
+4. **AgentScope 历史 ✅ 补正**：`storage/_sql/_tables.py` 有 `messages` 表
+   （`MessageRow`，`session_id+msg_id` 复合主键 + payload JSON），**确实统一存完整
+   消息历史**（跨通道进同一表，靠 session_id 分片）。
+5. **hermes 部分 ❓**：仓库 258MB，未逐行核实的（历史存储/跨通道 delivery）标 ❓，
+   未当结论用。
 
 ---
 
